@@ -1,0 +1,23 @@
+# 防止误将本地私密/临时路径提交进默认分支
+name: main-guard
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  check-main-clean:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Forbid private/tmp paths
+        run: node scripts/check-main-clean.mjs

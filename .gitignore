@@ -12,3 +12,8 @@ agent-bin/*
 
 # 本地对照用 CLI 源码等（勿提交）
 tmp/
+
+# 本地私密 / 过程草稿（永不入库；公开文档写 docs/ 根下）
+docs/private/
+docs/dev/
+*.local.md

@@ -35,6 +35,12 @@ npm run dev
 | `npm run check:agent` | 打包前检查 agent 是否存在且体积合理 |
 | `npm run dist:win` | 构建并打 Windows 安装包（含 check） |
 
+## 分支（方案 A / GitHub Flow）
+
+- **`main`**：唯一长期分支与发版线，保持可发布。  
+- **`feature/*` / `fix/*`**：从 `main` 拉出，完成后 PR 合回 `main`，再删分支。  
+- **不使用远端 `develop`**。细节见 **[docs/BRANCHING.md](./docs/BRANCHING.md)**。
+
 ## 目录约定
 
 | 路径 | 说明 |
@@ -43,6 +49,8 @@ npm run dev
 | `src/host/` | 产品 API、ACP、落盘 |
 | `src/main/` | Electron 主进程；preload 仅用 `preload.cjs` |
 | `src/renderer/` | UI（仅 IPC，不 spawn agent） |
+| `docs/` | 公开文档（随 PR 进 main） |
+| `docs/private/` | 本地私密草稿，**gitignore，永不入库** |
 | `agent-bin/` | 本地二进制 + VERSION.txt，**不入库** |
 | `~/.grok-desktop` | 运行时用户数据（测试勿提交） |
 
@@ -71,10 +79,12 @@ npm run dev
 
 ## Pull Request
 
-1. 分支命名自便，PR 说明写清：**改了什么、为什么、如何验证**。
-2. 涉及 Host API：更新 `src/shared/` 与相关测试。
-3. 涉及打包：本地跑通 `npm run check:agent`（有 agent 时）与 `npm test`。
-4. 提交信息请使用 **中文**（本仓库约定）。
+1. 默认向 **`main`** 开 PR（从最新 `main` 拉功能分支）。
+2. 分支命名自便，PR 说明写清：**改了什么、为什么、如何验证**。
+3. 涉及 Host API：更新 `src/shared/` 与相关测试。
+4. 涉及打包：本地跑通 `npm run check:agent`（有 agent 时）与 `npm test`。
+5. 公开说明放 `docs/`；仅自己看的笔记放 `docs/private/`（勿提交）。可选：`npm run check:main-clean`。
+6. 提交信息请使用 **中文**（本仓库约定）。
 
 ## 安全
 

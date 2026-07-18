@@ -15,6 +15,7 @@
     "dev": "tsx src/bin/host-smoke.ts",
     "sync:agent": "node scripts/sync-agent-bin.mjs",
     "check:agent": "node scripts/check-agent-bin.mjs",
+    "check:main-clean": "node scripts/check-main-clean.mjs",
     "pack": "npm run build && node scripts/check-agent-bin.mjs && electron-builder --dir",
     "dist": "npm run build && node scripts/check-agent-bin.mjs && electron-builder",
     "dist:win": "npm run build && node scripts/check-agent-bin.mjs && electron-builder --win"
