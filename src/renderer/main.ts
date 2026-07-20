@@ -7884,23 +7884,120 @@ async function showSettingsPage(): Promise<void> {
   await settingsPage.show();
 }
 
-function hidePermMenu(): void {
-  $("perm-menu")?.classList.add("hidden");
+/** 权限菜单关闭动画收尾定时器 */
+let permMenuCloseTimer: ReturnType<typeof setTimeout> | null = null;
+let permMenuOpenRaf = 0;
+
+function isPermMenuVisible(): boolean {
+  const menu = document.getElementById("perm-menu");
+  return Boolean(menu && !menu.classList.contains("hidden"));
+}
+
+/**
+ * 关闭权限菜单。
+ * @param immediate 窗口 resize 等场景跳过动画，避免残影留在原点
+ */
+function hidePermMenu(opts?: { immediate?: boolean }): void {
+  const menu = document.getElementById("perm-menu");
+  if (!menu) return;
+  if (permMenuOpenRaf) {
+    cancelAnimationFrame(permMenuOpenRaf);
+    permMenuOpenRaf = 0;
+  }
+  if (permMenuCloseTimer != null) {
+    clearTimeout(permMenuCloseTimer);
+    permMenuCloseTimer = null;
+  }
+
+  const finish = () => {
+    menu.classList.add("hidden");
+    menu.classList.remove("is-open", "open-up", "open-down");
+    delete menu.dataset.anchor;
+  };
+
+  const reduced =
+    typeof matchMedia === "function" &&
+    matchMedia("(prefers-reduced-motion: reduce)").matches;
+  if (
+    opts?.immediate ||
+    reduced ||
+    menu.classList.contains("hidden") ||
+    !menu.classList.contains("is-open")
+  ) {
+    menu.classList.remove("is-open");
+    finish();
+    return;
+  }
+
+  menu.classList.remove("is-open");
+  const onEnd = (e: TransitionEvent) => {
+    if (e.target !== menu) return;
+    if (e.propertyName !== "opacity" && e.propertyName !== "transform") return;
+    menu.removeEventListener("transitionend", onEnd);
+    if (permMenuCloseTimer != null) {
+      clearTimeout(permMenuCloseTimer);
+      permMenuCloseTimer = null;
+    }
+    finish();
+  };
+  menu.addEventListener("transitionend", onEnd);
+  // transitionend 偶发丢失时兜底
+  permMenuCloseTimer = setTimeout(() => {
+    menu.removeEventListener("transitionend", onEnd);
+    permMenuCloseTimer = null;
+    finish();
+  }, 240);
 }
 
 /** 窗口几何变化时关掉 fixed 浮层，避免锚点失效留在原点 */
 function hideEphemeralMenus(): void {
-  hidePermMenu();
+  hidePermMenu({ immediate: true });
   hideModelMenu();
   hidePlusMenu();
+}
+
+function syncPermMenuActiveItem(): void {
+  const menu = document.getElementById("perm-menu");
+  if (!menu) return;
+  for (const btn of Array.from(menu.querySelectorAll<HTMLElement>("[data-mode]"))) {
+    const mode = btn.dataset.mode;
+    const active =
+      mode === "always_approve"
+        ? permMode === "always_approve"
+        : mode === "normal"
+          ? permMode !== "always_approve" && permMode !== "plan"
+          : mode === permMode;
+    btn.classList.toggle("is-active", active);
+  }
 }
 
 function showPermMenu(anchor: HTMLElement): void {
   hideModelMenu();
   hidePlusMenu();
   const menu = $("perm-menu");
-  // 先显示再量尺寸，才能按视口空间决定上/下弹出
-  menu.classList.remove("hidden");
+
+  // 再次点击同一锚点：丝滑收起
+  if (
+    isPermMenuVisible() &&
+    menu.classList.contains("is-open") &&
+    menu.dataset.anchor === anchor.id
+  ) {
+    hidePermMenu();
+    return;
+  }
+
+  if (permMenuCloseTimer != null) {
+    clearTimeout(permMenuCloseTimer);
+    permMenuCloseTimer = null;
+  }
+  if (permMenuOpenRaf) {
+    cancelAnimationFrame(permMenuOpenRaf);
+    permMenuOpenRaf = 0;
+  }
+
+  // 先无 is-open 显示以便测量真实尺寸，再 rAF 触发展开动画
+  menu.classList.remove("hidden", "is-open");
+  syncPermMenuActiveItem();
   const r = anchor.getBoundingClientRect();
   const mw = menu.offsetWidth || 160;
   const mh = menu.offsetHeight || 88;
@@ -7910,16 +8007,30 @@ function showPermMenu(anchor: HTMLElement): void {
   // 输入栏贴底：优先向上弹出，避免「完全访问」等项被窗口底边裁切
   const spaceBelow = window.innerHeight - r.bottom;
   let top: number;
+  let openUp = false;
   if (spaceBelow < mh + 12 && r.top > mh + 12) {
     top = Math.max(8, r.top - mh - 6);
+    openUp = true;
   } else {
     top = r.bottom + 4;
     if (top + mh > window.innerHeight - 8) {
       top = Math.max(8, window.innerHeight - mh - 8);
     }
+    // 最终仍在 chip 上方则用向上动效
+    openUp = top + mh / 2 < r.top;
   }
+  menu.classList.toggle("open-up", openUp);
+  menu.classList.toggle("open-down", !openUp);
   menu.style.left = `${left}px`;
   menu.style.top = `${top}px`;
+  menu.dataset.anchor = anchor.id;
+
+  // 强制 reflow，保证从收起态过渡到 is-open
+  void menu.offsetWidth;
+  permMenuOpenRaf = requestAnimationFrame(() => {
+    permMenuOpenRaf = 0;
+    menu.classList.add("is-open");
+  });
 }
 
 /**
@@ -8477,8 +8588,7 @@ npm start</pre>
   $("btn-perm-mode").onclick = () => showPermMenu($("btn-perm-mode"));
   $("btn-perm-mode-2").onclick = () => showPermMenu($("btn-perm-mode-2"));
   document.addEventListener("click", (e) => {
-    const menu = $("perm-menu");
-    if (menu.classList.contains("hidden")) return;
+    if (!isPermMenuVisible()) return;
     if (!(e.target as HTMLElement).closest("#perm-menu, #btn-perm-mode, #btn-perm-mode-2, #btn-sandbox-setup")) {
       hidePermMenu();
     }
@@ -8487,6 +8597,10 @@ npm start</pre>
     const t = e.target as HTMLElement;
     const mode = t.dataset.mode as typeof permMode | undefined;
     if (!mode) return;
+    // 选中高亮先于收起动画，关闭过程中可见反馈
+    for (const btn of Array.from($("perm-menu").querySelectorAll<HTMLElement>("[data-mode]"))) {
+      btn.classList.toggle("is-active", btn.dataset.mode === mode);
+    }
     hidePermMenu();
     if (mode === "plan") {
       void enterPlanMode().then((r) => {

@@ -3495,6 +3495,42 @@ dialog input {
   overflow-y: auto;
   box-sizing: border-box;
 }
+
+/* 权限菜单：scale + fade + 轻位移，开合丝滑 */
+#perm-menu.float-menu {
+  opacity: 0;
+  transform: translate3d(0, 6px, 0) scale(0.96);
+  transform-origin: top left;
+  pointer-events: none;
+  transition:
+    opacity 0.16s cubic-bezier(0.2, 0.8, 0.2, 1),
+    transform 0.18s cubic-bezier(0.2, 0.8, 0.2, 1);
+  will-change: opacity, transform;
+}
+#perm-menu.float-menu.open-up {
+  transform: translate3d(0, -6px, 0) scale(0.96);
+  transform-origin: bottom left;
+}
+#perm-menu.float-menu.is-open {
+  opacity: 1;
+  transform: translate3d(0, 0, 0) scale(1);
+  pointer-events: auto;
+}
+#perm-menu.float-menu .menu-item {
+  transition: background 0.12s ease, color 0.12s ease;
+}
+#perm-menu.float-menu .menu-item.is-active {
+  background: var(--orange-soft);
+  color: var(--orange);
+  font-weight: 600;
+}
+@media (prefers-reduced-motion: reduce) {
+  #perm-menu.float-menu {
+    transition: none;
+    will-change: auto;
+  }
+}
+
 .menu-item {
   display: block;
   width: 100%;
