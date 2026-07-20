@@ -141,6 +141,8 @@ export class SettingsPageController {
     string,
     { ok: boolean; latencyMs: number; error?: string } | "loading"
   > = {};
+  /** 已占用的配置段 id（新建时避重） */
+  private existingProviderIds: string[] = [];
 
   constructor(private readonly cb: SettingsPageCallbacks) {
     this.bindShell();
@@ -576,6 +578,7 @@ export class SettingsPageController {
       configPath: string;
     }>("providers.list");
     const list = res.data?.providers ?? [];
+    this.existingProviderIds = list.map((p) => p.id);
     const configPath = res.data?.configPath ?? this.cfg.paths?.configToml ?? "";
     const editing = this.editingProviderId
       ? list.find((p) => p.id === this.editingProviderId)
@@ -685,6 +688,31 @@ export class SettingsPageController {
     return Array.from(s).slice(0, 2).join("").toUpperCase();
   }
 
+  /** 与 host sanitizeId 对齐（失败返回空串） */
+  private sanitizeProviderId(raw: string): string {
+    const id = raw
+      .trim()
+      .toLowerCase()
+      .replace(/[^a-z0-9._-]+/g, "-")
+      .replace(/^-+|-+$/g, "");
+    if (!id || !/^[a-z0-9]/.test(id)) return "";
+    return id;
+  }
+
+  /** 在已占用 id 中分配唯一配置段名 */
+  private allocateUniqueProviderId(raw: string): string {
+    const base = this.sanitizeProviderId(raw) || "provider";
+    const taken = new Set(
+      this.existingProviderIds.map((x) => x.toLowerCase()),
+    );
+    if (!taken.has(base)) return base;
+    for (let n = 2; n < 1000; n++) {
+      const cand = `${base}-${n}`;
+      if (!taken.has(cand)) return cand;
+    }
+    return `${base}-${Date.now().toString(36)}`;
+  }
+
   private htmlProviderForm(
     editing: CustomProviderRow | null | undefined,
     isEdit: boolean,
@@ -721,6 +749,7 @@ export class SettingsPageController {
             <label class="settings-field">
               <span class="settings-field-label">${this.cb.esc(tr("prov.displayName"))}</span>
               <input class="settings-input" id="prov-id" ${isEdit ? "readonly" : ""} value="${this.cb.esc(editing?.id ?? "")}" placeholder="${this.cb.esc(tr("prov.idPh"))}" autocomplete="off" />
+              ${isEdit ? "" : `<span class="settings-field-hint">${this.cb.esc(tr("prov.idHint"))}</span>`}
             </label>
             <div class="settings-field">
               <span class="settings-field-label">${this.cb.esc(tr("prov.requestModel"))}</span>
@@ -924,8 +953,8 @@ export class SettingsPageController {
   }
 
   /**
-   * 显示名称（#prov-id / 配置段名）默认 = 实际请求模型；用户手改过则不覆盖。
-   * 提供商名称（#prov-name）不在此同步。
+   * 显示名称（#prov-id / 配置段名）默认跟随请求模型，并自动避开已占用 id。
+   * 用户手改过则不覆盖。提供商名称（#prov-name）不在此同步。
    */
   private syncDisplayNameFromModel(
     root: HTMLElement,
@@ -940,22 +969,25 @@ export class SettingsPageController {
     if (fromMenu) {
       if (idInput.dataset.userEdited === "1") {
         const modelBefore = idInput.dataset.lastAutoName ?? "";
-        if (
-          idInput.value.trim() &&
-          idInput.value.trim() !== modelBefore &&
-          idInput.value.trim() !== modelId
-        ) {
-          return;
-        }
+        const cur = idInput.value.trim();
+        // 仍是上次自动值，或与模型名相同（未真正手改）时允许重算唯一 id
+        const stillAuto =
+          !cur ||
+          cur === modelBefore ||
+          this.sanitizeProviderId(cur) === this.sanitizeProviderId(modelId) ||
+          cur === modelId;
+        if (!stillAuto) return;
         idInput.dataset.userEdited = "0";
       }
-      idInput.value = modelId;
-      idInput.dataset.lastAutoName = modelId;
+      const unique = this.allocateUniqueProviderId(modelId);
+      idInput.value = unique;
+      idInput.dataset.lastAutoName = unique;
       return;
     }
     if (idInput.dataset.userEdited === "1") return;
-    idInput.value = modelId;
-    idInput.dataset.lastAutoName = modelId;
+    const unique = this.allocateUniqueProviderId(modelId);
+    idInput.value = unique;
+    idInput.dataset.lastAutoName = unique;
   }
 
   private fillModelMenuData(models: Array<{ id: string }>): void {
@@ -1011,7 +1043,8 @@ export class SettingsPageController {
   }
 
   private async saveProviderForm(root: HTMLElement): Promise<void> {
-    const id = (
+    const isCreate = !this.editingProviderId;
+    let id = (
       root.querySelector("#prov-id") as HTMLInputElement | null
     )?.value.trim();
     const name = (
@@ -1037,6 +1070,26 @@ export class SettingsPageController {
       if (hint) hint.textContent = tr("prov.needFields");
       return;
     }
+    const sanitized = this.sanitizeProviderId(id);
+    if (!sanitized) {
+      if (hint) hint.textContent = tr("prov.needFields");
+      return;
+    }
+    id = sanitized;
+    // 新建：配置段 id 必须唯一，避免 upsert 静默覆盖
+    if (isCreate) {
+      const taken = this.existingProviderIds.some(
+        (x) => x.toLowerCase() === id!.toLowerCase(),
+      );
+      if (taken) {
+        if (hint) hint.textContent = tr("prov.idExists", { id });
+        const idInput = root.querySelector(
+          "#prov-id",
+        ) as HTMLInputElement | null;
+        idInput?.focus();
+        return;
+      }
+    }
     const res = await this.cb.inv("providers.upsert", {
       id,
       name: name || id,
@@ -1045,6 +1098,7 @@ export class SettingsPageController {
       apiKey: apiKey || undefined,
       apiBackend,
       setAsDefault,
+      createOnly: isCreate,
     });
     if (!res.ok) {
       if (hint) hint.textContent = res.error?.message ?? tr("prov.saveFail");

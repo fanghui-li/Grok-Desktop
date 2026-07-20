@@ -151,6 +151,7 @@ async function handleHostIpc(
             | "messages"
             | undefined,
           setAsDefault: p.setAsDefault as boolean | undefined,
+          createOnly: p.createOnly as boolean | undefined,
         }),
       );
     case "providers.remove":

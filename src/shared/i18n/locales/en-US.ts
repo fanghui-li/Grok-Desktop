@@ -785,7 +785,10 @@ export const enUS: MessageDict = {
   "prov.protocol": "Protocol",
   "prov.fetchModels": "Fetch model list",
   "prov.displayName": "Display name (config section)",
-  "prov.idPh": "Defaults to request model id; editable",
+  "prov.idPh": "Unique id, e.g. relay-a (writes [model.xxx])",
+  "prov.idHint":
+    "Must be unique — maps to [model.xxx] in config; can differ from request model",
+  "prov.idExists": "Section “{id}” already exists; pick another display name",
   "prov.requestModel": "Request model",
   "prov.modelPh": "Type or pick from the list",
   "prov.pickModel": "Choose model",

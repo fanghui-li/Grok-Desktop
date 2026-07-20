@@ -8,8 +8,11 @@ import os from "node:os";
 import path from "node:path";
 import { grokHomeDir } from "./paths.js";
 
-const COMPAT_BLOCK = `
-# Desktop：关闭厂商兼容（不扫描 ~/.claude、~/.cursor 的 skills/hooks/mcp 等）
+/** 写入 config 时附带的说明行（strip 时按此前缀清理，避免重复堆积） */
+const COMPAT_COMMENT =
+  "# Desktop：关闭厂商兼容（不扫描 ~/.claude、~/.cursor 的 skills/hooks/mcp 等）";
+
+const COMPAT_BLOCK = `${COMPAT_COMMENT}
 [compat.claude]
 skills = false
 rules = false
@@ -28,7 +31,7 @@ sessions = false
 
 [compat.codex]
 sessions = false
-`.trimStart();
+`;
 
 /** 与文档一致的 env 开关（false = 不扫描） */
 export const COMPAT_DISABLED_ENV: Record<string, string> = {
@@ -123,8 +126,48 @@ function listVendorPluginNames(): string[] {
   return [...names].sort();
 }
 
+/** 是否已是 Desktop 期望的 compat 关闭块（避免每次启动无意义改写） */
+function hasDesktopCompatBlock(text: string): boolean {
+  const n = text.replace(/\r\n/g, "\n");
+  return (
+    /\[compat\.claude\]/.test(n) &&
+    /\[compat\.cursor\]/.test(n) &&
+    /\[compat\.codex\]/.test(n) &&
+    /skills\s*=\s*false/.test(n) &&
+    /sessions\s*=\s*false/.test(n)
+  );
+}
+
+function stripDesktopCompatComments(text: string): string {
+  return text
+    .split("\n")
+    .filter((line) => {
+      const t = line.trim();
+      // 历史重复行：整行都是这条 Desktop 兼容说明
+      if (t === COMPAT_COMMENT.trim()) return false;
+      if (/^#\s*Desktop[：:].*厂商兼容/.test(t)) return false;
+      return true;
+    })
+    .join("\n");
+}
+
 function upsertCompatSections(text: string): string {
   let out = text.replace(/\r\n/g, "\n");
+  // 已正确关闭且无重复注释时保持原样（幂等）
+  if (hasDesktopCompatBlock(out)) {
+    const commentHits = out
+      .split("\n")
+      .filter((l) => {
+        const t = l.trim();
+        return (
+          t === COMPAT_COMMENT.trim() ||
+          /^#\s*Desktop[：:].*厂商兼容/.test(t)
+        );
+      }).length;
+    if (commentHits <= 1) return out;
+  }
+  // 去掉旧 [compat.*] 与可能堆积的说明注释，再写回唯一一块
+  out = stripDesktopCompatComments(out);
   out = stripTomlTable(out, "compat.claude");
   out = stripTomlTable(out, "compat.cursor");
   out = stripTomlTable(out, "compat.codex");
