@@ -3,6 +3,18 @@
  */
 import type { HostIpcMethod } from "../shared/host-api.js";
 import { tr, type LocalePreference } from "../shared/i18n/index.js";
+import type {
+  ThemeVariant,
+  VariantAppearance,
+} from "../shared/theme/types.js";
+import {
+  ThemeCodecError,
+  appearanceFromPreset,
+  assertVariantMatch,
+  isKnownCodeThemeId,
+  parseCodexThemeV1,
+  presetsForVariant,
+} from "../shared/theme/index.js";
 
 type Inv = <T>(method: HostIpcMethod, params?: unknown) => Promise<{
   ok: boolean;
@@ -27,6 +39,8 @@ export interface DesktopConfigData {
   locale?: LocalePreference;
   /** Appearance preference */
   theme?: SettingsThemePreference;
+  appearanceLight?: VariantAppearance;
+  appearanceDark?: VariantAppearance;
   paths?: {
     settings: string;
     configToml: string;
@@ -45,10 +59,16 @@ export interface SettingsPageCallbacks {
     /** 仅 locale/theme 真变更时传入，避免切换提供商时整页 applyDomI18n */
     locale?: LocalePreference;
     theme?: SettingsThemePreference;
+    appearanceLight?: VariantAppearance;
+    appearanceDark?: VariantAppearance;
   }) => void;
   /** 关闭设置页后（恢复主界面交互 / 焦点） */
   onClosed?: () => void;
   esc: (s: string) => string;
+  /** 当前 resolved 变体（system 跟 OS） */
+  resolveThemeVariant: () => ThemeVariant;
+  getAppearance: (variant: ThemeVariant) => VariantAppearance;
+  exportThemeString: () => string;
 }
 
 type SectionId =
@@ -70,6 +90,12 @@ type CustomProviderRow = {
   apiBackend: string;
   isDefault: boolean;
 };
+
+/** 密码框眼睛：闭眼 = 隐藏中（点一下显示）；睁眼 = 明文中（点一下隐藏） */
+const KEY_EYE_HIDDEN_SVG =
+  `<svg class="settings-key-eye-ico" viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M1 12s4-7 11-7 11 7 11 7-4 7-11 7S1 12 1 12z"/><circle cx="12" cy="12" r="3"/></svg>`;
+const KEY_EYE_VISIBLE_SVG =
+  `<svg class="settings-key-eye-ico" viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M17.94 17.94A10.07 10.07 0 0 1 12 20c-7 0-11-8-11-8a18.45 18.45 0 0 1 5.06-5.94M9.9 4.24A9.12 9.12 0 0 1 12 4c7 0 11 8 11 8a18.5 18.5 0 0 1-2.16 3.19"/><path d="M14.12 14.12a3 3 0 1 1-4.24-4.24"/><line x1="1" y1="1" x2="23" y2="23"/></svg>`;
 
 /** Base64（含 url-safe）→ UTF-8 可打印文本；失败返回 ok:false */
 function decodeBase64ToPrintableText(
@@ -314,6 +340,7 @@ export class SettingsPageController {
   private applyToApp(opts?: {
     pushLocale?: boolean;
     pushTheme?: boolean;
+    pushAppearance?: boolean;
   }): void {
     const mode = this.cfg.defaultPermMode ?? "normal";
     const model = (this.cfg.defaultModel ?? "").trim() || "grok";
@@ -324,6 +351,8 @@ export class SettingsPageController {
       defaultOpenTarget: SettingsOpenTarget;
       locale?: LocalePreference;
       theme?: SettingsThemePreference;
+      appearanceLight?: VariantAppearance;
+      appearanceDark?: VariantAppearance;
     } = {
       defaultPermMode: mode,
       defaultModel: model,
@@ -334,6 +363,14 @@ export class SettingsPageController {
     }
     if (opts?.pushTheme) {
       payload.theme = this.cfg.theme ?? "system";
+    }
+    if (opts?.pushAppearance || opts?.pushTheme) {
+      if (this.cfg.appearanceLight) {
+        payload.appearanceLight = this.cfg.appearanceLight;
+      }
+      if (this.cfg.appearanceDark) {
+        payload.appearanceDark = this.cfg.appearanceDark;
+      }
     }
     this.cb.onConfigApplied(payload);
   }
@@ -427,6 +464,26 @@ export class SettingsPageController {
 
   private htmlAppearance(): string {
     const theme = (this.cfg.theme ?? "system") as SettingsThemePreference;
+    const variant = this.cb.resolveThemeVariant();
+    const app = this.cb.getAppearance(variant);
+    const presets = presetsForVariant(variant);
+    const variantLabel =
+      variant === "dark"
+        ? tr("settings.theme.variantDark")
+        : tr("settings.theme.variantLight");
+    const presetOpts = presets
+      .map((p) => {
+        const sel = p.id === app.codeThemeId ? " selected" : "";
+        return `<option value="${this.cb.esc(p.id)}"${sel}>${this.cb.esc(p.label)}</option>`;
+      })
+      .join("");
+    // 当前 id 不在列表时仍展示
+    const orphan =
+      !presets.some((p) => p.id === app.codeThemeId) && app.codeThemeId
+        ? `<option value="${this.cb.esc(app.codeThemeId)}" selected>${this.cb.esc(app.codeThemeId)}</option>`
+        : "";
+    const swatchStyle = `background:${this.cb.esc(app.chromeTheme.surface)};color:${this.cb.esc(app.chromeTheme.accent)};border-color:color-mix(in srgb, ${this.cb.esc(app.chromeTheme.ink)} 16%, ${this.cb.esc(app.chromeTheme.surface)})`;
+
     return `
       <h1 class="settings-title">${this.cb.esc(tr("settings.section.appearance"))}</h1>
       <p class="settings-desc">${this.cb.esc(tr("settings.themeSub"))}</p>
@@ -439,6 +496,36 @@ export class SettingsPageController {
           ${this.choiceCard("theme", "dark", theme === "dark", tr("settings.theme.dark"), tr("settings.theme.darkSub"))}
         </div>
       </section>
+
+      <section class="settings-block">
+        <div class="settings-theme-chrome-bar" id="theme-chrome-bar">
+          <span class="settings-theme-chrome-label">${this.cb.esc(variantLabel)}</span>
+          <div class="settings-theme-chrome-actions">
+            <button type="button" class="btn-ghost settings-mini-btn" id="btn-theme-import">${this.cb.esc(tr("settings.theme.import"))}</button>
+            <button type="button" class="btn-ghost settings-mini-btn" id="btn-theme-export">${this.cb.esc(tr("settings.theme.copy"))}</button>
+            <div class="settings-theme-preset-wrap">
+              <span class="settings-theme-aa" style="${swatchStyle}" aria-hidden="true">${this.cb.esc(tr("settings.theme.aa"))}</span>
+              <select class="settings-select settings-theme-preset-select" id="theme-preset-select" aria-label="${this.cb.esc(tr("settings.theme.preset"))}">
+                ${orphan}${presetOpts}
+              </select>
+            </div>
+          </div>
+        </div>
+        <p class="settings-muted settings-theme-chrome-hint" id="theme-chrome-hint"></p>
+      </section>
+
+      <div id="theme-import-dlg" class="settings-theme-import-dlg hidden" role="dialog" aria-modal="true" aria-labelledby="theme-import-title">
+        <div class="settings-theme-import-card">
+          <h3 id="theme-import-title" class="settings-h2">${this.cb.esc(tr("settings.theme.importTitle"))}</h3>
+          <p class="settings-desc">${this.cb.esc(tr("settings.theme.importHint"))}</p>
+          <textarea id="theme-import-input" class="settings-theme-import-ta" rows="6" placeholder="codex-theme-v1:{…}" spellcheck="false"></textarea>
+          <p class="settings-error hidden" id="theme-import-err"></p>
+          <div class="settings-form-actions">
+            <button type="button" class="btn-ghost" id="btn-theme-import-cancel">${this.cb.esc(tr("common.cancel"))}</button>
+            <button type="button" class="btn-dark" id="btn-theme-import-ok">${this.cb.esc(tr("settings.theme.importOk"))}</button>
+          </div>
+        </div>
+      </div>
     `;
   }
 
@@ -451,6 +538,154 @@ export class SettingsPageController {
         if (v !== "system" && v !== "light" && v !== "dark") return;
         void this.patch({ theme: v }).then(() => this.renderContent());
       };
+    }
+
+    const sel = root.querySelector(
+      "#theme-preset-select",
+    ) as HTMLSelectElement | null;
+    sel?.addEventListener("change", () => {
+      const id = sel.value.trim();
+      if (!id) return;
+      void this.applyThemePreset(id).then((msg) => {
+        const hint = root.querySelector("#theme-chrome-hint");
+        if (hint) hint.textContent = msg ?? "";
+        return this.renderContent();
+      });
+    });
+
+    root.querySelector("#btn-theme-export")?.addEventListener("click", () => {
+      void this.copyThemeString(root);
+    });
+    root.querySelector("#btn-theme-import")?.addEventListener("click", () => {
+      this.openThemeImportDlg(root);
+    });
+    root
+      .querySelector("#btn-theme-import-cancel")
+      ?.addEventListener("click", () => this.closeThemeImportDlg(root));
+    root.querySelector("#btn-theme-import-ok")?.addEventListener("click", () => {
+      void this.submitThemeImport(root);
+    });
+  }
+
+  private async applyThemePreset(codeThemeId: string): Promise<string> {
+    const variant = this.cb.resolveThemeVariant();
+    if (
+      !isKnownCodeThemeId(codeThemeId) &&
+      codeThemeId !== "default" &&
+      codeThemeId !== "codex"
+    ) {
+      // 仍允许未知 id（导入后改过 chrome 的标签）；appearanceFromPreset 会回落默认
+    }
+    const next = appearanceFromPreset(codeThemeId, variant);
+    const patch: Partial<DesktopConfigData> =
+      variant === "light"
+        ? { appearanceLight: next }
+        : { appearanceDark: next };
+    await this.patchAppearance(patch);
+    return tr("settings.theme.presetApplied", { name: codeThemeId });
+  }
+
+  private async patchAppearance(
+    partial: Partial<DesktopConfigData>,
+  ): Promise<void> {
+    const res = await this.cb.inv<DesktopConfigData>("config.patch", partial);
+    if (res.ok && res.data) this.cfg = res.data;
+    else await this.reloadConfig();
+    this.applyToApp({ pushAppearance: true, pushTheme: true });
+  }
+
+  private async copyThemeString(root: HTMLElement): Promise<void> {
+    const hint = root.querySelector("#theme-chrome-hint");
+    try {
+      const s = this.cb.exportThemeString();
+      await navigator.clipboard.writeText(s);
+      if (hint) hint.textContent = tr("settings.theme.copied");
+    } catch {
+      // fallback: 展示在导入框
+      try {
+        const s = this.cb.exportThemeString();
+        this.openThemeImportDlg(root, s);
+        if (hint) hint.textContent = tr("settings.theme.copyFallback");
+      } catch (e) {
+        if (hint) {
+          hint.textContent =
+            e instanceof Error ? e.message : tr("settings.theme.copyFail");
+        }
+      }
+    }
+  }
+
+  private openThemeImportDlg(root: HTMLElement, prefill = ""): void {
+    const dlg = root.querySelector("#theme-import-dlg");
+    const ta = root.querySelector(
+      "#theme-import-input",
+    ) as HTMLTextAreaElement | null;
+    const err = root.querySelector("#theme-import-err");
+    dlg?.classList.remove("hidden");
+    if (ta) {
+      ta.value = prefill;
+      requestAnimationFrame(() => ta.focus());
+    }
+    err?.classList.add("hidden");
+    if (err) err.textContent = "";
+  }
+
+  private closeThemeImportDlg(root: HTMLElement): void {
+    root.querySelector("#theme-import-dlg")?.classList.add("hidden");
+  }
+
+  private async submitThemeImport(root: HTMLElement): Promise<void> {
+    const ta = root.querySelector(
+      "#theme-import-input",
+    ) as HTMLTextAreaElement | null;
+    const err = root.querySelector("#theme-import-err") as HTMLElement | null;
+    const hint = root.querySelector("#theme-chrome-hint");
+    const raw = ta?.value.trim() ?? "";
+    if (!raw) {
+      if (err) {
+        err.textContent = tr("settings.theme.importEmpty");
+        err.classList.remove("hidden");
+      }
+      return;
+    }
+    try {
+      const payload = parseCodexThemeV1(raw);
+      const variant = this.cb.resolveThemeVariant();
+      assertVariantMatch(payload, variant);
+      if (!isKnownCodeThemeId(payload.codeThemeId)) {
+        // Codex 要求 id 在列表；我们允许未知 id 但保留 chrome，标签用 id
+      }
+      const next: VariantAppearance = {
+        codeThemeId: payload.codeThemeId,
+        chromeTheme: payload.theme,
+      };
+      const patch: Partial<DesktopConfigData> =
+        variant === "light"
+          ? { appearanceLight: next }
+          : { appearanceDark: next };
+      await this.patchAppearance(patch);
+      this.closeThemeImportDlg(root);
+      if (hint) hint.textContent = tr("settings.theme.imported");
+      await this.renderContent();
+    } catch (e) {
+      let msg = tr("settings.theme.importFail");
+      if (e instanceof ThemeCodecError) {
+        if (/variant mismatch/i.test(e.message)) {
+          msg = tr("settings.theme.importVariantMismatch", {
+            variant: this.cb.resolveThemeVariant(),
+          });
+        } else if (/mismatch/i.test(e.message)) {
+          msg = tr("settings.theme.importPrefix");
+        } else {
+          msg = e.message;
+        }
+      } else if (e instanceof Error) {
+        msg = e.message;
+      }
+      if (err) {
+        err.textContent = msg;
+        err.classList.remove("hidden");
+      }
     }
   }
 
@@ -783,56 +1018,62 @@ export class SettingsPageController {
             <span class="settings-field-label">${this.cb.esc(tr("prov.name"))}</span>
             <input class="settings-input" id="prov-name" value="${this.cb.esc(editing?.name ?? "")}" placeholder="${this.cb.esc(tr("prov.namePh"))}" autocomplete="off" />
           </label>
-          <label class="settings-field">
-            <span class="settings-field-label">${this.cb.esc(tr("prov.baseUrl"))}</span>
-            <input class="settings-input" id="prov-base" value="${this.cb.esc(editing?.baseUrl ?? "")}" placeholder="https://your-relay.example.com/v1" autocomplete="off" />
-            <span class="settings-field-hint">${this.cb.esc(tr("prov.baseHint"))}</span>
-          </label>
-          <div class="settings-field-row">
-            <div class="settings-field">
-              <span class="settings-field-label">${this.cb.esc(tr("prov.apiKey"))}</span>
-              <div class="settings-key-combo">
-                <input class="settings-input" id="prov-key" type="password" value="" placeholder="${this.cb.esc(editing?.hasApiKey ? tr("prov.keyKeep") : "sk-…")}" autocomplete="new-password" />
-                <button type="button" class="btn-ghost settings-mini-btn settings-key-vis-btn" id="btn-prov-key-vis" aria-pressed="false" title="${this.cb.esc(tr("prov.keyShowTitle"))}" aria-label="${this.cb.esc(tr("prov.keyShowTitle"))}">${this.cb.esc(tr("prov.keyShow"))}</button>
-                <button type="button" class="btn-ghost settings-mini-btn" id="btn-prov-key-b64" title="${this.cb.esc(tr("prov.keyB64Title"))}">${this.cb.esc(tr("prov.keyB64"))}</button>
-              </div>
-              <span class="settings-field-hint" id="prov-key-b64-hint">${this.cb.esc(tr("prov.keyB64Hint"))}</span>
-            </div>
+          <div class="settings-field-row settings-field-row-base">
             <label class="settings-field">
-              <span class="settings-field-label">${this.cb.esc(tr("prov.protocol"))}</span>
-              <select class="settings-select" id="prov-backend">
+              <span class="settings-field-label-row">
+                <span class="settings-field-label">${this.cb.esc(tr("prov.baseUrl"))}</span>
+              </span>
+              <input class="settings-input" id="prov-base" value="${this.cb.esc(editing?.baseUrl ?? "")}" placeholder="https://your-relay.example.com/v1" autocomplete="off" />
+              <span class="settings-field-hint">${this.cb.esc(tr("prov.baseHint"))}</span>
+            </label>
+            <label class="settings-field">
+              <span class="settings-field-label-row">
+                <span class="settings-field-label">${this.cb.esc(tr("prov.protocol"))}</span>
+              </span>
+              <select class="settings-select settings-select-block" id="prov-backend">
                 <option value="chat_completions" ${!editing || editing.apiBackend === "chat_completions" ? "selected" : ""}>OpenAI Chat Completions</option>
                 <option value="responses" ${editing?.apiBackend === "responses" ? "selected" : ""}>OpenAI Responses</option>
                 <option value="messages" ${editing?.apiBackend === "messages" ? "selected" : ""}>Anthropic Messages</option>
               </select>
             </label>
           </div>
-          <div class="settings-form-actions settings-form-actions-tight">
-            <button type="button" class="btn-ghost settings-mini-btn" id="btn-prov-fetch-models">${this.cb.esc(tr("prov.fetchModels"))}</button>
-            <span class="settings-save-hint" id="prov-fetch-hint">GET {"{base_url}"}/models</span>
+          <div class="settings-field">
+            <span class="settings-field-label">${this.cb.esc(tr("prov.apiKey"))}</span>
+            <div class="settings-key-combo">
+              <div class="settings-key-input-wrap">
+                <input class="settings-input" id="prov-key" type="password" value="" placeholder="${this.cb.esc(editing?.hasApiKey ? tr("prov.keyKeep") : "sk-…")}" autocomplete="new-password" />
+                <button type="button" class="settings-key-eye" id="btn-prov-key-vis" aria-pressed="false" title="${this.cb.esc(tr("prov.keyShowTitle"))}" aria-label="${this.cb.esc(tr("prov.keyShowTitle"))}">${KEY_EYE_HIDDEN_SVG}</button>
+              </div>
+              <button type="button" class="btn-ghost settings-mini-btn" id="btn-prov-key-b64" title="${this.cb.esc(tr("prov.keyB64Title"))}">${this.cb.esc(tr("prov.keyB64"))}</button>
+            </div>
           </div>
           <div class="settings-field-row settings-field-row-models">
             <label class="settings-field">
-              <span class="settings-field-label">${this.cb.esc(tr("prov.displayName"))}</span>
+              <span class="settings-field-label-row">
+                <span class="settings-field-label">${this.cb.esc(tr("prov.displayName"))}</span>
+              </span>
               <input class="settings-input" id="prov-id" ${isEdit ? "readonly" : ""} value="${this.cb.esc(editing?.id ?? "")}" placeholder="${this.cb.esc(tr("prov.idPh"))}" autocomplete="off" />
-              ${isEdit ? "" : `<span class="settings-field-hint">${this.cb.esc(tr("prov.idHint"))}</span>`}
             </label>
             <div class="settings-field">
-              <span class="settings-field-label">${this.cb.esc(tr("prov.requestModel"))}</span>
+              <div class="settings-field-label-row">
+                <span class="settings-field-label">${this.cb.esc(tr("prov.requestModel"))}</span>
+                <button type="button" class="btn-ghost settings-mini-btn settings-label-action" id="btn-prov-fetch-models">${this.cb.esc(tr("prov.fetchModels"))}</button>
+              </div>
               <div class="settings-model-combo" id="prov-model-combo">
                 <input class="settings-input" id="prov-model" value="${this.cb.esc(editing?.model ?? "")}" placeholder="${this.cb.esc(tr("prov.modelPh"))}" autocomplete="off" />
                 <button type="button" class="settings-model-combo-btn" id="btn-prov-model-menu" title="${this.cb.esc(tr("prov.pickModel"))}" aria-label="${this.cb.esc(tr("prov.pickModel"))}" aria-haspopup="listbox" aria-expanded="false">▾</button>
                 <div class="settings-model-menu hidden" id="prov-model-menu" role="listbox"></div>
               </div>
+              <span class="settings-save-hint settings-model-fetch-hint" id="prov-fetch-hint"></span>
             </div>
           </div>
-          <label class="settings-field settings-field-check">
-            <input type="checkbox" id="prov-default" ${editing?.isDefault ? "checked" : ""} />
-            <span>${this.cb.esc(tr("prov.setDefault"))}</span>
-          </label>
           <div class="settings-form-actions settings-modal-footer">
             <button type="button" class="btn-ghost" id="btn-prov-cancel-footer">${this.cb.esc(tr("common.cancel"))}</button>
             <button type="button" class="btn-dark" id="btn-prov-save">${this.cb.esc(isEdit ? tr("prov.save") : tr("prov.add"))}</button>
+            <label class="settings-footer-check">
+              <input type="checkbox" id="prov-default" ${editing?.isDefault ? "checked" : ""} />
+              <span>${this.cb.esc(tr("prov.setDefault"))}</span>
+            </label>
             <span class="settings-save-hint" id="prov-save-hint"></span>
           </div>`;
   }
@@ -955,40 +1196,41 @@ export class SettingsPageController {
     visible: boolean,
   ): void {
     btn.setAttribute("aria-pressed", visible ? "true" : "false");
-    btn.textContent = visible ? tr("prov.keyHide") : tr("prov.keyShow");
-    btn.title = visible ? tr("prov.keyHideTitle") : tr("prov.keyShowTitle");
-    btn.setAttribute(
-      "aria-label",
-      visible ? tr("prov.keyHideTitle") : tr("prov.keyShowTitle"),
-    );
+    // 明文时显示划线眼（点一下隐藏）；掩码时显示睁眼（点一下显示）
+    btn.innerHTML = visible ? KEY_EYE_VISIBLE_SVG : KEY_EYE_HIDDEN_SVG;
+    const title = visible ? tr("prov.keyHideTitle") : tr("prov.keyShowTitle");
+    btn.title = title;
+    btn.setAttribute("aria-label", title);
   }
 
   /**
    * 部分中转用 Base64「伪装」API Key：将输入框内容按 Base64 解成明文再写回。
-   * 失败不改动原值；仅接受可打印 UTF-8 文本。
+   * 失败不改动原值；仅接受可打印 UTF-8 文本。反馈写在 Base64 按钮 title。
    */
   private decodeProviderKeyBase64(root: HTMLElement): void {
     const keyInput = root.querySelector("#prov-key") as HTMLInputElement | null;
-    const hint = root.querySelector("#prov-key-b64-hint");
+    const b64Btn = root.querySelector(
+      "#btn-prov-key-b64",
+    ) as HTMLButtonElement | null;
     const visBtn = root.querySelector(
       "#btn-prov-key-vis",
     ) as HTMLButtonElement | null;
     if (!keyInput) return;
     const raw = keyInput.value.trim();
     if (!raw) {
-      if (hint) hint.textContent = tr("prov.keyB64Empty");
+      if (b64Btn) b64Btn.title = tr("prov.keyB64Empty");
       return;
     }
     const decoded = decodeBase64ToPrintableText(raw);
     if (!decoded.ok) {
-      if (hint) hint.textContent = tr("prov.keyB64Fail");
+      if (b64Btn) b64Btn.title = tr("prov.keyB64Fail");
       return;
     }
     keyInput.value = decoded.text;
-    // 解码后自动明文，便于核对（可用「隐藏」收回）
+    // 解码后自动明文，便于核对（可点眼睛收回）
     keyInput.type = "text";
     if (visBtn) this.syncProviderKeyVisButton(visBtn, true);
-    if (hint) hint.textContent = tr("prov.keyB64Ok");
+    if (b64Btn) b64Btn.title = tr("prov.keyB64Ok");
   }
 
   private bindModelCombo(root: HTMLElement): void {

@@ -887,6 +887,9 @@ export class SidePaneController {
       return;
     }
 
+    // 读取前先提示加载，避免「侧栏空空」的误感
+    this.showInfo(tr("side.openingFile", { path }));
+
     const res = await this.inv<{
       path: string;
       absPath: string;
@@ -898,7 +901,8 @@ export class SidePaneController {
     }>("files.read", { path, cwd: cwd ?? undefined });
 
     if (!res.ok || !res.data) {
-      this.showInfo(res.error?.message ?? tr("side.readFail"));
+      const msg = res.error?.message ?? tr("side.readFail");
+      this.showInfo(`${tr("side.readFail")}\n${path}\n\n${msg}`);
       return;
     }
     const d = res.data;
@@ -926,7 +930,12 @@ export class SidePaneController {
   }
 
   showInfo(text: string): void {
-    this.setCategory("files", true);
+    // 不重复 setCategory，避免无 tab 时被 renderActive 刷回 empty
+    this.category = "files";
+    this.open = true;
+    this.applyCategory();
+    this.applyOpenState(true);
+    this.persist();
     $("side-pane-empty").classList.add("hidden");
     $("file-preview").classList.add("hidden");
     $("md-preview").classList.add("hidden");

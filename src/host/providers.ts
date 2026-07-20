@@ -276,6 +276,23 @@ export function listCustomProviders(home?: string): {
   };
 }
 
+/**
+ * CLI 对齐：catalog display name = config `name` ?? `model` ?? 段 id。
+ * 用于 models.list 覆盖展示名（chip / 菜单），内部切换仍用 id。
+ */
+export function modelDisplayNamesFromConfig(
+  home?: string,
+): Map<string, string> {
+  const map = new Map<string, string>();
+  for (const s of parseModelSections(readText(home))) {
+    const name = s.fields.name?.trim();
+    const model = s.fields.model?.trim();
+    const display = name || model || s.id;
+    if (display) map.set(s.id, display);
+  }
+  return map;
+}
+
 export function upsertCustomProvider(
   input: UpsertProviderInput,
   home?: string,

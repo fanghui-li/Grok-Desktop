@@ -101,6 +101,7 @@ import {
 import {
   listCustomProviders,
   listRemoteModels,
+  modelDisplayNamesFromConfig,
   pingProvider,
   removeCustomProvider,
   setDefaultModelId,
@@ -2250,16 +2251,31 @@ export class DesktopHost {
       return this.modelsListCache.list;
     }
     const list = this.modelsListUncached();
-    // 合并自定义提供商 id，保证 Desktop 添加的中转站一定出现在可选列表
+    // 合并自定义提供商 + 用 config 覆盖展示名（对齐 CLI：name ?? model ?? id）
     try {
       const { providers, defaultModel } = listCustomProviders(this.home);
+      const names = modelDisplayNamesFromConfig(this.home);
       for (const p of providers) {
-        if (!list.some((m) => m.id === p.id)) {
+        const display =
+          (p.name || p.model || p.id).trim() || p.id;
+        const hit = list.find((m) => m.id === p.id);
+        if (hit) {
+          hit.name = display;
+          if (defaultModel === p.id) hit.isDefault = true;
+        } else {
           list.push({
             id: p.id,
-            name: p.name || p.id,
+            name: display,
             isDefault: defaultModel === p.id,
           });
+        }
+      }
+      // 非 base_url 的 [model.*] 段也写 name（若有）
+      for (const [id, display] of names) {
+        const hit = list.find((m) => m.id === id);
+        if (hit) {
+          // 自定义提供商已用 p.name 写过；此处补全仅 name/model 的段
+          if (!hit.name || hit.name === hit.id) hit.name = display;
         }
       }
     } catch {

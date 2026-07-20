@@ -29,6 +29,12 @@ import {
   type SettingsPermMode,
   type SettingsThemePreference,
 } from "./settings-page.js";
+import type { ThemeVariant, VariantAppearance } from "../shared/theme/types.js";
+import {
+  applyChromeTheme,
+  defaultAppearance,
+  formatCodexThemeV1,
+} from "../shared/theme/index.js";
 import { PluginsPageController } from "./plugins-page.js";
 import {
   agentAdvertisedCommands,
@@ -210,6 +216,9 @@ let defaultOpenTarget: SettingsOpenTarget = "explorer";
 let localePreference: LocalePreference = "system";
 /** Appearance preference（对齐 Codex Appearance：system | light | dark） */
 let themePreference: SettingsThemePreference = "system";
+/** 分 variant 的 chrome + codeThemeId */
+let appearanceLight: VariantAppearance = defaultAppearance("light");
+let appearanceDark: VariantAppearance = defaultAppearance("dark");
 let systemThemeMql: MediaQueryList | null = null;
 let systemThemeListener: ((ev: MediaQueryListEvent) => void) | null = null;
 /** Codex 可拖拽文件侧栏 */
@@ -2690,11 +2699,26 @@ function effortLabel(level: EffortLevel = effortLevel): string {
   return effortOptions().find((e) => e.id === level)?.label ?? level;
 }
 
-/** chip 短标：如「4.5 高」（对齐 Codex「5.5 超高」） */
+/**
+ * CLI 对齐：展示名 = catalog name（config `name` ?? `model` ?? id）。
+ * 内部切换仍用 modelLabel（id）。
+ */
+function modelDisplayName(modelId: string = modelLabel): string {
+  const id = (modelId || "grok").trim();
+  const hit = modelsCache?.find((m) => m.id === id);
+  const n = hit?.name?.trim();
+  if (n) return n;
+  return id;
+}
+
+/** chip 短标：展示名 + 推理档（对齐 CLI display name） */
 function modelChipText(): string {
-  const raw = (modelLabel || "grok").trim();
-  let short = raw;
-  if (/^grok-/i.test(raw)) short = raw.replace(/^grok-/i, "");
+  const id = (modelLabel || "grok").trim();
+  let short = modelDisplayName(id);
+  // 仅当仍显示 id 且为 grok-* slug 时剥前缀做短标
+  if (short === id && /^grok-/i.test(short)) {
+    short = short.replace(/^grok-/i, "");
+  }
   if (short.length > 18) short = short.slice(0, 16) + "…";
   return `${short} ${effortLabel()}`;
 }
@@ -2705,9 +2729,20 @@ function syncModelLabels(): void {
     const el = document.getElementById(id);
     if (el) el.textContent = v;
   }
+  const display = modelDisplayName();
+  const modelForTitle =
+    display !== (modelLabel || "").trim()
+      ? `${display} (${modelLabel})`
+      : display;
   for (const id of ["btn-model", "btn-model-2"] as const) {
     const btn = document.getElementById(id);
-    if (btn) btn.title = tr("chat.modelTitle", { model: modelLabel, effort: effortLabel(), level: effortLevel });
+    if (btn) {
+      btn.title = tr("chat.modelTitle", {
+        model: modelForTitle,
+        effort: effortLabel(),
+        level: effortLevel,
+      });
+    }
   }
 }
 
@@ -3347,9 +3382,11 @@ async function ensureChipModelAvailable(opts?: {
 }
 
 function shortModelName(id: string = modelLabel): string {
-  const raw = (id || "grok").trim();
-  let short = raw;
-  if (/^grok-/i.test(raw)) short = raw.replace(/^grok-/i, "");
+  const mid = (id || "grok").trim();
+  let short = modelDisplayName(mid);
+  if (short === mid && /^grok-/i.test(short)) {
+    short = short.replace(/^grok-/i, "");
+  }
   if (short.length > 18) short = short.slice(0, 16) + "…";
   return short;
 }
@@ -3360,6 +3397,8 @@ function fetchModelsList(): Promise<ModelRow[]> {
     .then((r) => {
       const list = r.data?.length ? r.data : FALLBACK_MODELS;
       modelsCache = list;
+      // 列表带上 display name 后刷新 chip（否则仍显示 id）
+      syncModelLabels();
       return list;
     })
     .catch(() => modelsCache ?? FALLBACK_MODELS)
@@ -8196,7 +8235,7 @@ async function showAutomationsModal(): Promise<void> {
   };
 }
 
-function resolveTheme(pref: SettingsThemePreference): "light" | "dark" {
+function resolveTheme(pref: SettingsThemePreference): ThemeVariant {
   if (pref === "light" || pref === "dark") return pref;
   try {
     if (typeof matchMedia === "function") {
@@ -8210,9 +8249,31 @@ function resolveTheme(pref: SettingsThemePreference): "light" | "dark" {
   return "light";
 }
 
-function paintResolvedTheme(resolved: "light" | "dark"): void {
-  document.documentElement.dataset.theme = resolved;
-  document.documentElement.style.colorScheme = resolved;
+function appearanceForVariant(v: ThemeVariant): VariantAppearance {
+  return v === "light" ? appearanceLight : appearanceDark;
+}
+
+function paintResolvedTheme(resolved: ThemeVariant): void {
+  const app = appearanceForVariant(resolved);
+  const isDefault = app.codeThemeId === "default" || app.codeThemeId === "codex";
+  applyChromeTheme(app.chromeTheme, resolved, {
+    isDefaultPreset: isDefault,
+  });
+  // 冷启动缓存（theme-boot 可读）
+  try {
+    localStorage.setItem("grok-desktop-theme", themePreference);
+    localStorage.setItem(
+      "grok-desktop-theme-boot",
+      JSON.stringify({
+        variant: resolved,
+        codeThemeId: app.codeThemeId,
+        chrome: app.chromeTheme,
+        isDefault,
+      }),
+    );
+  } catch {
+    /* ignore */
+  }
   void inv("ui.setChromeTheme", { theme: resolved }).catch(() => {
     /* older shell */
   });
@@ -8242,7 +8303,7 @@ function bindSystemThemeListener(): void {
   }
 }
 
-/** 应用外观偏好（写 localStorage 供 theme-boot 冷启动） */
+/** 应用 mode（system/light/dark）并刷新 chrome */
 function applyThemePreference(pref: SettingsThemePreference): void {
   themePreference = pref;
   try {
@@ -8254,12 +8315,38 @@ function applyThemePreference(pref: SettingsThemePreference): void {
   bindSystemThemeListener();
 }
 
+/** 写入内存中的某 variant 外观并可选立即绘制 */
+function setVariantAppearance(
+  variant: ThemeVariant,
+  app: VariantAppearance,
+  repaint: boolean,
+): void {
+  if (variant === "light") appearanceLight = app;
+  else appearanceDark = app;
+  if (repaint && resolveTheme(themePreference) === variant) {
+    paintResolvedTheme(variant);
+  }
+}
+
+/** 导出当前 resolved 变体的 codex-theme-v1 串 */
+function exportCurrentThemeString(): string {
+  const variant = resolveTheme(themePreference);
+  const app = appearanceForVariant(variant);
+  return formatCodexThemeV1({
+    codeThemeId: app.codeThemeId,
+    theme: app.chromeTheme,
+    variant,
+  });
+}
+
 function applyDesktopConfig(cfg: {
   defaultPermMode: SettingsPermMode;
   defaultModel: string;
   defaultOpenTarget: SettingsOpenTarget;
   locale?: LocalePreference;
   theme?: SettingsThemePreference;
+  appearanceLight?: VariantAppearance;
+  appearanceDark?: VariantAppearance;
 }): void {
   // 只更新「新对话默认」；切换供应商等操作不得覆盖当前会话的权限模式 / 模型 chip
   defaultModelLabel = cfg.defaultModel || "grok";
@@ -8275,8 +8362,19 @@ function applyDesktopConfig(cfg: {
     setComposerPlaceholders(goalComposeActive);
     syncModelLabels();
   }
+  let appearanceDirty = false;
+  if (cfg.appearanceLight) {
+    appearanceLight = cfg.appearanceLight;
+    appearanceDirty = true;
+  }
+  if (cfg.appearanceDark) {
+    appearanceDark = cfg.appearanceDark;
+    appearanceDirty = true;
+  }
   if (cfg.theme !== undefined && cfg.theme !== themePreference) {
     applyThemePreference(cfg.theme);
+  } else if (appearanceDirty) {
+    paintResolvedTheme(resolveTheme(themePreference));
   }
   if (!activeSessionId) {
     accessMode =
@@ -8350,6 +8448,9 @@ async function showSettingsPage(): Promise<void> {
       getSelectedProjectId: () => selectedProjectId,
       onConfigApplied: applyDesktopConfig,
       onClosed: restoreComposerAfterOverlay,
+      resolveThemeVariant: () => resolveTheme(themePreference),
+      getAppearance: (v) => appearanceForVariant(v),
+      exportThemeString: () => exportCurrentThemeString(),
     });
   }
   await settingsPage.show();
@@ -9255,6 +9356,8 @@ npm start</pre>
     defaultOpenTarget?: SettingsOpenTarget;
     locale?: LocalePreference;
     theme?: SettingsThemePreference;
+    appearanceLight?: VariantAppearance;
+    appearanceDark?: VariantAppearance;
   }>("config.get");
   if (cfg.data) {
     const mode =
@@ -9268,6 +9371,8 @@ npm start</pre>
       defaultOpenTarget: cfg.data.defaultOpenTarget ?? "explorer",
       locale: pref,
       theme: themePref,
+      appearanceLight: cfg.data.appearanceLight,
+      appearanceDark: cfg.data.appearanceDark,
     });
   } else {
     setLocale(resolveLocale("system", navigator.language));
