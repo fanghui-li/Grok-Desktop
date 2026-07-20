@@ -392,7 +392,7 @@ export const enUS: MessageDict = {
   "slash.noMatchQ": "No matches for “{q}”",
   "slash.alwaysApprove": "Full access",
   "slash.alwaysApproveDesc":
-    "Skip permission prompts; run again to restore Default (same as permission chip)",
+    "Skip permission prompts (prefer the composer permission chip; /always-approve still works)",
   "slash.plan": "Plan mode",
   "slash.planDesc": "Enable Plan (activates on next send; chip × to exit)",
   "slash.viewPlan": "View plan",

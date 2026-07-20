@@ -380,7 +380,7 @@ export const zhCN = {
   "slash.noMatchQ": "无匹配项「{q}」",
   "slash.alwaysApprove": "完全访问",
   "slash.alwaysApproveDesc":
-    "跳过权限确认；再执行一次恢复「默认确认」（同权限 chip）",
+    "跳过权限确认（推荐用输入栏权限 chip；手输 /always-approve 仍可用）",
   "slash.plan": "计划模式",
   "slash.planDesc": "开启 Plan（下次发送激活；chip × 退出）",
   "slash.viewPlan": "查看计划",

@@ -32,6 +32,7 @@ import { PluginsPageController } from "./plugins-page.js";
 import {
   agentAdvertisedCommands,
   getStaticSlashCommands,
+  resolveSlashCommand,
   skillCommands,
   type SlashCommandDef,
 } from "./slash-commands.js";
@@ -4123,6 +4124,29 @@ function showToast(text: string, kind: "info" | "error" = "info"): void {
   }, 3200);
 }
 
+/**
+ * 发送路径：若整行是已知 slash（含 paletteHidden 如 /always-approve），本地执行不交 agent。
+ * 返回 true 表示已处理并应中止发送。
+ */
+async function tryRunComposerSlashLine(raw: string): Promise<boolean> {
+  const t = raw.trim();
+  if (!t.startsWith("/")) return false;
+  // 单 token 或 /cmd args — 先解析主命令
+  const m = t.match(/^\/([^\s]+)(?:\s+([\s\S]*))?$/);
+  if (!m) return false;
+  const name = (m[1] ?? "").toLowerCase();
+  if (!name) return false;
+  // 仅拦截桌面静态命令（skills/agent 广告仍可当 prompt 或走 palette）
+  const cmd = resolveSlashCommand(getStaticSlashCommands(), name);
+  if (!cmd) return false;
+  const ta = activeComposerInput();
+  if (ta) ta.value = "";
+  slashPalette?.hide();
+  const res = await runSlashCommand(cmd);
+  if (res.message) showToast(res.message, res.ok ? "info" : "error");
+  return true;
+}
+
 /** 仅处理会话斜杠命令（导航类走侧栏 / 顶栏 UI） */
 async function runSlashCommand(cmd: SlashCommandDef): Promise<{ ok: boolean; message?: string }> {
   const act = cmd.action;
@@ -7184,6 +7208,8 @@ async function startNewChat(prompt?: string): Promise<void> {
     prompt ??
     ($("composer-input") as HTMLTextAreaElement).value.trim() ??
     ($("chat-input") as HTMLTextAreaElement).value.trim();
+  // 欢迎页手输 /always-approve 等：本地执行，不建空会话
+  if (!prompt && (await tryRunComposerSlashLine(raw))) return;
   const goalParse = parseGoalInput(raw);
   if (goalParse.enterComposeOnly) {
     ($("composer-input") as HTMLTextAreaElement).value = "";
@@ -7545,6 +7571,7 @@ async function sendContinue(): Promise<void> {
   // 空闲时也可 /btw；/interject 需 turn
   {
     const raw = activeComposerInput()?.value.trim() ?? "";
+    if (await tryRunComposerSlashLine(raw)) return;
     const inline = parseInlineBtwOrInterject(raw);
     if (inline?.kind === "btw") {
       const ta = activeComposerInput();
