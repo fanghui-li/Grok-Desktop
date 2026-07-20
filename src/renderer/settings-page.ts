@@ -10,7 +10,8 @@ type Inv = <T>(method: HostIpcMethod, params?: unknown) => Promise<{
   error?: { message?: string };
 }>;
 
-export type SettingsPermMode = "always_approve" | "normal" | "plan";
+/** 默认访问权限；plan 不再作为「权限」默认项（对齐 Grok Build 两维模型） */
+export type SettingsPermMode = "always_approve" | "normal";
 /** explorer | code | cursor | codium | windsurf | editor(遗留) */
 export type SettingsOpenTarget = string;
 
@@ -400,7 +401,6 @@ export class SettingsPageController {
         <div class="settings-choice-row">
           ${this.choiceCard("perm", "normal", mode === "normal", tr("settings.perm.normal"), tr("settings.perm.normalSub"))}
           ${this.choiceCard("perm", "always_approve", mode === "always_approve", tr("settings.perm.full"), tr("settings.perm.fullSub"))}
-          ${this.choiceCard("perm", "plan", mode === "plan", tr("settings.perm.plan"), tr("settings.perm.planSub"))}
         </div>
       </section>
 

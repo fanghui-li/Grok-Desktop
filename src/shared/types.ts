@@ -4,7 +4,15 @@ import type { NormalizedEvent, ThreadStatus } from "./events.js";
 /** 推理力度（对齐 CLI /effort） */
 export type ReasoningEffort = "low" | "medium" | "high" | "xhigh";
 
+/**
+ * 会话「主展示」模式（roster / 兼容字段）。
+ * Grok Build 实际为两维：`AccessMode`（权限）× plan 开关；
+ * `mode` 仅表示 UI 优先展示：plan 激活时为 plan，否则为 access。
+ */
 export type SessionMode = "normal" | "plan" | "always_approve";
+
+/** 访问权限（对齐 Build always-approve / default），与 plan 正交 */
+export type AccessMode = "normal" | "always_approve";
 
 /** Product vocabulary: Project (specs). */
 export interface Project {
@@ -29,7 +37,12 @@ export interface Thread {
   model?: string;
   /** 会话推理力度（与 model 一并按会话记忆） */
   effort?: ReasoningEffort | string;
+  /** 派生展示：plan 优先，否则 access */
   mode?: SessionMode;
+  /** 访问权限：完全访问 / 默认确认（与 plan 独立，对齐 Build yolo） */
+  accessMode?: AccessMode;
+  /** 计划模式是否激活（含 pending/active；Host 侧布尔） */
+  planActive?: boolean;
   pinned?: boolean;
   archived?: boolean;
   worktreeId?: string;
@@ -83,7 +96,10 @@ export interface ThreadsCreateParams {
   /** 最大回合数；写入 session _meta.maxTurns（agent 可忽略） */
   maxTurns?: number;
   alwaysApprove?: boolean;
+  /** @deprecated 优先 alwaysApprove + plan；保留兼容旧调用 */
   mode?: SessionMode;
+  /** 创建时是否进入 plan（可与 alwaysApprove 同时为 true） */
+  plan?: boolean;
   worktree?: {
     mode: WorktreeMode;
     name?: string;

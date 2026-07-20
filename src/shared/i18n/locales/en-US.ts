@@ -218,7 +218,7 @@ export const enUS: MessageDict = {
 
   "settings.defaultPerm": "Default permissions",
   "settings.defaultPermDesc":
-    "Default policy for new chats. The composer can override temporarily without changing this default.",
+    "Default access policy for new chats (Full access / Default). Plan mode is independent — use /plan or the plan chip.",
   "settings.perm.normal": "Default",
   "settings.perm.normalSub":
     "Read/write workspace files; sensitive actions need approval",

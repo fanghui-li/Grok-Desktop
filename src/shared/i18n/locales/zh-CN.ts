@@ -211,7 +211,7 @@ export const zhCN = {
 
   "settings.defaultPerm": "默认权限",
   "settings.defaultPermDesc":
-    "新对话默认使用的权限策略。输入区可临时覆盖，不影响此处默认值。",
+    "新对话默认访问权限（完全访问 / 默认确认）。计划模式与权限独立，用 /plan 或计划 chip 开关。",
   "settings.perm.normal": "默认确认",
   "settings.perm.normalSub": "读写工作区文件，敏感操作需你批准",
   "settings.perm.full": "完全访问",

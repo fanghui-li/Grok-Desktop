@@ -13,6 +13,7 @@ import type {
   HunkTimelineEntry,
   InboxItem,
   ModelInfo,
+  AccessMode,
   PermissionDecision,
   PlanState,
   Project,
@@ -374,7 +375,7 @@ export class DesktopHost {
     defaultModel?: string;
     grokPathOverride?: string;
     alwaysApproveDefault?: boolean;
-    defaultPermMode?: "always_approve" | "normal" | "plan";
+    defaultPermMode?: "always_approve" | "normal";
     defaultOpenTarget?: string;
     locale?: "zh-CN" | "en-US" | "system";
   }) {
@@ -608,10 +609,14 @@ export class DesktopHost {
     }
 
     const cfg = this.configGet();
+    // 两维：访问权限 × plan（对齐 Grok Build；可同时 true）
     const alwaysApprove =
       params.alwaysApprove === true ||
       params.mode === "always_approve" ||
       cfg.alwaysApproveDefault === true;
+    const planActive =
+      params.plan === true || params.mode === "plan";
+    const accessMode: AccessMode = alwaysApprove ? "always_approve" : "normal";
 
     const threadId = `thread_${randomUUID()}`;
     const title = params.title ?? params.prompt?.slice(0, 80) ?? "New Thread";
@@ -625,7 +630,9 @@ export class DesktopHost {
       cwd,
       status: "idle",
       model: params.model ?? cfg.defaultModel,
-      mode: params.mode ?? (alwaysApprove ? "always_approve" : "normal"),
+      accessMode,
+      planActive,
+      mode: deriveSessionMode(accessMode, planActive),
       worktreeId,
       createdAt: now,
       updatedAt: now,
@@ -647,9 +654,10 @@ export class DesktopHost {
     try {
       await client.start();
       const meta: Record<string, unknown> = {};
+      // Build：yolo 可在 plan 底下保持 armed
       if (alwaysApprove) meta.yoloMode = true;
       if (thread.model) meta.modelId = thread.model;
-      if (params.mode === "plan") meta.planMode = true;
+      if (planActive) meta.planMode = true;
       // 对齐 agent wire：meta.reasoningEffort（low|medium|high|xhigh）
       const effort = (params.effort ?? "").toString().trim().toLowerCase();
       if (effort && ["low", "medium", "high", "xhigh"].includes(effort)) {
@@ -678,8 +686,8 @@ export class DesktopHost {
       });
       if (worktreeId) this.worktrees.bindSession(worktreeId, sessionId);
 
-      // planMode meta  alone 不够：显式 session/set_mode，对齐 CLI /plan 激活
-      if (params.mode === "plan") {
+      // planMode meta alone 不够：显式 session/set_mode，对齐 CLI /plan 激活
+      if (planActive) {
         try {
           await client.setSessionMode("plan");
         } catch (err) {
@@ -998,33 +1006,69 @@ export class DesktopHost {
   }
 
   /**
-   * 切换会话模式（plan / always_approve / normal）。
-   * plan ↔ default 走 ACP session/set_mode；本地 thread.mode 同步更新。
+   * 更新会话策略（对齐 Grok Build 两维模型）。
+   * - `plan`：ACP session/set_mode plan|default
+   * - `alwaysApprove`：本地 armed 标志；Host 对 permission.requested 自动放行
+   * - 二者正交，可同时为 true（yolo armed underneath plan）
+   *
+   * 兼容旧调用：`mode: SessionMode` 仍可传，会映射到两维（会清掉未表达的维）。
    */
-  async threadsSetMode(threadId: string, mode: SessionMode): Promise<Thread> {
+  async threadsSetMode(
+    threadId: string,
+    modeOrPatch:
+      | SessionMode
+      | {
+          mode?: SessionMode;
+          alwaysApprove?: boolean;
+          plan?: boolean;
+        },
+  ): Promise<Thread> {
     const live = this.threads.get(threadId);
     if (!live) throw new HostError("SESSION_NOT_FOUND", `Unknown Thread: ${threadId}`);
-    live.thread.mode = mode;
+
+    const patch =
+      typeof modeOrPatch === "string"
+        ? legacyModeToPatch(modeOrPatch)
+        : modeOrPatch.mode !== undefined &&
+            modeOrPatch.alwaysApprove === undefined &&
+            modeOrPatch.plan === undefined
+          ? legacyModeToPatch(modeOrPatch.mode)
+          : modeOrPatch;
+
+    let access: AccessMode =
+      live.thread.accessMode ??
+      (live.thread.mode === "always_approve" ? "always_approve" : "normal");
+    let planActive = live.thread.planActive ?? live.thread.mode === "plan";
+
+    if (patch.alwaysApprove !== undefined) {
+      access = patch.alwaysApprove ? "always_approve" : "normal";
+    }
+    if (patch.plan !== undefined) {
+      planActive = patch.plan;
+    }
+
+    live.thread.accessMode = access;
+    live.thread.planActive = planActive;
+    live.thread.mode = deriveSessionMode(access, planActive);
     live.thread.updatedAt = new Date().toISOString();
-    if (live.client && live.writable) {
+
+    if (live.client && live.writable && patch.plan !== undefined) {
       try {
-        if (mode === "plan") {
-          await live.client.setSessionMode("plan");
-        } else {
-          // normal / always_approve 在 agent 侧都是 default prompt mode；
-          // always-approve 另由权限策略处理
-          await live.client.setSessionMode("default");
-        }
+        await live.client.setSessionMode(planActive ? "plan" : "default");
       } catch (err) {
         this.logger.warn("threads.setMode_acp_failed", {
           threadId,
-          mode,
+          planActive,
           err: err instanceof Error ? err.message : String(err),
         });
-        // 仍返回本地 mode，UI 可继续；下次 create 会带 meta
       }
     }
-    this.logger.info("threads.setMode", { threadId, mode });
+    this.logger.info("threads.setMode", {
+      threadId,
+      accessMode: access,
+      planActive,
+      mode: live.thread.mode,
+    });
     return { ...live.thread };
   }
 
@@ -2409,15 +2453,45 @@ export class DesktopHost {
       live.thread.updatedAt = new Date().toISOString();
     }
     if (ev.type === "permission.requested" && live) {
-      this.inbox.add({
-        type: "permission",
-        title: "Permission required",
-        body: ev.summary,
-        sessionId: ev.sessionId,
-        threadId,
-        requestId: ev.requestId,
-        projectId: live.thread.projectId,
-      });
+      // Build：always-approve 可在 plan 底下 armed；非 edit 类由 agent/yolo 或此处代批
+      const yolo =
+        live.thread.accessMode === "always_approve" ||
+        live.thread.mode === "always_approve";
+      if (yolo && live.client) {
+        try {
+          live.client.respondPermission(ev.requestId, "allow_once");
+          this.logger.info("permission.auto_approved", {
+            threadId,
+            requestId: ev.requestId,
+            planActive: live.thread.planActive,
+          });
+          // 仍下发事件供 UI 可选展示，但不进 Inbox 打扰
+        } catch (err) {
+          this.logger.warn("permission.auto_approve_failed", {
+            threadId,
+            err: err instanceof Error ? err.message : String(err),
+          });
+          this.inbox.add({
+            type: "permission",
+            title: "Permission required",
+            body: ev.summary,
+            sessionId: ev.sessionId,
+            threadId,
+            requestId: ev.requestId,
+            projectId: live.thread.projectId,
+          });
+        }
+      } else {
+        this.inbox.add({
+          type: "permission",
+          title: "Permission required",
+          body: ev.summary,
+          sessionId: ev.sessionId,
+          threadId,
+          requestId: ev.requestId,
+          projectId: live.thread.projectId,
+        });
+      }
     }
     if (ev.type === "session.available_commands" && live) {
       live.availableCommands = ev.commands;
@@ -2553,4 +2627,20 @@ export class DesktopHost {
     if (err instanceof Error) return new HostError("INTERNAL", err.message);
     return new HostError("INTERNAL", String(err));
   }
+}
+
+/** plan 优先展示；否则为 access（对齐 Build 状态条） */
+function deriveSessionMode(access: AccessMode, planActive: boolean): SessionMode {
+  if (planActive) return "plan";
+  return access;
+}
+
+/** 旧三态 mode → 两维 patch（会同时设定两维） */
+function legacyModeToPatch(mode: SessionMode): {
+  alwaysApprove: boolean;
+  plan: boolean;
+} {
+  if (mode === "plan") return { alwaysApprove: false, plan: true };
+  if (mode === "always_approve") return { alwaysApprove: true, plan: false };
+  return { alwaysApprove: false, plan: false };
 }

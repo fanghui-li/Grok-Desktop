@@ -247,7 +247,8 @@ export function authLogout(home?: string): {
 }
 
 /** Desktop UI / defaults persisted under ~/.grok/desktop/settings.json */
-export type DesktopPermMode = "always_approve" | "normal" | "plan";
+/** 默认访问权限（不含 plan；plan 是独立会话模式） */
+export type DesktopPermMode = "always_approve" | "normal";
 /** explorer | code | cursor | codium | windsurf | editor(遗留) */
 export type DesktopOpenTarget = string;
 
@@ -295,9 +296,12 @@ export function readDesktopConfig(home?: string): DesktopConfig {
 /** Normalized view for UI / Host consumers. */
 export function getDesktopConfigView(home?: string): DesktopConfigView {
   const raw = readDesktopConfig(home);
+  // 历史配置可能把 plan 写进 defaultPermMode；plan 不是访问权限，回落 normal
+  const rawPerm = raw.defaultPermMode;
   const defaultPermMode: DesktopPermMode =
-    raw.defaultPermMode ??
-    (raw.alwaysApproveDefault ? "always_approve" : "normal");
+    rawPerm === "always_approve" || raw.alwaysApproveDefault
+      ? "always_approve"
+      : "normal";
   return {
     ...raw,
     defaultPermMode,
