@@ -218,7 +218,7 @@ export const enUS: MessageDict = {
 
   "settings.defaultPerm": "Default permissions",
   "settings.defaultPermDesc":
-    "Default policy for new chats. The composer can override temporarily without changing this default.",
+    "Default access policy for new chats (Full access / Default). Plan mode is independent — use /plan or the plan chip.",
   "settings.perm.normal": "Default",
   "settings.perm.normalSub":
     "Read/write workspace files; sensitive actions need approval",
@@ -392,7 +392,7 @@ export const enUS: MessageDict = {
   "slash.noMatchQ": "No matches for “{q}”",
   "slash.alwaysApprove": "Full access",
   "slash.alwaysApproveDesc":
-    "Skip permission prompts; run again to restore Default (same as permission chip)",
+    "Skip permission prompts (prefer the composer permission chip; /always-approve still works)",
   "slash.plan": "Plan mode",
   "slash.planDesc": "Enable Plan (activates on next send; chip × to exit)",
   "slash.viewPlan": "View plan",

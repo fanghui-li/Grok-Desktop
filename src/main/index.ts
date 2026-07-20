@@ -401,7 +401,19 @@ async function handleHostIpc(
       return resultOk(await host.threadsDelete(p.threadId as string));
     case "threads.setMode":
       return resultOk(
-        await host.threadsSetMode(p.threadId as string, p.mode as never),
+        await host.threadsSetMode(
+          p.threadId as string,
+          // 新：{ alwaysApprove, plan }；旧：{ mode }
+          p.mode !== undefined &&
+            p.alwaysApprove === undefined &&
+            p.plan === undefined
+            ? (p.mode as never)
+            : {
+                mode: p.mode as never,
+                alwaysApprove: p.alwaysApprove as boolean | undefined,
+                plan: p.plan as boolean | undefined,
+              },
+        ),
       );
     case "threads.setModel":
       return resultOk(

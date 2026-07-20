@@ -211,7 +211,7 @@ export const zhCN = {
 
   "settings.defaultPerm": "默认权限",
   "settings.defaultPermDesc":
-    "新对话默认使用的权限策略。输入区可临时覆盖，不影响此处默认值。",
+    "新对话默认访问权限（完全访问 / 默认确认）。计划模式与权限独立，用 /plan 或计划 chip 开关。",
   "settings.perm.normal": "默认确认",
   "settings.perm.normalSub": "读写工作区文件，敏感操作需你批准",
   "settings.perm.full": "完全访问",
@@ -380,7 +380,7 @@ export const zhCN = {
   "slash.noMatchQ": "无匹配项「{q}」",
   "slash.alwaysApprove": "完全访问",
   "slash.alwaysApproveDesc":
-    "跳过权限确认；再执行一次恢复「默认确认」（同权限 chip）",
+    "跳过权限确认（推荐用输入栏权限 chip；手输 /always-approve 仍可用）",
   "slash.plan": "计划模式",
   "slash.planDesc": "开启 Plan（下次发送激活；chip × 退出）",
   "slash.viewPlan": "查看计划",

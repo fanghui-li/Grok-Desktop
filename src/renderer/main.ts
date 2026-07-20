@@ -32,6 +32,7 @@ import { PluginsPageController } from "./plugins-page.js";
 import {
   agentAdvertisedCommands,
   getStaticSlashCommands,
+  resolveSlashCommand,
   skillCommands,
   type SlashCommandDef,
 } from "./slash-commands.js";
@@ -145,13 +146,22 @@ function setActiveCwd(cwd: string | null): void {
 }
 /** 当前 transcript 中下一条 user 消息的 prompt_index（与 agent rewind 对齐） */
 let nextUserPromptIndex = 0;
-let permMode: SettingsPermMode = "normal";
+/**
+ * 访问权限（对齐 Grok Build always-approve / default）。
+ * 与 plan 正交：plan 激活时 yolo 仍可 armed underneath。
+ */
+let accessMode: SettingsPermMode = "normal";
 /**
  * Plan 状态（对齐 CLI Pending / Active）：
  * - pending：用户开了 plan，尚未发下一条消息
  * - active：agent 已进 plan（set_mode 或 plan.mode.changed）
+ * 与 accessMode 独立，不再塞进同一个三态枚举。
  */
 let planPhase: "off" | "pending" | "active" = "off";
+
+function isPlanOn(): boolean {
+  return planPhase !== "off";
+}
 /** 当前待审批的 exit_plan_mode 请求 */
 let pendingPlanApproval: {
   requestId: string;
@@ -777,7 +787,11 @@ function bindChatScrollLayout(): void {
     if (dock) ro.observe(dock);
     if (chat) ro.observe(chat);
   }
-  window.addEventListener("resize", () => syncChatComposerReserve());
+  window.addEventListener("resize", () => {
+    syncChatComposerReserve();
+    // 窗口拉伸后 fixed 菜单坐标失效，直接关闭（权限 / 模型 / +）
+    hideEphemeralMenus();
+  });
   // 显示对话 / 目标条 / 权限条显隐时再量一次
   if (chat && typeof MutationObserver !== "undefined") {
     new MutationObserver(() => {
@@ -2443,8 +2457,8 @@ async function rewindToUserPrompt(
 }
 
 function permLabel(): string {
-  // 计划模式用独立 chip 标识；权限下拉只体现访问策略
-  if (permMode === "always_approve") return tr("composer.permFull");
+  // 权限 chip 只体现访问策略；plan 用独立 chip（对齐 Build）
+  if (accessMode === "always_approve") return tr("composer.permFull");
   return tr("composer.permDefault");
 }
 
@@ -2826,13 +2840,14 @@ async function startFreshSessionWithModel(
     model: modelId,
     effort,
     maxTurns: maxTurnsLimit ?? undefined,
-    alwaysApprove: permMode === "always_approve",
-    mode:
-      permMode === "plan"
-        ? "plan"
-        : permMode === "always_approve"
-          ? "always_approve"
-          : "normal",
+    alwaysApprove: accessMode === "always_approve",
+    plan: isPlanOn(),
+    // 兼容字段：展示用派生 mode
+    mode: isPlanOn()
+      ? "plan"
+      : accessMode === "always_approve"
+        ? "always_approve"
+        : "normal",
   });
 
   if (!res.ok) {
@@ -3263,7 +3278,7 @@ function currentGoalTitle(): string | null {
 
 /** 输入栏红框区域：计划 / 目标状态 chip（对齐 Codex） */
 function syncSessionModeChips(): void {
-  const planOn = permMode === "plan";
+  const planOn = isPlanOn();
   const goalTitle = currentGoalTitle();
   // /goal 进入编写态即显示 chip，发送后仍显示
   const goalOn = Boolean(goalTitle) || goalComposeActive;
@@ -3289,18 +3304,21 @@ function syncSessionModeChips(): void {
 }
 
 /**
- * 同步会话 mode 到 agent。旧会话是 disk_*，必须先 attach 成 live thread，
- * 否则 Host 报 Unknown Thread: disk_…
+ * 同步访问权限 + plan 到 agent（两维正交）。
+ * 旧会话是 disk_*，必须先 attach 成 live thread。
  */
-async function setThreadModeLive(
-  mode: "plan" | "normal" | "always_approve",
-): Promise<{ ok: boolean; message?: string }> {
+async function syncSessionPolicyLive(opts?: {
+  plan?: boolean;
+  alwaysApprove?: boolean;
+}): Promise<{ ok: boolean; message?: string }> {
+  const plan = opts?.plan ?? isPlanOn();
+  const alwaysApprove =
+    opts?.alwaysApprove ?? accessMode === "always_approve";
   if (!activeSessionId && !activeThreadId) {
     // 尚无会话：仅 UI 标记，create 时带 meta
     return { ok: true };
   }
   if (!activeCwd && activeSessionId) {
-    // attach 需要 cwd；尝试从 thread 列表补
     const row = threads.find((t) => t.sessionId === activeSessionId);
     if (row?.cwd) setActiveCwd(row.cwd);
   }
@@ -3311,7 +3329,11 @@ async function setThreadModeLive(
       message: tr("mode.attachFail"),
     };
   }
-  const r = await inv("threads.setMode", { threadId, mode });
+  const r = await inv("threads.setMode", {
+    threadId,
+    plan,
+    alwaysApprove,
+  });
   if (!r.ok) {
     return {
       ok: false,
@@ -3321,12 +3343,26 @@ async function setThreadModeLive(
   return { ok: true };
 }
 
+/** @deprecated 兼容旧调用名 → 两维 sync */
+async function setThreadModeLive(
+  mode: "plan" | "normal" | "always_approve",
+): Promise<{ ok: boolean; message?: string }> {
+  if (mode === "plan") {
+    return syncSessionPolicyLive({ plan: true });
+  }
+  if (mode === "always_approve") {
+    return syncSessionPolicyLive({ plan: isPlanOn(), alwaysApprove: true });
+  }
+  // normal：仅关 plan？旧语义是整段重置。保留为关 plan + 默认确认。
+  return syncSessionPolicyLive({ plan: false, alwaysApprove: false });
+}
+
 function exitPlanMode(): void {
-  if (permMode !== "plan" && planPhase === "off") return;
-  permMode = "normal";
+  if (!isPlanOn()) return;
   planPhase = "off";
+  // 退出 plan 不碰 accessMode（Build：yolo 标记在 plan 退出后重新露出）
   syncPermLabels();
-  void setThreadModeLive("normal").then((r) => {
+  void syncSessionPolicyLive({ plan: false }).then((r) => {
     if (!r.ok) {
       showToast(r.message ?? tr("plan.exitSyncFail"), "error");
     }
@@ -3334,13 +3370,12 @@ function exitPlanMode(): void {
   showToast(tr("plan.exited"));
 }
 
-/** 开启计划模式（UI + ACP session/set_mode plan） */
+/** 开启计划模式（UI + ACP session/set_mode plan）；保留当前 accessMode */
 async function enterPlanMode(): Promise<{ ok: boolean; message?: string }> {
-  permMode = "plan";
   planPhase = "pending";
   syncPermLabels();
   if (activeSessionId || activeThreadId) {
-    const r = await setThreadModeLive("plan");
+    const r = await syncSessionPolicyLive({ plan: true });
     if (!r.ok) {
       return {
         ok: false,
@@ -3424,7 +3459,7 @@ function syncPlanPanelChrome(): void {
   }
   if (status) {
     const bits: string[] = [];
-    if (permMode === "plan") {
+    if (isPlanOn()) {
       bits.push(
         planPhase === "pending"
           ? "Pending"
@@ -3716,10 +3751,10 @@ async function respondPlanPanel(
     );
 
     if (outcome === "approved") {
+      // 退出 plan，保留 accessMode（Build：yolo 在 plan 下 armed，批准后继续）
       planPhase = "off";
-      permMode = "normal";
       syncPermLabels();
-      await setThreadModeLive("normal");
+      await syncSessionPolicyLive({ plan: false });
       setPlanPanelBusy(false);
       sidePane?.closePlanCategory();
       syncPlanPanelChrome();
@@ -3737,20 +3772,18 @@ async function respondPlanPanel(
         });
       }
     } else if (outcome === "abandoned") {
-      // 退出 plan 模式；plan.md 保留，仅 status=rejected（plans.reject / respond）
+      // 退出 plan；保留 accessMode
       planPhase = "off";
-      permMode = "normal";
       syncPermLabels();
-      await setThreadModeLive("normal");
+      await syncSessionPolicyLive({ plan: false });
       setPlanPanelBusy(false);
       sidePane?.closePlanCategory();
       syncPlanPanelChrome();
       showToast(tr("plan.abandonToast"));
       appendLine(tr("plan.abandonLine"), "system");
     } else {
-      // cancelled = 要求修改：保持 plan
+      // cancelled = 要求修改：保持 plan + accessMode
       planPhase = "active";
-      permMode = "plan";
       syncPermLabels();
       setPlanPanelBusy(false);
 
@@ -3868,7 +3901,7 @@ function notePlanArtifactFromTool(name: string | undefined, raw: unknown): void 
  * - 否则仅 toast，用户 /view-plan 或点 chip 再开
  */
 async function maybeSurfacePlanAfterTurn(): Promise<void> {
-  if (permMode !== "plan" && planPhase === "off") return;
+  if (!isPlanOn()) return;
   if (!activeSessionId) return;
   if (pendingPlanApproval) return;
 
@@ -4091,17 +4124,42 @@ function showToast(text: string, kind: "info" | "error" = "info"): void {
   }, 3200);
 }
 
+/**
+ * 发送路径：若整行是已知 slash（含 paletteHidden 如 /always-approve），本地执行不交 agent。
+ * 返回 true 表示已处理并应中止发送。
+ */
+async function tryRunComposerSlashLine(raw: string): Promise<boolean> {
+  const t = raw.trim();
+  if (!t.startsWith("/")) return false;
+  // 单 token 或 /cmd args — 先解析主命令
+  const m = t.match(/^\/([^\s]+)(?:\s+([\s\S]*))?$/);
+  if (!m) return false;
+  const name = (m[1] ?? "").toLowerCase();
+  if (!name) return false;
+  // 仅拦截桌面静态命令（skills/agent 广告仍可当 prompt 或走 palette）
+  const cmd = resolveSlashCommand(getStaticSlashCommands(), name);
+  if (!cmd) return false;
+  const ta = activeComposerInput();
+  if (ta) ta.value = "";
+  slashPalette?.hide();
+  const res = await runSlashCommand(cmd);
+  if (res.message) showToast(res.message, res.ok ? "info" : "error");
+  return true;
+}
+
 /** 仅处理会话斜杠命令（导航类走侧栏 / 顶栏 UI） */
 async function runSlashCommand(cmd: SlashCommandDef): Promise<{ ok: boolean; message?: string }> {
   const act = cmd.action;
   switch (act.kind) {
     case "set-perm":
-      // always-approve：与 CLI 一致为 toggle；与权限 chip「完全访问」同一状态
+      // always-approve：toggle 访问权限，不退出 plan（Build：yolo armed underneath）
       if (act.mode === "always_approve") {
-        if (permMode === "plan") exitPlanMode();
-        const on = permMode !== "always_approve";
-        permMode = on ? "always_approve" : "normal";
-        const sync = await setThreadModeLive(on ? "always_approve" : "normal");
+        const on = accessMode !== "always_approve";
+        accessMode = on ? "always_approve" : "normal";
+        const sync = await syncSessionPolicyLive({
+          alwaysApprove: on,
+          plan: isPlanOn(),
+        });
         syncPermLabels();
         return {
           ok: sync.ok,
@@ -4113,16 +4171,16 @@ async function runSlashCommand(cmd: SlashCommandDef): Promise<{ ok: boolean; mes
         };
       }
       if (act.mode === "plan") {
+        // /plan 再开一次：若已在 plan 则退出（toggle 感）；否则进入
+        if (isPlanOn()) {
+          exitPlanMode();
+          return { ok: true, message: tr("slash.exitPlan") };
+        }
         return enterPlanMode();
       }
-      // normal：若在 plan 中则完整退出
-      if (permMode === "plan") {
-        exitPlanMode();
-        return { ok: true, message: tr("slash.exitPlan") };
-      }
-      permMode = "normal";
-      planPhase = "off";
-      await setThreadModeLive("normal");
+      // normal：只切访问权限为默认确认，不强制退 plan
+      accessMode = "normal";
+      await syncSessionPolicyLive({ alwaysApprove: false, plan: isPlanOn() });
       syncPermLabels();
       return { ok: true, message: tr("slash.permTo", { label: permLabel() }) };
     case "view-plan":
@@ -7150,6 +7208,8 @@ async function startNewChat(prompt?: string): Promise<void> {
     prompt ??
     ($("composer-input") as HTMLTextAreaElement).value.trim() ??
     ($("chat-input") as HTMLTextAreaElement).value.trim();
+  // 欢迎页手输 /always-approve 等：本地执行，不建空会话
+  if (!prompt && (await tryRunComposerSlashLine(raw))) return;
   const goalParse = parseGoalInput(raw);
   if (goalParse.enterComposeOnly) {
     ($("composer-input") as HTMLTextAreaElement).value = "";
@@ -7196,8 +7256,13 @@ async function startNewChat(prompt?: string): Promise<void> {
     effort: effortLevel,
     maxTurns: maxTurnsLimit ?? undefined,
     // 关键：不传 prompt，避免 Host 阻塞到 turn 结束
-    alwaysApprove: permMode === "always_approve",
-    mode: permMode === "plan" ? "plan" : permMode === "always_approve" ? "always_approve" : "normal",
+    alwaysApprove: accessMode === "always_approve",
+    plan: isPlanOn(),
+    mode: isPlanOn()
+      ? "plan"
+      : accessMode === "always_approve"
+        ? "always_approve"
+        : "normal",
   });
 
   if (!res.ok) {
@@ -7223,7 +7288,7 @@ async function startNewChat(prompt?: string): Promise<void> {
   );
 
   // Pending → Active：下一条消息进入计划 Active
-  if (permMode === "plan" && planPhase === "pending") {
+  if (planPhase === "pending") {
     planPhase = "active";
   }
   lastPlanArtifactPath = null;
@@ -7506,6 +7571,7 @@ async function sendContinue(): Promise<void> {
   // 空闲时也可 /btw；/interject 需 turn
   {
     const raw = activeComposerInput()?.value.trim() ?? "";
+    if (await tryRunComposerSlashLine(raw)) return;
     const inline = parseInlineBtwOrInterject(raw);
     if (inline?.kind === "btw") {
       const ta = activeComposerInput();
@@ -7556,7 +7622,7 @@ async function sendContinue(): Promise<void> {
     taken.goalTitle && !goalPaused ? taken.goalTitle : null,
   );
   // Pending → Active：下一条消息进入计划 Active
-  if (permMode === "plan" && planPhase === "pending") {
+  if (planPhase === "pending") {
     planPhase = "active";
   }
   lastPlanArtifactPath = null;
@@ -7839,7 +7905,8 @@ function applyDesktopConfig(cfg: {
     syncModelLabels();
   }
   if (!activeSessionId) {
-    permMode = cfg.defaultPermMode;
+    accessMode =
+      cfg.defaultPermMode === "always_approve" ? "always_approve" : "normal";
     applyDefaultToChip();
     syncPermLabels();
   }
@@ -7880,31 +7947,173 @@ async function showSettingsPage(): Promise<void> {
   await settingsPage.show();
 }
 
-function showPermMenu(anchor: HTMLElement): void {
-  hideModelMenu();
-  const menu = $("perm-menu");
-  const r = anchor.getBoundingClientRect();
-  menu.style.left = `${r.left}px`;
-  menu.style.top = `${r.bottom + 4}px`;
-  menu.classList.remove("hidden");
+/** 权限菜单关闭动画收尾定时器 */
+let permMenuCloseTimer: ReturnType<typeof setTimeout> | null = null;
+let permMenuOpenRaf = 0;
+
+function isPermMenuVisible(): boolean {
+  const menu = document.getElementById("perm-menu");
+  return Boolean(menu && !menu.classList.contains("hidden"));
 }
 
 /**
- * Shift+Tab：循环会话模式（对齐 CLI）
- * normal → plan → always_approve → normal
+ * 关闭权限菜单。
+ * @param immediate 窗口 resize 等场景跳过动画，避免残影留在原点
+ */
+function hidePermMenu(opts?: { immediate?: boolean }): void {
+  const menu = document.getElementById("perm-menu");
+  if (!menu) return;
+  if (permMenuOpenRaf) {
+    cancelAnimationFrame(permMenuOpenRaf);
+    permMenuOpenRaf = 0;
+  }
+  if (permMenuCloseTimer != null) {
+    clearTimeout(permMenuCloseTimer);
+    permMenuCloseTimer = null;
+  }
+
+  const finish = () => {
+    menu.classList.add("hidden");
+    menu.classList.remove("is-open", "open-up", "open-down");
+    delete menu.dataset.anchor;
+  };
+
+  const reduced =
+    typeof matchMedia === "function" &&
+    matchMedia("(prefers-reduced-motion: reduce)").matches;
+  if (
+    opts?.immediate ||
+    reduced ||
+    menu.classList.contains("hidden") ||
+    !menu.classList.contains("is-open")
+  ) {
+    menu.classList.remove("is-open");
+    finish();
+    return;
+  }
+
+  menu.classList.remove("is-open");
+  const onEnd = (e: TransitionEvent) => {
+    if (e.target !== menu) return;
+    if (e.propertyName !== "opacity" && e.propertyName !== "transform") return;
+    menu.removeEventListener("transitionend", onEnd);
+    if (permMenuCloseTimer != null) {
+      clearTimeout(permMenuCloseTimer);
+      permMenuCloseTimer = null;
+    }
+    finish();
+  };
+  menu.addEventListener("transitionend", onEnd);
+  // transitionend 偶发丢失时兜底
+  permMenuCloseTimer = setTimeout(() => {
+    menu.removeEventListener("transitionend", onEnd);
+    permMenuCloseTimer = null;
+    finish();
+  }, 240);
+}
+
+/** 窗口几何变化时关掉 fixed 浮层，避免锚点失效留在原点 */
+function hideEphemeralMenus(): void {
+  hidePermMenu({ immediate: true });
+  hideModelMenu();
+  hidePlusMenu();
+}
+
+function syncPermMenuActiveItem(): void {
+  const menu = document.getElementById("perm-menu");
+  if (!menu) return;
+  for (const btn of Array.from(menu.querySelectorAll<HTMLElement>("[data-mode]"))) {
+    const mode = btn.dataset.mode;
+    // 菜单只反映访问权限，与 plan 无关
+    const active =
+      mode === "always_approve"
+        ? accessMode === "always_approve"
+        : mode === "normal"
+          ? accessMode === "normal"
+          : false;
+    btn.classList.toggle("is-active", active);
+  }
+}
+
+function showPermMenu(anchor: HTMLElement): void {
+  hideModelMenu();
+  hidePlusMenu();
+  const menu = $("perm-menu");
+
+  // 再次点击同一锚点：丝滑收起
+  if (
+    isPermMenuVisible() &&
+    menu.classList.contains("is-open") &&
+    menu.dataset.anchor === anchor.id
+  ) {
+    hidePermMenu();
+    return;
+  }
+
+  if (permMenuCloseTimer != null) {
+    clearTimeout(permMenuCloseTimer);
+    permMenuCloseTimer = null;
+  }
+  if (permMenuOpenRaf) {
+    cancelAnimationFrame(permMenuOpenRaf);
+    permMenuOpenRaf = 0;
+  }
+
+  // 先无 is-open 显示以便测量真实尺寸，再 rAF 触发展开动画
+  menu.classList.remove("hidden", "is-open");
+  syncPermMenuActiveItem();
+  const r = anchor.getBoundingClientRect();
+  const mw = menu.offsetWidth || 160;
+  const mh = menu.offsetHeight || 88;
+  let left = r.left;
+  if (left + mw > window.innerWidth - 8) left = window.innerWidth - mw - 8;
+  if (left < 8) left = 8;
+  // 输入栏贴底：优先向上弹出，避免「完全访问」等项被窗口底边裁切
+  const spaceBelow = window.innerHeight - r.bottom;
+  let top: number;
+  let openUp = false;
+  if (spaceBelow < mh + 12 && r.top > mh + 12) {
+    top = Math.max(8, r.top - mh - 6);
+    openUp = true;
+  } else {
+    top = r.bottom + 4;
+    if (top + mh > window.innerHeight - 8) {
+      top = Math.max(8, window.innerHeight - mh - 8);
+    }
+    // 最终仍在 chip 上方则用向上动效
+    openUp = top + mh / 2 < r.top;
+  }
+  menu.classList.toggle("open-up", openUp);
+  menu.classList.toggle("open-down", !openUp);
+  menu.style.left = `${left}px`;
+  menu.style.top = `${top}px`;
+  menu.dataset.anchor = anchor.id;
+
+  // 强制 reflow，保证从收起态过渡到 is-open
+  void menu.offsetWidth;
+  permMenuOpenRaf = requestAnimationFrame(() => {
+    permMenuOpenRaf = 0;
+    menu.classList.add("is-open");
+  });
+}
+
+/**
+ * Shift+Tab：循环主展示模式（对齐 Grok Build CLI）
+ * Normal → Plan → Always-approve → Normal
+ * 注：从 Plan 到 Always-approve 会关 plan 并打开 yolo；
+ * 从 Normal 进 Plan 不改变 accessMode（yolo 可 armed underneath）。
  */
 async function cycleSessionMode(): Promise<void> {
-  if (permMode === "normal") {
+  if (!isPlanOn() && accessMode === "normal") {
     const r = await enterPlanMode();
     if (r.message) showToast(r.message, r.ok ? "info" : "error");
     return;
   }
-  if (permMode === "plan") {
-    // 退出 plan agent 侧，再切完全访问
+  if (isPlanOn()) {
     planPhase = "off";
-    permMode = "always_approve";
+    accessMode = "always_approve";
     syncPermLabels();
-    const r = await setThreadModeLive("always_approve");
+    const r = await syncSessionPolicyLive({ plan: false, alwaysApprove: true });
     if (!r.ok) {
       showToast(r.message ?? "切换完全访问失败", "error");
       return;
@@ -7912,11 +8121,11 @@ async function cycleSessionMode(): Promise<void> {
     showToast("已开启完全访问");
     return;
   }
-  // always_approve → normal
-  permMode = "normal";
+  // always_approve（非 plan）→ normal
+  accessMode = "normal";
   planPhase = "off";
   syncPermLabels();
-  void setThreadModeLive("normal");
+  void syncSessionPolicyLive({ plan: false, alwaysApprove: false });
   showToast("已恢复默认确认");
 }
 
@@ -7927,15 +8136,22 @@ function showPermission(requestId: string, summary: string): void {
   const low = summary.toLowerCase();
   if (
     /enter_plan|enter-plan|进入计划|plan mode/i.test(low) &&
-    (permMode === "plan" || planPhase !== "off")
+    isPlanOn()
   ) {
     void inv("permissions.respond", {
       requestId,
       decision: "allow_once",
     });
     planPhase = "active";
-    permMode = "plan";
     syncPermLabels();
+    return;
+  }
+  // Host 在 always_approve 时会自动放行；此处仍可能收到事件，直接隐藏条
+  if (accessMode === "always_approve") {
+    void inv("permissions.respond", {
+      requestId,
+      decision: "allow_once",
+    }).catch(() => undefined);
     return;
   }
   const bar = $("permission-bar");
@@ -7953,7 +8169,6 @@ function showPermission(requestId: string, summary: string): void {
       bar.classList.add("hidden");
       if (decision === "allow_once" && /enter_plan|enter-plan|进入计划/i.test(low)) {
         planPhase = "active";
-        permMode = "plan";
         syncPermLabels();
       }
     };
@@ -8027,14 +8242,12 @@ function onEvent(raw: unknown): void {
       return;
     }
     if (ev.active) {
-      permMode = "plan";
       // 用户 /plan 已为 pending：保持 Pending 至下一条消息；
-      // agent 主动进入时直接 Active
+      // agent 主动进入时直接 Active。不改 accessMode。
       if (planPhase === "off") planPhase = "active";
-    } else if (permMode === "plan") {
-      // agent 侧退出 plan（always_approve 走 default 时 permMode 已非 plan，不覆盖）
+    } else if (isPlanOn()) {
+      // agent 退出 plan；保留 accessMode（yolo 可重新露出）
       planPhase = "off";
-      permMode = "normal";
     }
     syncPermLabels();
     return;
@@ -8187,7 +8400,6 @@ async function handlePlanApprovalRequested(ev: {
     }
   }
   planPhase = "active";
-  permMode = "plan";
   syncPermLabels();
   await openPlanPanel({
     requestId: ev.requestId,
@@ -8444,40 +8656,36 @@ npm start</pre>
   $("btn-perm-mode").onclick = () => showPermMenu($("btn-perm-mode"));
   $("btn-perm-mode-2").onclick = () => showPermMenu($("btn-perm-mode-2"));
   document.addEventListener("click", (e) => {
-    const menu = $("perm-menu");
-    if (menu.classList.contains("hidden")) return;
+    if (!isPermMenuVisible()) return;
     if (!(e.target as HTMLElement).closest("#perm-menu, #btn-perm-mode, #btn-perm-mode-2, #btn-sandbox-setup")) {
-      menu.classList.add("hidden");
+      hidePermMenu();
     }
   });
   $("perm-menu").onclick = (e) => {
     const t = e.target as HTMLElement;
-    const mode = t.dataset.mode as typeof permMode | undefined;
-    if (!mode) return;
-    $("perm-menu").classList.add("hidden");
-    if (mode === "plan") {
-      void enterPlanMode().then((r) => {
-        if (r.message) showToast(r.message, r.ok ? "info" : "error");
+    const mode = t.dataset.mode as SettingsPermMode | "plan" | undefined;
+    if (!mode || mode === "plan") return;
+    // 选中高亮先于收起动画，关闭过程中可见反馈
+    for (const btn of Array.from($("perm-menu").querySelectorAll<HTMLElement>("[data-mode]"))) {
+      btn.classList.toggle("is-active", btn.dataset.mode === mode);
+    }
+    hidePermMenu();
+    // 权限菜单只切访问策略，绝不退出 plan
+    if (mode === "always_approve") {
+      accessMode = "always_approve";
+      syncPermLabels();
+      void syncSessionPolicyLive({
+        alwaysApprove: true,
+        plan: isPlanOn(),
       });
       return;
     }
-    if (mode === "always_approve") {
-      if (permMode === "plan") exitPlanMode();
-      permMode = "always_approve";
-      planPhase = "off";
-      syncPermLabels();
-      void setThreadModeLive("always_approve");
-      return;
-    }
-    // normal
-    if (permMode === "plan") {
-      exitPlanMode();
-      return;
-    }
-    permMode = "normal";
-    planPhase = "off";
+    accessMode = "normal";
     syncPermLabels();
-    void setThreadModeLive("normal");
+    void syncSessionPolicyLive({
+      alwaysApprove: false,
+      plan: isPlanOn(),
+    });
   };
 
   $("btn-send").onclick = () => {

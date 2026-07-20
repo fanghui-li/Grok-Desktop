@@ -1269,7 +1269,8 @@ button { cursor: pointer; border: 0; background: none; }
   border: 1px solid var(--border);
   border-radius: 18px;
   box-shadow: var(--shadow);
-  padding: 12px 12px 8px;
+  /* 底边留足空间，避免 overflow+圆角裁切权限 chip 文字下半截 */
+  padding: 12px 12px 10px;
 }
 .composer-card.compact { border-radius: 16px; }
 .composer-card textarea {
@@ -1280,18 +1281,54 @@ button { cursor: pointer; border: 0; background: none; }
 }
 .composer-card textarea::placeholder { color: #b0b0b0; }
 .composer-toolbar {
-  display: flex; align-items: center; justify-content: space-between;
-  padding: 4px 2px 2px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  /* 工具栏不可被压扁；底部 padding 防止 chip 贴边被圆角裁切 */
+  padding: 6px 2px 4px;
+  min-height: 32px;
+  flex-shrink: 0;
+  overflow: visible;
 }
-.composer-left, .composer-right { display: flex; align-items: center; gap: 6px; }
+.composer-left, .composer-right {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-height: 28px;
+  overflow: visible;
+}
 
 .mode-chip {
-  display: inline-flex; align-items: center; gap: 4px;
-  padding: 4px 8px; border-radius: 8px;
-  color: var(--orange); font-size: 13px; font-weight: 500;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 5px 10px;
+  border-radius: 999px;
+  color: var(--orange);
+  font-size: 13px;
+  font-weight: 500;
+  /* 中文 glyph 下沿需要足够行高，避免「完全访问」底部被裁 */
+  line-height: 1.35;
+  min-height: 28px;
+  box-sizing: border-box;
+  white-space: nowrap;
+  flex-shrink: 0;
+  overflow: visible;
 }
 .mode-chip:hover { background: var(--orange-soft); }
-.mode-dot { font-size: 12px; }
+.mode-chip .mode-chip-caret {
+  font-size: 10px;
+  line-height: 1;
+  opacity: 0.75;
+  flex-shrink: 0;
+  /* 避免 caret 被父级 baseline 裁切 */
+  transform: translateY(-0.5px);
+}
+.mode-dot {
+  font-size: 12px;
+  line-height: 1;
+  flex-shrink: 0;
+}
 
 /* /plan · /goal 会话状态标识（对齐 Codex 输入栏 chip） */
 .session-mode-chip {
@@ -3302,7 +3339,10 @@ button { cursor: pointer; border: 0; background: none; }
   min-height: 0;
   display: flex;
   flex-direction: column;
-  overflow: hidden;
+  /* 仅横向裁切圆角溢出；纵向可见，避免底栏权限 chip 被裁 */
+  overflow-x: hidden;
+  overflow-y: visible;
+  padding-bottom: 10px;
 }
 .chat-composer-wrap .composer-card textarea {
   flex: 0 1 auto;
@@ -3314,6 +3354,8 @@ button { cursor: pointer; border: 0; background: none; }
 }
 .chat-composer-wrap .composer-toolbar {
   flex: 0 0 auto;
+  min-height: 32px;
+  overflow: visible;
 }
 .chat-composer-wrap .attach-chips {
   flex: 0 0 auto;
@@ -3340,7 +3382,8 @@ button { cursor: pointer; border: 0; background: none; }
     padding: 6px 10px;
   }
   .chat-composer-wrap .composer-card {
-    padding: 8px 10px 6px;
+    /* 矮窗仍保留底边，避免权限 chip 被圆角裁切 */
+    padding: 8px 10px 8px;
   }
   .chat-composer-wrap .composer-card textarea {
     min-height: 24px;
@@ -3439,14 +3482,64 @@ dialog input {
 .dlg-actions { display: flex; justify-content: flex-end; gap: 8px; }
 
 .float-menu {
-  position: fixed; z-index: 60;
-  background: #fff; border: 1px solid var(--border);
-  border-radius: 12px; box-shadow: var(--shadow);
-  padding: 6px; min-width: 160px;
+  /* 高于 composer-dock / titleBar 占位，避免权限菜单被输入栏或底边挡住 */
+  position: fixed;
+  z-index: 100;
+  background: #fff;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  box-shadow: 0 8px 28px rgba(0, 0, 0, 0.12);
+  padding: 6px;
+  min-width: 160px;
+  max-height: min(320px, calc(100vh - 16px));
+  overflow-y: auto;
+  box-sizing: border-box;
 }
+
+/* 权限菜单：scale + fade + 轻位移，开合丝滑 */
+#perm-menu.float-menu {
+  opacity: 0;
+  transform: translate3d(0, 6px, 0) scale(0.96);
+  transform-origin: top left;
+  pointer-events: none;
+  transition:
+    opacity 0.16s cubic-bezier(0.2, 0.8, 0.2, 1),
+    transform 0.18s cubic-bezier(0.2, 0.8, 0.2, 1);
+  will-change: opacity, transform;
+}
+#perm-menu.float-menu.open-up {
+  transform: translate3d(0, -6px, 0) scale(0.96);
+  transform-origin: bottom left;
+}
+#perm-menu.float-menu.is-open {
+  opacity: 1;
+  transform: translate3d(0, 0, 0) scale(1);
+  pointer-events: auto;
+}
+#perm-menu.float-menu .menu-item {
+  transition: background 0.12s ease, color 0.12s ease;
+}
+#perm-menu.float-menu .menu-item.is-active {
+  background: var(--orange-soft);
+  color: var(--orange);
+  font-weight: 600;
+}
+@media (prefers-reduced-motion: reduce) {
+  #perm-menu.float-menu {
+    transition: none;
+    will-change: auto;
+  }
+}
+
 .menu-item {
-  display: block; width: 100%; text-align: left;
-  padding: 8px 12px; border-radius: 8px; font-size: 13px;
+  display: block;
+  width: 100%;
+  text-align: left;
+  padding: 8px 12px;
+  border-radius: 8px;
+  font-size: 13px;
+  line-height: 1.35;
+  white-space: nowrap;
 }
 .menu-item:hover { background: var(--bg-hover); }
 

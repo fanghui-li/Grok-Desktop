@@ -38,6 +38,9 @@ describe("contract audit", () => {
     expect(html).toMatch(/设置/);
     expect(html).toMatch(/随心输入/);
     expect(html).toMatch(/完全访问/);
+    // 权限 chip 下拉 caret 须独立节点，避免被裁切/丢失
+    expect(html).toMatch(/mode-chip-caret/);
+    expect(css).toMatch(/\.mode-chip\s*\{[^}]*line-height/s);
     expect(html).toMatch(/打开位置/);
     expect(html).toMatch(/文件/);
     expect(html).toMatch(/浏览器/);

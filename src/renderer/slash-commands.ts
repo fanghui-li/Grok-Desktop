@@ -20,6 +20,11 @@ export interface SlashCommand {
   dynamic?: boolean;
   /** skill 来源角标：个人 / 项目 / 系统 */
   badge?: string;
+  /**
+   * 不在 `/` 默认列表展示（主入口在别处，如权限 chip）。
+   * 手输 id/关键词仍可匹配执行。
+   */
+  paletteHidden?: boolean;
 }
 
 export type SlashEffortLevel = "low" | "medium" | "high" | "xhigh";
@@ -69,6 +74,8 @@ export function getStaticSlashCommands(): SlashCommandDef[] {
       description: tr("slash.alwaysApproveDesc"),
       keywords: "always-approve always approve yolo auto-approve 完全访问",
       icon: "⚡",
+      // 主入口：输入栏权限 chip；slash 仍可用但不占默认列表
+      paletteHidden: true,
       action: { kind: "set-perm", mode: "always_approve" },
     },
     {
@@ -312,12 +319,37 @@ export function filterSlashCommands(
   query: string,
 ): SlashCommandDef[] {
   const q = query.trim().toLowerCase();
-  if (!q) return commands;
+  if (!q) {
+    // 默认列表：隐藏 paletteHidden（如 /always-approve，主入口是权限 chip）
+    return commands.filter((c) => !c.paletteHidden);
+  }
   return commands.filter((c) => {
     const hay =
       `${c.id} ${c.title} ${c.description} ${c.keywords ?? ""}`.toLowerCase();
     const id = c.id.startsWith("skill:") ? c.id.slice(6) : c.id;
-    return hay.includes(q) || c.id.startsWith(q) || id.startsWith(q);
+    const hit =
+      hay.includes(q) || c.id.startsWith(q) || id.startsWith(q);
+    if (!hit) return false;
+    // 隐藏项仅在明确匹配 id 前缀时出现，避免关键词「完全」误刷进列表
+    if (c.paletteHidden) {
+      return c.id.startsWith(q) || id.startsWith(q);
+    }
+    return true;
+  });
+}
+
+/** 按完整 token 解析 slash（发送路径 / 手输兼容） */
+export function resolveSlashCommand(
+  commands: SlashCommandDef[],
+  token: string,
+): SlashCommandDef | undefined {
+  const raw = token.trim().replace(/^\//, "").toLowerCase();
+  if (!raw) return undefined;
+  const name = raw.split(/\s+/)[0] ?? "";
+  if (!name) return undefined;
+  return commands.find((c) => {
+    const id = c.id.startsWith("skill:") ? c.id.slice(6) : c.id;
+    return c.id.toLowerCase() === name || id.toLowerCase() === name;
   });
 }
 
