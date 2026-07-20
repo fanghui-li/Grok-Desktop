@@ -777,7 +777,11 @@ function bindChatScrollLayout(): void {
     if (dock) ro.observe(dock);
     if (chat) ro.observe(chat);
   }
-  window.addEventListener("resize", () => syncChatComposerReserve());
+  window.addEventListener("resize", () => {
+    syncChatComposerReserve();
+    // 窗口拉伸后 fixed 菜单坐标失效，直接关闭（权限 / 模型 / +）
+    hideEphemeralMenus();
+  });
   // 显示对话 / 目标条 / 权限条显隐时再量一次
   if (chat && typeof MutationObserver !== "undefined") {
     new MutationObserver(() => {
@@ -7880,8 +7884,20 @@ async function showSettingsPage(): Promise<void> {
   await settingsPage.show();
 }
 
+function hidePermMenu(): void {
+  $("perm-menu")?.classList.add("hidden");
+}
+
+/** 窗口几何变化时关掉 fixed 浮层，避免锚点失效留在原点 */
+function hideEphemeralMenus(): void {
+  hidePermMenu();
+  hideModelMenu();
+  hidePlusMenu();
+}
+
 function showPermMenu(anchor: HTMLElement): void {
   hideModelMenu();
+  hidePlusMenu();
   const menu = $("perm-menu");
   // 先显示再量尺寸，才能按视口空间决定上/下弹出
   menu.classList.remove("hidden");
@@ -8464,14 +8480,14 @@ npm start</pre>
     const menu = $("perm-menu");
     if (menu.classList.contains("hidden")) return;
     if (!(e.target as HTMLElement).closest("#perm-menu, #btn-perm-mode, #btn-perm-mode-2, #btn-sandbox-setup")) {
-      menu.classList.add("hidden");
+      hidePermMenu();
     }
   });
   $("perm-menu").onclick = (e) => {
     const t = e.target as HTMLElement;
     const mode = t.dataset.mode as typeof permMode | undefined;
     if (!mode) return;
-    $("perm-menu").classList.add("hidden");
+    hidePermMenu();
     if (mode === "plan") {
       void enterPlanMode().then((r) => {
         if (r.message) showToast(r.message, r.ok ? "info" : "error");
