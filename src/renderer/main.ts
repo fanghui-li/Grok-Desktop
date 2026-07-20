@@ -7883,10 +7883,27 @@ async function showSettingsPage(): Promise<void> {
 function showPermMenu(anchor: HTMLElement): void {
   hideModelMenu();
   const menu = $("perm-menu");
-  const r = anchor.getBoundingClientRect();
-  menu.style.left = `${r.left}px`;
-  menu.style.top = `${r.bottom + 4}px`;
+  // 先显示再量尺寸，才能按视口空间决定上/下弹出
   menu.classList.remove("hidden");
+  const r = anchor.getBoundingClientRect();
+  const mw = menu.offsetWidth || 160;
+  const mh = menu.offsetHeight || 88;
+  let left = r.left;
+  if (left + mw > window.innerWidth - 8) left = window.innerWidth - mw - 8;
+  if (left < 8) left = 8;
+  // 输入栏贴底：优先向上弹出，避免「完全访问」等项被窗口底边裁切
+  const spaceBelow = window.innerHeight - r.bottom;
+  let top: number;
+  if (spaceBelow < mh + 12 && r.top > mh + 12) {
+    top = Math.max(8, r.top - mh - 6);
+  } else {
+    top = r.bottom + 4;
+    if (top + mh > window.innerHeight - 8) {
+      top = Math.max(8, window.innerHeight - mh - 8);
+    }
+  }
+  menu.style.left = `${left}px`;
+  menu.style.top = `${top}px`;
 }
 
 /**

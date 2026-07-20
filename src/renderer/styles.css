@@ -3482,14 +3482,28 @@ dialog input {
 .dlg-actions { display: flex; justify-content: flex-end; gap: 8px; }
 
 .float-menu {
-  position: fixed; z-index: 60;
-  background: #fff; border: 1px solid var(--border);
-  border-radius: 12px; box-shadow: var(--shadow);
-  padding: 6px; min-width: 160px;
+  /* 高于 composer-dock / titleBar 占位，避免权限菜单被输入栏或底边挡住 */
+  position: fixed;
+  z-index: 100;
+  background: #fff;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  box-shadow: 0 8px 28px rgba(0, 0, 0, 0.12);
+  padding: 6px;
+  min-width: 160px;
+  max-height: min(320px, calc(100vh - 16px));
+  overflow-y: auto;
+  box-sizing: border-box;
 }
 .menu-item {
-  display: block; width: 100%; text-align: left;
-  padding: 8px 12px; border-radius: 8px; font-size: 13px;
+  display: block;
+  width: 100%;
+  text-align: left;
+  padding: 8px 12px;
+  border-radius: 8px;
+  font-size: 13px;
+  line-height: 1.35;
+  white-space: nowrap;
 }
 .menu-item:hover { background: var(--bg-hover); }
 
