@@ -790,6 +790,13 @@ export class SettingsPageController {
     for (const el of Array.from(root.querySelectorAll(".settings-choice[data-group=perm]"))) {
       (el as HTMLElement).onclick = () => {
         const v = (el as HTMLElement).dataset.value as SettingsPermMode;
+        if (v === "always_approve") {
+          const ok = window.confirm(
+            tr("settings.perm.fullConfirm") ||
+              "Set default to full access (skip permission prompts) for new chats?",
+          );
+          if (!ok) return;
+        }
         void this.patch({ defaultPermMode: v }).then(() => this.renderContent());
       };
     }

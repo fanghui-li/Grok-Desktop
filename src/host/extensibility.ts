@@ -379,11 +379,28 @@ export function writeDesktopConfig(
   const p = path.join(dir, "settings.json");
   const cur = readDesktopConfig(home);
   const next: DesktopConfig = { ...cur, ...patch };
+  // scrub invalid defaultPermMode (plan is a session mode, not an access default)
+  if (
+    next.defaultPermMode !== undefined &&
+    next.defaultPermMode !== "always_approve" &&
+    next.defaultPermMode !== "normal"
+  ) {
+    next.defaultPermMode = "normal";
+  }
   // 同步遗留字段
   if (patch.defaultPermMode !== undefined) {
-    next.alwaysApproveDefault = patch.defaultPermMode === "always_approve";
-  } else if (patch.alwaysApproveDefault !== undefined && patch.defaultPermMode === undefined) {
-    next.defaultPermMode = patch.alwaysApproveDefault ? "always_approve" : "normal";
+    const mode =
+      patch.defaultPermMode === "always_approve" ? "always_approve" : "normal";
+    next.defaultPermMode = mode;
+    next.alwaysApproveDefault = mode === "always_approve";
+  } else if (
+    patch.alwaysApproveDefault !== undefined &&
+    patch.defaultPermMode === undefined
+  ) {
+    next.defaultPermMode = patch.alwaysApproveDefault
+      ? "always_approve"
+      : "normal";
+    next.alwaysApproveDefault = !!patch.alwaysApproveDefault;
   }
   if (patch.appearanceLight !== undefined) {
     next.appearanceLight = normalizeVariantAppearance(

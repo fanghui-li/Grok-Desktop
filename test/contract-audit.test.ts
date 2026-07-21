@@ -68,6 +68,17 @@ describe("contract audit", () => {
     expect(main).toMatch(/e\.preventDefault\(\)/);
     expect(main).toMatch(/showMainWindow/);
     expect(main).toMatch(/isQuitting/);
+    expect(main).toMatch(/shellStartHandoffWatch/);
+    expect(main).toMatch(/shell\.navigate|shellNavigateEvent/);
+  });
+
+  it("shell control events and turn settle guard exist", () => {
+    const events = read("src/shared/events.ts");
+    expect(events).toMatch(/shell\.handoff/);
+    expect(events).toMatch(/shellEventFromLegacyActivity/);
+    const renderer = read("src/renderer/main.ts");
+    expect(renderer).toMatch(/Never force-end an active turn/);
+    expect(renderer).toMatch(/shell\.handoff/);
   });
 
   it("Host API product vocabulary and errors", () => {
@@ -82,5 +93,21 @@ describe("contract audit", () => {
   it("IPC channel constants are stable", () => {
     expect(HOST_IPC_CHANNEL).toBe("grok-desktop-host");
     expect(HOST_EVENT_CHANNEL).toBe("grok-desktop-host-event");
+  });
+
+  it("turn completion UX and full-access confirm exist", () => {
+    const events = read("src/shared/events.ts");
+    expect(events).toMatch(/hadAssistantText/);
+    expect(events).toMatch(/hadToolActivity/);
+    const acp = read("src/host/acp-client.ts");
+    expect(acp).toMatch(/hadToolActivityThisTurn/);
+    expect(acp).toMatch(/error: message/);
+    const renderer = read("src/renderer/main.ts");
+    expect(renderer).toMatch(/chat\.turnTimeout/);
+    const settings = read("src/renderer/settings-page.ts");
+    expect(settings).toMatch(/settings\.perm\.fullConfirm/);
+    const en = read("src/shared/i18n/locales/en-US.ts");
+    expect(en).toMatch(/chat\.turnTimeout/);
+    expect(en).toMatch(/settings\.perm\.fullConfirm/);
   });
 });

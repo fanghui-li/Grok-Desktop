@@ -52,6 +52,8 @@ export class AcpClient {
   private closed = false;
   /** True if we already streamed assistant message chunks this turn. */
   private streamedAssistantThisTurn = false;
+  /** True if any tool/process activity was observed this turn. */
+  private hadToolActivityThisTurn = false;
   private permissionWaiters = new Map<
     string,
     { resolve: (optionId: string) => void }
@@ -196,6 +198,7 @@ export class AcpClient {
     }
 
     this.streamedAssistantThisTurn = false;
+    this.hadToolActivityThisTurn = false;
     this.opts.onEvent({
       type: "turn.started",
       threadId: this.opts.threadId,
@@ -209,6 +212,7 @@ export class AcpClient {
     });
 
     try {
+      // Idle-reset (#5) + turn.completed metadata for UI settle UX (#6).
       const result = (await this.request(
         "session/prompt",
         {
@@ -216,7 +220,7 @@ export class AcpClient {
           prompt: [{ type: "text", text }],
         },
         { idleMs: 15 * 60_000, maxMs: 2 * 60 * 60_000 },
-      )) as { stopReason?: string; text?: string };
+      )) as { stopReason?: string; stop_reason?: string; text?: string };
 
       // Only emit final text if no streaming chunks were received (avoid duplicate full paste)
       if (result?.text && !this.streamedAssistantThisTurn) {
@@ -233,7 +237,10 @@ export class AcpClient {
         type: "turn.completed",
         threadId: this.opts.threadId,
         sessionId: this.sessionId,
-        stopReason: result?.stopReason,
+        stopReason: result?.stopReason ?? result?.stop_reason,
+        hadAssistantText:
+          this.streamedAssistantThisTurn || Boolean(result?.text),
+        hadToolActivity: this.hadToolActivityThisTurn,
       });
       this.opts.onEvent({
         type: "session.status",
@@ -249,14 +256,15 @@ export class AcpClient {
           ? String((err as { code?: string }).code ?? "")
           : "";
       const stopReason =
-        code === "TIMEOUT" || /timed out/i.test(message)
-          ? "timeout"
-          : "error";
+        code === "TIMEOUT" || /timed out/i.test(message) ? "timeout" : "error";
       this.opts.onEvent({
         type: "turn.completed",
         threadId: this.opts.threadId,
         sessionId: this.sessionId ?? "",
         stopReason,
+        error: message,
+        hadAssistantText: this.streamedAssistantThisTurn,
+        hadToolActivity: this.hadToolActivityThisTurn,
       });
       this.opts.onEvent({
         type: "session.status",
