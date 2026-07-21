@@ -63,6 +63,30 @@ export interface GrokCapabilities {
   worktreeApi: boolean;
   /** 是否会消费 agent available_commands_update（A20） */
   availableCommands?: boolean;
+  /** agent initialize 声明 hooks */
+  hooks?: boolean;
+  fsNotify?: boolean;
+  loadSession?: boolean;
+  /** QueueChanged / x.ai/queue 可用 */
+  queueWire?: boolean;
+  agentVersion?: string | null;
+}
+
+/** Mode B 附着状态（plan §3.2） */
+export type AttachState =
+  | "history_only"
+  | "attaching"
+  | "live"
+  | "failed"
+  | "detaching";
+
+export interface ThreadAttachStateView {
+  threadId?: string;
+  sessionId: string;
+  state: AttachState;
+  lastError?: string;
+  attachedAt?: string;
+  lastActiveAt?: string;
 }
 
 /** agent-bin/VERSION.txt（sync:agent 写入；安装包随 extraResources 带入） */

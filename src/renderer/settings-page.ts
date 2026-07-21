@@ -41,6 +41,8 @@ export interface DesktopConfigData {
   theme?: SettingsThemePreference;
   appearanceLight?: VariantAppearance;
   appearanceDark?: VariantAppearance;
+  idleDetachMs?: number;
+  maxLiveAttaches?: number;
   paths?: {
     settings: string;
     configToml: string;
@@ -76,6 +78,7 @@ type SectionId =
   | "appearance"
   | "account"
   | "memory"
+  | "hooks"
   | "shortcuts"
   | "about";
 
@@ -171,6 +174,13 @@ function settingsSections(): Array<{
       label: tr("settings.section.memory"),
       icon: "◎",
       keywords: tr("settings.kw.memory"),
+    },
+    {
+      id: "hooks",
+      group: tr("settings.group.integrations"),
+      label: tr("settings.section.hooks"),
+      icon: "⚓",
+      keywords: tr("settings.kw.hooks"),
     },
     {
       id: "shortcuts",
@@ -448,6 +458,10 @@ export class SettingsPageController {
         case "memory":
           root.innerHTML = await this.htmlMemory();
           this.bindMemory(root);
+          break;
+        case "hooks":
+          root.innerHTML = await this.htmlHooks();
+          this.bindHooks(root);
           break;
         case "shortcuts":
           root.innerHTML = this.htmlShortcuts();
@@ -769,6 +783,27 @@ export class SettingsPageController {
           ${emptyHint}
         </div>
       </section>
+
+      <section class="settings-block">
+        <h2 class="settings-h2">${this.cb.esc(tr("settings.idleDetach"))}</h2>
+        <p class="settings-desc">${this.cb.esc(tr("settings.idleDetachDesc"))}</p>
+        <div class="settings-card">
+          <div class="settings-row">
+            <div class="settings-row-text">
+              <div class="settings-row-title">${this.cb.esc(tr("settings.idleDetachMs"))}</div>
+            </div>
+            <input type="number" min="0" step="1" id="cfg-idle-min" class="settings-select" style="width:6rem"
+              value="${Math.round((this.cfg.idleDetachMs ?? 20 * 60 * 1000) / 60000)}" />
+          </div>
+          <div class="settings-row">
+            <div class="settings-row-text">
+              <div class="settings-row-title">${this.cb.esc(tr("settings.maxLiveAttaches"))}</div>
+            </div>
+            <input type="number" min="1" max="32" step="1" id="cfg-max-live" class="settings-select" style="width:6rem"
+              value="${this.cfg.maxLiveAttaches ?? 4}" />
+          </div>
+        </div>
+      </section>
     `;
   }
 
@@ -800,6 +835,16 @@ export class SettingsPageController {
         void this.patch({ defaultPermMode: v }).then(() => this.renderContent());
       };
     }
+    const idleMin = root.querySelector("#cfg-idle-min") as HTMLInputElement | null;
+    idleMin?.addEventListener("change", () => {
+      const mins = Math.max(0, Number(idleMin.value) || 0);
+      void this.patch({ idleDetachMs: mins * 60_000 });
+    });
+    const maxLive = root.querySelector("#cfg-max-live") as HTMLInputElement | null;
+    maxLive?.addEventListener("change", () => {
+      const n = Math.min(32, Math.max(1, Number(maxLive.value) || 4));
+      void this.patch({ maxLiveAttaches: n });
+    });
     const sel = root.querySelector("#cfg-open-target") as HTMLSelectElement | null;
     sel?.addEventListener("change", () => {
       void this.patch({
@@ -1801,6 +1846,75 @@ export class SettingsPageController {
         if (!window.confirm(tr("memory.deleteConfirm"))) return;
         await this.cb.inv("memory.deletePath", { path: pth });
         await this.renderContent();
+      });
+    }
+  }
+
+  // ── Hooks（P3-B）──────────────────────────────────────
+
+  private async htmlHooks(): Promise<string> {
+    const res = await this.cb.inv<{
+      hooks: Array<{
+        id: string;
+        source: string;
+        event?: string;
+        trusted: boolean;
+        path?: string;
+      }>;
+      note?: string;
+    }>("hooks.list");
+    const hooks = res.data?.hooks ?? [];
+    const note = res.data?.note;
+    const rows =
+      hooks.length === 0
+        ? `<p class="settings-muted">${this.cb.esc(tr("settings.hooksEmpty"))}</p>
+           ${note ? `<p class="settings-desc">${this.cb.esc(note)}</p>` : ""}`
+        : hooks
+            .map((h) => {
+              const trustLabel = h.trusted
+                ? tr("settings.hooksTrusted")
+                : tr("settings.hooksUntrusted");
+              return `<div class="settings-row" data-hook-id="${this.cb.esc(h.id)}">
+                <div class="settings-row-text">
+                  <div class="settings-row-title">${this.cb.esc(h.event || h.id)}</div>
+                  <div class="settings-row-sub">${this.cb.esc(h.source)} · ${this.cb.esc(trustLabel)}</div>
+                </div>
+                <div class="settings-row-actions">
+                  <button type="button" class="btn-ghost sm" data-hook-trust="${this.cb.esc(h.id)}">${this.cb.esc(tr("settings.hooksTrust"))}</button>
+                  <button type="button" class="btn-ghost sm" data-hook-untrust="${this.cb.esc(h.id)}">${this.cb.esc(tr("settings.hooksUntrust"))}</button>
+                </div>
+              </div>`;
+            })
+            .join("");
+    return `
+      <h1 class="settings-title">${this.cb.esc(tr("settings.hooksTitle"))}</h1>
+      <p class="settings-desc">${this.cb.esc(tr("settings.hooksDesc"))}</p>
+      <div class="settings-card">${rows}</div>
+      <div class="settings-row" style="margin-top:12px">
+        <button type="button" class="btn-dark sm" id="hooks-reload">${this.cb.esc(tr("settings.hooksReload"))}</button>
+      </div>
+    `;
+  }
+
+  private bindHooks(root: HTMLElement): void {
+    const reload = root.querySelector("#hooks-reload") as HTMLElement | null;
+    reload?.addEventListener("click", () => {
+      void this.cb.inv("hooks.reload").then(() => this.renderContent());
+    });
+    for (const btn of Array.from(root.querySelectorAll("[data-hook-trust]"))) {
+      (btn as HTMLElement).addEventListener("click", () => {
+        const id = (btn as HTMLElement).dataset.hookTrust ?? "";
+        if (!id) return;
+        void this.cb.inv("hooks.trust", { id }).then(() => this.renderContent());
+      });
+    }
+    for (const btn of Array.from(root.querySelectorAll("[data-hook-untrust]"))) {
+      (btn as HTMLElement).addEventListener("click", () => {
+        const id = (btn as HTMLElement).dataset.hookUntrust ?? "";
+        if (!id) return;
+        void this.cb
+          .inv("hooks.untrust", { id })
+          .then(() => this.renderContent());
       });
     }
   }

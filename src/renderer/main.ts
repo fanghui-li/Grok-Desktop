@@ -37,6 +37,11 @@ import {
 } from "../shared/theme/index.js";
 import { PluginsPageController } from "./plugins-page.js";
 import {
+  sendButtonIconHtml,
+  sidebarIcon,
+  type SidebarIconName,
+} from "./sidebar-icons.js";
+import {
   agentAdvertisedCommands,
   getStaticSlashCommands,
   resolveSlashCommand,
@@ -53,6 +58,28 @@ import {
   extractToolMeta,
   updateToolCardDone,
 } from "./agent-blocks.js";
+import { syncAttachPillDom } from "./attach-pill-dom.js";
+import {
+  buildForkDialogHtml,
+  parseForkSlashArgs,
+  readForkDialogResult,
+} from "./fork-session-ui.js";
+import {
+  hostClearQueue,
+  hostEnqueue,
+  hostRemoveItem,
+  hostReorder,
+  hostSetQueueFlags,
+  hostUpdateItem,
+  loadSessionQueue,
+  mirrorQueueToLocal,
+} from "./prompt-queue-store.js";
+import {
+  buildPromptQueueBarHtml,
+  buildPromptQueueEmptyModalHtml,
+  buildPromptQueueModalBodyHtml,
+} from "./prompt-queue-ui.js";
+import type { AttachState } from "../shared/types.js";
 
 interface Bridge {
   invoke(method: HostIpcMethod, params?: unknown): Promise<unknown>;
@@ -412,11 +439,19 @@ type QueuedPrompt = {
   display: string;
   content: string;
   attachments: ComposerAttachment[];
+  status?: "pending" | "sending" | "failed";
+  lastError?: string | null;
 };
 const promptQueue: QueuedPrompt[] = [];
 let queueDrainScheduled = false;
 /** 用户 interrupt/停止后为 true，阻止自动 drain */
 let queuePausedByInterrupt = false;
+/** L1 队列是否启用（Host 落盘 flags） */
+let queueingEnabled = true;
+/** Agent 队列 wire 同步错误（仅 toast） */
+let queueSyncError: string | null = null;
+/** Mode B 附着状态（驱动 pill） */
+let attachUiState: AttachState = "history_only";
 
 /**
  * S17 本会话 prompt 历史（最新在前）：
@@ -937,18 +972,18 @@ function bindChatScrollLayout(): void {
   requestAnimationFrame(() => syncChatComposerReserve());
 }
 
-/** 空闲 / 进行中：仅由发送钮 ↑ / ■ 表达（方案 2） */
+/** 空闲 / 进行中：仅由发送钮 arrow-up / stop 表达（方案 2） */
 function setComposerBusy(busy: boolean): void {
   for (const id of ["btn-send", "btn-send-chat"] as const) {
     const b = $(id);
     if (busy) {
       b.classList.add("stop");
-      b.textContent = "■";
+      b.innerHTML = sendButtonIconHtml(true);
       b.title = tr("common.stop");
       b.setAttribute("aria-label", tr("common.stop"));
     } else {
       b.classList.remove("stop");
-      b.textContent = "↑";
+      b.innerHTML = sendButtonIconHtml(false);
       b.title = tr("common.send");
       b.setAttribute("aria-label", tr("common.send"));
     }
@@ -956,28 +991,7 @@ function setComposerBusy(busy: boolean): void {
   syncPromptQueueBar();
 }
 
-function queueItemPreview(q: QueuedPrompt, max = 72): string {
-  const t = (q.display || q.content).replace(/\s+/g, " ").trim();
-  return t.length > max ? t.slice(0, max) + "…" : t;
-}
-
-function renderQueueItemRow(q: QueuedPrompt, i: number, total: number): string {
-  const short = queueItemPreview(q);
-  const upDis = i === 0 ? " disabled" : "";
-  const downDis = i >= total - 1 ? " disabled" : "";
-  return `<li class="prompt-queue-item" data-qid="${esc(q.id)}">
-    <span class="prompt-queue-idx">${i + 1}</span>
-    <span class="prompt-queue-text" title="${esc(q.display || q.content)}">${esc(short)}</span>
-    <span class="prompt-queue-actions">
-      <button type="button" class="prompt-queue-act" data-queue-up="${esc(q.id)}" title="${esc(tr("queue.moveUp"))}"${upDis}>↑</button>
-      <button type="button" class="prompt-queue-act" data-queue-down="${esc(q.id)}" title="${esc(tr("queue.moveDown"))}"${downDis}>↓</button>
-      <button type="button" class="prompt-queue-act" data-queue-edit="${esc(q.id)}" title="${esc(tr("queue.edit"))}">✎</button>
-      <button type="button" class="prompt-queue-x" data-queue-rm="${esc(q.id)}" title="${esc(tr("queue.remove"))}">×</button>
-    </span>
-  </li>`;
-}
-
-/** 同步输入区上方的排队条 */
+/** 同步输入区上方的排队条（HTML 见 prompt-queue-ui） */
 function syncPromptQueueBar(): void {
   const bars = ["prompt-queue-bar", "prompt-queue-bar-welcome"]
     .map((id) => document.getElementById(id))
@@ -990,30 +1004,16 @@ function syncPromptQueueBar(): void {
       continue;
     }
     bar.classList.remove("hidden");
-    const n = promptQueue.length;
-    const list = promptQueue
-      .map((q, i) => renderQueueItemRow(q, i, n))
-      .join("");
-    const pauseBanner = queuePausedByInterrupt
-      ? `<div class="prompt-queue-pause">
-           <span>${esc(tr("queue.pausedHint"))}</span>
-           <button type="button" class="prompt-queue-resume" data-queue-resume="1">${esc(tr("queue.resume"))}</button>
-         </div>`
-      : "";
-    bar.innerHTML = `
-      <div class="prompt-queue-head">
-        <span class="prompt-queue-title">${esc(tr("queue.title", { n }))}</span>
-        <span class="prompt-queue-head-actions">
-          ${
-            queuePausedByInterrupt
-              ? `<button type="button" class="prompt-queue-resume" data-queue-resume="1">${esc(tr("queue.resume"))}</button>`
-              : ""
-          }
-          <button type="button" class="prompt-queue-clear" data-queue-clear="1">${esc(tr("queue.clear"))}</button>
-        </span>
-      </div>
-      ${pauseBanner}
-      <ul class="prompt-queue-list">${list}</ul>`;
+    bar.innerHTML = buildPromptQueueBarHtml(
+      promptQueue.map((q) => ({
+        id: q.id,
+        display: q.display,
+        content: q.content,
+        status: q.status,
+        lastError: q.lastError,
+      })),
+      queuePausedByInterrupt,
+    );
   }
   // 高度变化时重算底栏留白
   requestAnimationFrame(() => {
@@ -1025,8 +1025,47 @@ function syncPromptQueueBar(): void {
   });
 }
 
+function applyHostQueueMirror(file: Awaited<ReturnType<typeof loadSessionQueue>>): void {
+  const m = mirrorQueueToLocal(file);
+  promptQueue.length = 0;
+  for (const it of m.items) {
+    promptQueue.push({
+      id: it.id,
+      display: it.display,
+      content: it.content,
+      attachments: (it.attachments as ComposerAttachment[]) ?? [],
+      status: it.status,
+      lastError: it.lastError,
+    });
+  }
+  queuePausedByInterrupt = m.pausedByInterrupt;
+  queueingEnabled = m.queueingEnabled;
+  queueSyncError = m.syncError;
+  syncPromptQueueBar();
+}
+
+/** 按 activeSessionId 从 Host 重载 L1 队列 */
+async function reloadPromptQueueFromHost(): Promise<void> {
+  if (!activeSessionId) {
+    promptQueue.length = 0;
+    queuePausedByInterrupt = false;
+    syncPromptQueueBar();
+    return;
+  }
+  const file = await loadSessionQueue(inv, activeSessionId);
+  applyHostQueueMirror(file);
+}
+
 function clearPromptQueue(opts?: { silent?: boolean }): void {
   if (!promptQueue.length && !queuePausedByInterrupt) return;
+  const sid = activeSessionId;
+  if (sid) {
+    void hostClearQueue(inv, sid).then((f) => {
+      applyHostQueueMirror(f);
+      if (!opts?.silent) showToast(tr("queue.cleared"));
+    });
+    return;
+  }
   promptQueue.length = 0;
   queuePausedByInterrupt = false;
   syncPromptQueueBar();
@@ -1041,6 +1080,14 @@ function refreshQueueModalIfOpen(): void {
 }
 
 function removeQueuedPrompt(id: string): void {
+  const sid = activeSessionId;
+  if (sid) {
+    void hostRemoveItem(inv, sid, id).then((f) => {
+      applyHostQueueMirror(f);
+      refreshQueueModalIfOpen();
+    });
+    return;
+  }
   const i = promptQueue.findIndex((q) => q.id === id);
   if (i < 0) return;
   promptQueue.splice(i, 1);
@@ -1054,9 +1101,21 @@ function moveQueuedPrompt(id: string, dir: -1 | 1): void {
   if (i < 0) return;
   const j = i + dir;
   if (j < 0 || j >= promptQueue.length) return;
-  const tmp = promptQueue[i]!;
+  const ordered = promptQueue.map((q) => q.id);
+  const tmp = ordered[i]!;
+  ordered[i] = ordered[j]!;
+  ordered[j] = tmp;
+  const sid = activeSessionId;
+  if (sid) {
+    void hostReorder(inv, sid, ordered).then((f) => {
+      applyHostQueueMirror(f);
+      refreshQueueModalIfOpen();
+    });
+    return;
+  }
+  const t = promptQueue[i]!;
   promptQueue[i] = promptQueue[j]!;
-  promptQueue[j] = tmp;
+  promptQueue[j] = t;
   syncPromptQueueBar();
   refreshQueueModalIfOpen();
 }
@@ -1070,8 +1129,18 @@ function updateQueuedPrompt(
   const d = patch.display.trim();
   const c = patch.content.trim();
   if (!d && !c) return false;
-  q.display = d || c;
-  q.content = c || d;
+  const display = d || c;
+  const content = c || d;
+  const sid = activeSessionId;
+  if (sid) {
+    void hostUpdateItem(inv, sid, id, { display, content }).then((f) => {
+      applyHostQueueMirror(f);
+      refreshQueueModalIfOpen();
+    });
+    return true;
+  }
+  q.display = display;
+  q.content = content;
   syncPromptQueueBar();
   refreshQueueModalIfOpen();
   return true;
@@ -1110,6 +1179,15 @@ function openEditQueuedPrompt(id: string): void {
 }
 
 function resumePromptQueue(): void {
+  const sid = activeSessionId;
+  if (sid) {
+    void hostSetQueueFlags(inv, sid, { pausedByInterrupt: false }).then((f) => {
+      applyHostQueueMirror(f);
+      showToast(tr("queue.resumed"));
+      if (!turnActive) scheduleDrainPromptQueue();
+    });
+    return;
+  }
   if (!promptQueue.length) {
     queuePausedByInterrupt = false;
     syncPromptQueueBar();
@@ -1123,6 +1201,25 @@ function resumePromptQueue(): void {
 
 function enqueuePrompt(item: Omit<QueuedPrompt, "id">): string {
   const id = `q_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 7)}`;
+  const sid = activeSessionId;
+  if (sid) {
+    void hostEnqueue(inv, sid, {
+      id,
+      content: item.content,
+      display: item.display,
+      attachments: item.attachments as unknown[],
+    }).then((f) => {
+      applyHostQueueMirror(f);
+      const toastKey = queuePausedByInterrupt
+        ? "queue.enqueuedPaused"
+        : "queue.enqueued";
+      showToast(tr(toastKey, { n: promptQueue.length }));
+      if (queueSyncError) {
+        showToast(tr("queue.localOnly", { err: queueSyncError }), "error");
+      }
+    });
+    return id;
+  }
   promptQueue.push({ ...item, id });
   syncPromptQueueBar();
   const toastKey = queuePausedByInterrupt
@@ -1162,35 +1259,22 @@ async function drainPromptQueue(): Promise<void> {
 
 function showPromptQueueModal(): { ok: boolean; message?: string } {
   if (!promptQueue.length) {
-    openModal(
-      tr("queue.modalTitle"),
-      `<p class="prompt-dlg-hint">${esc(tr("queue.empty"))}</p>
-       <p class="prompt-dlg-hint">${esc(tr("queue.hint"))}</p>
-       <div class="prompt-dlg-actions">
-         <button type="button" class="btn-ghost" id="prompt-dlg-cancel">${esc(tr("context.close"))}</button>
-       </div>`,
-    );
+    openModal(tr("queue.modalTitle"), buildPromptQueueEmptyModalHtml());
     $("prompt-dlg-cancel").onclick = () => closeModal();
     return { ok: true, message: tr("queue.empty") };
   }
-  const n = promptQueue.length;
-  const list = promptQueue.map((q, i) => renderQueueItemRow(q, i, n)).join("");
-  const pauseNote = queuePausedByInterrupt
-    ? `<p class="prompt-dlg-hint prompt-queue-pause-note">${esc(tr("queue.pausedHint"))}</p>`
-    : "";
   openModal(
     tr("queue.modalTitle"),
-    `${pauseNote}
-     <ul class="prompt-queue-list prompt-queue-list--modal">${list}</ul>
-     <div class="prompt-dlg-actions">
-       ${
-         queuePausedByInterrupt
-           ? `<button type="button" class="btn-dark" id="queue-modal-resume">${esc(tr("queue.resume"))}</button>`
-           : ""
-       }
-       <button type="button" class="btn-ghost" id="queue-modal-clear">${esc(tr("queue.clear"))}</button>
-       <button type="button" class="btn-ghost" id="prompt-dlg-cancel">${esc(tr("context.close"))}</button>
-     </div>`,
+    buildPromptQueueModalBodyHtml(
+      promptQueue.map((q) => ({
+        id: q.id,
+        display: q.display,
+        content: q.content,
+        status: q.status,
+        lastError: q.lastError,
+      })),
+      queuePausedByInterrupt,
+    ),
   );
   const resumeBtn = document.getElementById("queue-modal-resume");
   if (resumeBtn) {
@@ -1261,48 +1345,87 @@ function isTaskRunningPhase(phase: string): boolean {
 }
 
 function showTasksPanel(): { ok: boolean; message?: string } {
-  const rows = [...taskSnaps.values()]
-    .filter((t) => !activeSessionId || !t.sessionId || t.sessionId === activeSessionId)
-    .sort((a, b) => b.updatedAt - a.updatedAt);
-  if (!rows.length) {
+  // Async refresh from Host aggregate (process/monitor/subagent/scheduled)
+  void showTasksPanelAsync();
+  return { ok: true };
+}
+
+async function showTasksPanelAsync(): Promise<void> {
+  type Agg = {
+    id: string;
+    kind: string;
+    title: string;
+    status: string;
+    canKill?: boolean;
+    canOpen?: boolean;
+    automationId?: string;
+    childSessionId?: string;
+  };
+  let agg: Agg[] = [];
+  if (activeSessionId) {
+    const res = await inv<{ items: Agg[] }>("threads.tasksList", {
+      sessionId: activeSessionId,
+    });
+    if (res.ok && res.data?.items) agg = res.data.items;
+  }
+  // Fallback: local taskSnaps when Host empty
+  if (!agg.length) {
+    const rows = [...taskSnaps.values()]
+      .filter(
+        (t) =>
+          !activeSessionId || !t.sessionId || t.sessionId === activeSessionId,
+      )
+      .sort((a, b) => b.updatedAt - a.updatedAt);
+    agg = rows.map((t) => ({
+      id: t.taskId,
+      kind: t.isMonitor ? "monitor" : "process",
+      title: (t.description || t.command || t.taskId).trim(),
+      status:
+        t.phase === "completed"
+          ? t.success === false
+            ? "failed"
+            : "ok"
+          : t.phase,
+      canKill: isTaskRunningPhase(t.phase),
+    }));
+  }
+  if (!agg.length) {
     openModal(
       tr("tasks.modalTitle"),
       `<p class="prompt-dlg-hint">${esc(tr("tasks.empty"))}</p>
        <p class="prompt-dlg-hint">${esc(tr("tasks.hint"))}</p>
+       <p class="prompt-dlg-hint">${esc(tr("tasks.automationsHint"))}</p>
        <div class="prompt-dlg-actions">
          <button type="button" class="btn-ghost" id="prompt-dlg-cancel">${esc(tr("context.close"))}</button>
        </div>`,
     );
     $("prompt-dlg-cancel").onclick = () => closeModal();
-    return { ok: true, message: tr("tasks.empty") };
+    return;
   }
-  const items = rows
+  const items = agg
     .map((t) => {
-      const kind = t.isMonitor ? "monitor" : "task";
-      const label =
-        (t.description || t.command || "").trim() || kind;
-      const short = t.taskId.slice(0, 10);
-      const st =
-        t.phase === "completed"
-          ? t.success === false
-            ? "fail"
-            : "ok"
-          : t.phase;
-      const age = formatAge(new Date(t.updatedAt).toISOString()) || "";
-      const running = isTaskRunningPhase(t.phase);
-      return `<div class="task-panel-row" data-task-id="${esc(t.taskId)}">
+      const kind = t.kind || "process";
+      const label = (t.title || "").trim() || kind;
+      const short = t.id.slice(0, 10);
+      const st = t.status || "unknown";
+      const running = t.canKill || isTaskRunningPhase(st);
+      return `<div class="task-panel-row" data-task-id="${esc(t.id)}">
         <div class="task-panel-main">
           <span class="task-panel-st task-st-${esc(st)}">[${esc(st)}]</span>
           <span class="task-panel-kind">${esc(kind)}</span>
-          <span class="task-panel-id" title="${esc(t.taskId)}">${esc(short)}</span>
+          <span class="task-panel-id" title="${esc(t.id)}">${esc(short)}</span>
           <span class="task-panel-label" title="${esc(label)}">${esc(label.slice(0, 100))}</span>
-          ${age ? `<span class="task-panel-age">${esc(age)}</span>` : ""}
         </div>
         <div class="task-panel-acts">
-          <button type="button" class="btn-ghost sm" data-task-copy="${esc(t.taskId)}">${esc(tr("tasks.copyId"))}</button>
+          <button type="button" class="btn-ghost sm" data-task-copy="${esc(t.id)}">${esc(tr("tasks.copyId"))}</button>
           ${
-            running
-              ? `<button type="button" class="btn-dark sm" data-task-kill="${esc(t.taskId)}" title="${esc(tr("tasks.killTitle"))}">${esc(tr("tasks.kill"))}</button>`
+            running && (kind === "process" || kind === "monitor")
+              ? `<button type="button" class="btn-dark sm" data-task-kill="${esc(t.id)}" title="${esc(tr("tasks.killTitle"))}">${esc(tr("tasks.kill"))}</button>`
+              : ""
+          }
+          ${
+            kind === "scheduled" || t.canOpen
+              ? `<button type="button" class="btn-ghost sm" data-task-open-auto="${esc(t.automationId || t.id)}">${esc(tr("tasks.openAutomations"))}</button>`
               : ""
           }
         </div>
@@ -1339,7 +1462,14 @@ function showTasksPanel(): { ok: boolean; message?: string } {
       if (id) void killBackgroundTask(id);
     };
   }
-  return { ok: true };
+  for (const btn of Array.from(
+    document.querySelectorAll("[data-task-open-auto]"),
+  )) {
+    (btn as HTMLElement).onclick = () => {
+      closeModal();
+      document.getElementById("btn-automations")?.click();
+    };
+  }
 }
 
 /** S20：杀后台任务（ACP `_x.ai/task/kill`） */
@@ -1947,6 +2077,11 @@ async function cancelTurn(opts?: { clearQueue?: boolean }): Promise<void> {
   } else if (promptQueue.length) {
     queuePausedByInterrupt = true;
     syncPromptQueueBar();
+    if (activeSessionId) {
+      void hostSetQueueFlags(inv, activeSessionId, {
+        pausedByInterrupt: true,
+      });
+    }
   }
   if (tid) {
     const res = await inv("turns.cancel", { threadId: tid });
@@ -2690,8 +2825,11 @@ function permLabel(): string {
 }
 
 function syncPermLabels(): void {
-  $("perm-label").textContent = permLabel();
-  $("perm-label-2").textContent = permLabel();
+  const v = permLabel();
+  for (const id of ["perm-label", "perm-label-2", "perm-label-btw"] as const) {
+    const el = document.getElementById(id);
+    if (el) el.textContent = v;
+  }
   syncSessionModeChips();
 }
 
@@ -2725,7 +2863,7 @@ function modelChipText(): string {
 
 function syncModelLabels(): void {
   const v = modelChipText();
-  for (const id of ["model-label", "model-label-2"] as const) {
+  for (const id of ["model-label", "model-label-2", "model-label-btw"] as const) {
     const el = document.getElementById(id);
     if (el) el.textContent = v;
   }
@@ -2734,7 +2872,7 @@ function syncModelLabels(): void {
     display !== (modelLabel || "").trim()
       ? `${display} (${modelLabel})`
       : display;
-  for (const id of ["btn-model", "btn-model-2"] as const) {
+  for (const id of ["btn-model", "btn-model-2", "btn-model-btw"] as const) {
     const btn = document.getElementById(id);
     if (btn) {
       btn.title = tr("chat.modelTitle", {
@@ -3593,14 +3731,14 @@ function syncSessionModeChips(): void {
   // /goal 进入编写态即显示 chip，发送后仍显示
   const goalOn = Boolean(goalTitle) || goalComposeActive;
 
-  for (const id of ["chip-plan", "chip-plan-2"] as const) {
+  for (const id of ["chip-plan", "chip-plan-2", "chip-plan-btw"] as const) {
     const el = document.getElementById(id);
     if (!el) continue;
     el.classList.toggle("hidden", !planOn);
     el.title = planOn ? tr("plan.modeChipOpen") : tr("plan.modeChip");
   }
   syncPlanPanelChrome();
-  for (const id of ["chip-goal", "chip-goal-2"] as const) {
+  for (const id of ["chip-goal", "chip-goal-2", "chip-goal-btw"] as const) {
     const el = document.getElementById(id);
     if (!el) continue;
     el.classList.toggle("hidden", !goalOn);
@@ -4335,14 +4473,14 @@ function bindSessionModeChips(): void {
       }
       return;
     }
-    const planChip = t.closest("#chip-plan, #chip-plan-2");
+    const planChip = t.closest("#chip-plan, #chip-plan-2, #chip-plan-btw");
     if (planChip && !t.closest("[data-chip-close]")) {
       void showViewPlan().then((r) => {
         if (!r.ok && r.message) showToast(r.message, "error");
       });
       return;
     }
-    const goalChip = t.closest("#chip-goal, #chip-goal-2");
+    const goalChip = t.closest("#chip-goal, #chip-goal-2, #chip-goal-btw");
     if (goalChip && !t.closest("[data-chip-close]")) {
       void runGoalCommand("status");
     }
@@ -4451,18 +4589,53 @@ async function tryRunComposerSlashLine(raw: string): Promise<boolean> {
   const name = (m[1] ?? "").toLowerCase();
   if (!name) return false;
   // 仅拦截桌面静态命令（skills/agent 广告仍可当 prompt 或走 palette）
-  const cmd = resolveSlashCommand(getStaticSlashCommands(), name);
+  // 静态 + skill 动态（resolve）均可本地拦截
+  const staticCmd = resolveSlashCommand(getStaticSlashCommands(), name);
+  const skillHit =
+    !staticCmd && name.startsWith("skill:")
+      ? null
+      : !staticCmd
+        ? null
+        : staticCmd;
+  // skill:name 或直接 skill 名走 resolve
+  if (!staticCmd && !name.includes(":")) {
+    // try skill resolve by bare name via Host
+    const resolved = await inv<{
+      mode: string;
+      prompt: string;
+      name: string;
+    }>("skills.resolve", {
+      name,
+      cwd: activeCwd || selectedProject()?.path,
+    });
+    if (resolved.ok && resolved.data?.mode === "resolved") {
+      const ta = activeComposerInput();
+      if (ta) ta.value = "";
+      slashPalette?.hide();
+      const args = (m[2] ?? "").trim();
+      const body =
+        resolved.data.prompt + (args ? `\n\nUser request:\n${args}` : "");
+      await dispatchAgentPrompt(body, `/${name}${args ? " " + args : ""}`, {
+        force: false,
+      });
+      return true;
+    }
+  }
+  const cmd = skillHit ?? staticCmd;
   if (!cmd) return false;
   const ta = activeComposerInput();
   if (ta) ta.value = "";
   slashPalette?.hide();
-  const res = await runSlashCommand(cmd);
+  const res = await runSlashCommand(cmd, (m[2] ?? "").trim());
   if (res.message) showToast(res.message, res.ok ? "info" : "error");
   return true;
 }
 
 /** 仅处理会话斜杠命令（导航类走侧栏 / 顶栏 UI） */
-async function runSlashCommand(cmd: SlashCommandDef): Promise<{ ok: boolean; message?: string }> {
+async function runSlashCommand(
+  cmd: SlashCommandDef,
+  args = "",
+): Promise<{ ok: boolean; message?: string }> {
   const act = cmd.action;
   switch (act.kind) {
     case "set-perm":
@@ -4504,8 +4677,34 @@ async function runSlashCommand(cmd: SlashCommandDef): Promise<{ ok: boolean; mes
     case "set-max-turns":
       return promptSetMaxTurns(act.turns);
     case "agent-command": {
-      // agent 广告命令：插入 `/name ` 到输入框，由用户补参后发送（同源 slash）
       const name = act.name.replace(/^\//, "");
+      // Skills：Host resolve → 真执行 prompt；否则回退插入文案
+      const resolved = await inv<{
+        mode: string;
+        prompt: string;
+        name: string;
+      }>("skills.resolve", {
+        name,
+        cwd: activeCwd || selectedProject()?.path,
+      });
+      if (resolved.ok && resolved.data) {
+        const body =
+          resolved.data.prompt +
+          (args ? `\n\nUser request:\n${args}` : "");
+        const display =
+          resolved.data.mode === "resolved"
+            ? `/${name}${args ? " " + args : ""}`
+            : tr("slash.skillInsert", { name });
+        await dispatchAgentPrompt(body, display, { force: false });
+        return {
+          ok: true,
+          message:
+            resolved.data.mode === "resolved"
+              ? tr("slash.skillResolved", { name })
+              : tr("slash.skillFallback", { name }),
+        };
+      }
+      // agent 广告命令：插入 `/name ` 到输入框
       insertComposerText(`/${name} `);
       return { ok: true, message: tr("slash.agentCmdInserted", { name }) };
     }
@@ -4598,7 +4797,7 @@ async function runSlashCommand(cmd: SlashCommandDef): Promise<{ ok: boolean; mes
     case "compact-session":
       return compactActiveSession();
     case "fork-session":
-      return forkActiveSession();
+      return forkActiveSession(args);
     case "rewind-session":
       return rewindViaSlash();
     case "show-queue":
@@ -5336,7 +5535,11 @@ function parentThreadTitle(parentSessionId: string | undefined): string | null {
  */
 async function forkSessionFrom(
   source: ThreadRow,
-  opts?: { confirm?: boolean },
+  opts?: {
+    confirm?: boolean;
+    directive?: string;
+    worktreeMode?: "use_main" | "create_new";
+  },
 ): Promise<{ ok: boolean; message?: string }> {
   const cwd = source.cwd || activeCwd || selectedProject()?.path;
   if (!cwd) return { ok: false, message: tr("slash.forkNeedProject") };
@@ -5345,13 +5548,14 @@ async function forkSessionFrom(
   }
 
   const baseTitle = threadDisplayTitle(source);
+  // 侧栏确认框只选工作区；directive 仅 slash `/fork …` 传入
+  let directive = opts?.directive?.trim() ?? "";
+  let worktreeMode = opts?.worktreeMode ?? "use_main";
+
   if (opts?.confirm) {
-    const ok = await confirmText({
-      title: tr("session.forkConfirmTitle"),
-      message: tr("session.forkConfirmMsg", { title: baseTitle }),
-      okLabel: tr("session.forkConfirmOk"),
-    });
-    if (!ok) return { ok: false };
+    const dlg = await openForkDialog({ worktreeMode });
+    if (!dlg) return { ok: false };
+    worktreeMode = dlg.worktreeMode;
   }
 
   // 若正在该会话上跑 turn，先停
@@ -5371,6 +5575,7 @@ async function forkSessionFrom(
     cwd: string;
     historyCopied?: boolean;
     parentSessionId?: string;
+    directiveSent?: boolean;
   }>("threads.fork", {
     sourceSessionId: source.sessionId,
     cwd,
@@ -5378,6 +5583,11 @@ async function forkSessionFrom(
     title: forkTitle,
     model: source.model || modelLabel,
     effort: source.effort || effortLevel,
+    directive: directive || undefined,
+    worktree:
+      worktreeMode === "create_new"
+        ? { mode: "create_new" as const }
+        : { mode: "use_main" as const },
   });
   if (!res.ok) {
     return { ok: false, message: res.error?.message ?? tr("slash.forkFail") };
@@ -5401,20 +5611,47 @@ async function forkSessionFrom(
   }
   await openThread(row);
   await refreshProjectsAndThreads();
-  const copied = res.data?.historyCopied
+  let msg = res.data?.historyCopied
     ? tr("slash.forkOkCopied")
     : tr("slash.forkOkEmpty");
-  return { ok: true, message: copied };
+  if (res.data?.directiveSent) msg += " · " + tr("slash.forkDirectiveSent");
+  return { ok: true, message: msg };
 }
 
-/** slash `/fork`：当前活动会话，不弹确认 */
-async function forkActiveSession(): Promise<{ ok: boolean; message?: string }> {
+/** Fork 确认：仅工作区（HTML 见 fork-session-ui） */
+function openForkDialog(initial: {
+  worktreeMode: "use_main" | "create_new";
+}): Promise<{ worktreeMode: "use_main" | "create_new" } | null> {
+  return new Promise((resolve) => {
+    openModal(tr("session.forkConfirmTitle"), buildForkDialogHtml());
+    const radios = document.querySelectorAll('input[name="fork-wt"]');
+    for (const r of Array.from(radios)) {
+      const input = r as HTMLInputElement;
+      if (input.value === initial.worktreeMode) input.checked = true;
+    }
+    $("fork-dlg-ok").onclick = () => {
+      const result = readForkDialogResult();
+      closeModal();
+      resolve(result);
+    };
+    $("prompt-dlg-cancel").onclick = () => {
+      closeModal();
+      resolve(null);
+    };
+  });
+}
+
+/** slash `/fork [directive]`：解析 --worktree / --no-worktree */
+async function forkActiveSession(
+  rawArg?: string,
+): Promise<{ ok: boolean; message?: string }> {
   const p = selectedProject();
   const cwd = activeCwd || p?.path;
   if (!cwd) return { ok: false, message: tr("slash.forkNeedProject") };
   if (!activeSessionId) {
     return { ok: false, message: tr("slash.forkNeedSession") };
   }
+  const { directive: arg, worktreeMode } = parseForkSlashArgs(rawArg ?? "");
   const source =
     threads.find((t) => t.sessionId === activeSessionId) ??
     ({
@@ -5430,7 +5667,11 @@ async function forkActiveSession(): Promise<{ ok: boolean; message?: string }> {
       model: modelLabel,
       effort: effortLevel,
     } satisfies ThreadRow);
-  return forkSessionFrom(source, { confirm: false });
+  return forkSessionFrom(source, {
+    confirm: false,
+    directive: arg || undefined,
+    worktreeMode,
+  });
 }
 
 function arrayBufferToBase64(buf: ArrayBuffer): string {
@@ -5530,7 +5771,12 @@ function bindImagePaste(): void {
     })();
   };
 
-  for (const id of ["composer-input", "chat-input", "focus-input"] as const) {
+  for (const id of [
+    "composer-input",
+    "chat-input",
+    "focus-input",
+    "btw-side-input",
+  ] as const) {
     document
       .getElementById(id)
       ?.addEventListener("paste", onPaste as EventListener, true);
@@ -5559,7 +5805,12 @@ function bindSlashPalette(): void {
     onMessage: (text, kind) => showToast(text, kind ?? "info"),
     onOpen: () => atFilePalette?.hide(),
   });
-  for (const id of ["composer-input", "chat-input", "focus-input"] as const) {
+  for (const id of [
+    "composer-input",
+    "chat-input",
+    "focus-input",
+    "btw-side-input",
+  ] as const) {
     const ta = document.getElementById(id) as HTMLTextAreaElement | null;
     if (ta) slashPalette.attach(ta);
   }
@@ -5602,7 +5853,12 @@ function bindAtFilePalette(): void {
     onMessage: (text, kind) => showToast(text, kind ?? "info"),
     onOpen: () => slashPalette?.hide(),
   });
-  for (const id of ["composer-input", "chat-input", "focus-input"] as const) {
+  for (const id of [
+    "composer-input",
+    "chat-input",
+    "focus-input",
+    "btw-side-input",
+  ] as const) {
     const ta = document.getElementById(id) as HTMLTextAreaElement | null;
     if (ta) atFilePalette.attach(ta);
   }
@@ -5709,7 +5965,11 @@ function openComposerImagePreview(a: ComposerAttachment): void {
 }
 
 function renderAttachmentChips(): void {
-  for (const id of ["composer-attachments", "chat-attachments"] as const) {
+  for (const id of [
+    "composer-attachments",
+    "chat-attachments",
+    "btw-attachments",
+  ] as const) {
     const el = document.getElementById(id);
     if (!el) continue;
     if (!composerAttachments.length) {
@@ -6694,7 +6954,12 @@ function showPlusMenu(anchor: HTMLElement): void {
 }
 
 function bindPlusMenu(): void {
-  for (const id of ["btn-attach", "btn-attach-chat", "btn-focus-attach"] as const) {
+  for (const id of [
+    "btn-attach",
+    "btn-attach-chat",
+    "btn-focus-attach",
+    "btn-attach-btw",
+  ] as const) {
     const btn = document.getElementById(id);
     if (!btn) continue;
     btn.addEventListener("click", (e) => {
@@ -6730,7 +6995,11 @@ function bindPlusMenu(): void {
   };
   document.addEventListener("click", (e) => {
     const t = e.target as HTMLElement;
-    if (!t.closest("#plus-menu, #btn-attach, #btn-attach-chat, #btn-focus-attach")) {
+    if (
+      !t.closest(
+        "#plus-menu, #btn-attach, #btn-attach-chat, #btn-focus-attach, #btn-attach-btw",
+      )
+    ) {
       hidePlusMenu();
     }
   });
@@ -7098,7 +7367,9 @@ function makeArchiveFolder(
   head.className = `project-archive-head${open ? " is-open" : ""}`;
   head.setAttribute("aria-expanded", open ? "true" : "false");
   const count = archivedThreads.length;
-  head.innerHTML = `<span class="archive-ico" aria-hidden="true">📦</span><span class="archive-label">归档</span>${count ? `<span class="archive-count">${count}</span>` : ""}<span class="proj-chev archive-chev" aria-hidden="true">${open ? "▾" : "▸"}</span>`;
+  head.innerHTML =
+    `${sidebarIcon("folder", "archive-ico")}<span class="archive-label">归档</span>${count ? `<span class="archive-count">${count}</span>` : ""}` +
+    `${sidebarIcon(open ? "chevronDown" : "chevronRight", "proj-chev archive-chev")}`;
   head.onclick = (e) => {
     e.stopPropagation();
     if (expandedArchiveIds.has(projectId)) expandedArchiveIds.delete(projectId);
@@ -7189,10 +7460,10 @@ async function refreshProjectsAndThreads(): Promise<void> {
     b.className = `project-item${p.id === selectedProjectId ? " active" : ""}`;
     b.setAttribute("aria-expanded", isExpanded ? "true" : "false");
     b.innerHTML =
-      `<span class="proj-chev" aria-hidden="true">${isExpanded ? "▾" : "▸"}</span>` +
-      `<span class="folder-ico">📁</span>` +
+      `${sidebarIcon(isExpanded ? "chevronDown" : "chevronRight", "proj-chev")}` +
+      `${sidebarIcon(isExpanded ? "folderOpen" : "folder", "folder-ico")}` +
       `<span class="proj-title">${esc(p.title)}</span>` +
-      `<span class="proj-remove" data-remove-project="${esc(p.id)}" title="从列表移除" aria-label="移除项目">×</span>`;
+      `<span class="proj-remove" data-remove-project="${esc(p.id)}" title="从列表移除" aria-label="移除项目">${sidebarIcon("x", "proj-remove-x")}</span>`;
     b.onclick = (e) => {
       const rm = (e.target as HTMLElement).closest("[data-remove-project]") as HTMLElement | null;
       if (rm) {
@@ -7324,8 +7595,6 @@ async function continueRecentSession(): Promise<void> {
 async function openThread(t: ThreadRow): Promise<void> {
   // 加载 history 期间挂起直播事件，避免与磁盘回放叠双份
   suspendLiveTranscript = true;
-  // 切换会话：丢弃本地 follow-up 队列（按会话语义，不跨会话）
-  clearPromptQueue({ silent: true });
   endTurn(); // 切换会话时清理进行中 UI
   hideAgentCrashBanner();
   agentAvailableCommands = [];
@@ -7342,6 +7611,12 @@ async function openThread(t: ThreadRow): Promise<void> {
   }
   activeThreadId = t.id;
   activeSessionId = t.sessionId;
+  // 默认 history_only；发送时再 attach（P1-B 懒附着）
+  setAttachUiState(
+    t.id.startsWith("disk_") || !t.id ? "history_only" : "history_only",
+  );
+  // L1 按会话加载持久队列（勿静默清空）
+  void reloadPromptQueueFromHost();
   setActiveCwd(t.cwd);
   sidePane?.onSessionChanged();
   // chip 跟随会话模型，不用全局默认盖住
@@ -7448,12 +7723,23 @@ function replayHistoryTool(e: {
   markToolCompleted(id, name, rawOut);
 }
 
-/** Disk session → attach live ACP so turns.prompt works. */
+/** Disk session → attach live ACP so turns.prompt works. Ping if already live. */
 async function ensureLiveThread(): Promise<string | null> {
   if (!activeSessionId || !activeCwd) return null;
   if (activeThreadId && !activeThreadId.startsWith("disk_")) {
-    return activeThreadId;
+    const ping = await inv<{ ok: boolean; alive: boolean; state: string }>(
+      "threads.ping",
+      { threadId: activeThreadId },
+    );
+    if (ping.ok && ping.data?.ok && ping.data.alive) {
+      setAttachUiState("live");
+      return activeThreadId;
+    }
+    // stale live id → force reattach
+    setAttachUiState("failed", ping.error?.message ?? tr("crash.default"));
+    activeThreadId = `disk_${activeSessionId}`;
   }
+  setAttachUiState("attaching");
   // R3：attach 期挂起直播，避免与已回放历史叠双份（Mode B 无 load live buffer）
   suspendLiveTranscript = true;
   try {
@@ -7463,10 +7749,12 @@ async function ensureLiveThread(): Promise<string | null> {
     });
     if (!att.ok || !att.data?.threadId) {
       appendLine(att.error?.message ?? tr("crash.attachFail"), "error");
+      setAttachUiState("failed", att.error?.message);
       showAgentCrashBanner(att.error?.message);
       return null;
     }
     activeThreadId = att.data.threadId;
+    setAttachUiState("live");
     hideAgentCrashBanner();
     // attach 后刷新 agent 广告命令
     void refreshAgentAvailableCommands().then(() => slashPalette?.invalidate());
@@ -7474,6 +7762,35 @@ async function ensureLiveThread(): Promise<string | null> {
   } finally {
     suspendLiveTranscript = false;
   }
+}
+
+function setAttachUiState(state: AttachState, lastError?: string): void {
+  attachUiState = state;
+  syncAttachPill(lastError);
+  if (state === "failed" && lastError) {
+    showAgentCrashBanner(lastError);
+  }
+}
+
+function syncAttachPill(lastError?: string): void {
+  syncAttachPillDom(attachUiState, lastError, {
+    onConnectClick: () => {
+      void connectAgentWarm();
+    },
+  });
+}
+
+/** 用户主动连接 Agent（不发送消息） */
+async function connectAgentWarm(): Promise<void> {
+  if (!activeSessionId) {
+    showToast(tr("crash.needSession"), "error");
+    return;
+  }
+  if (activeThreadId && !activeThreadId.startsWith("disk_")) {
+    activeThreadId = `disk_${activeSessionId}`;
+  }
+  const tid = await ensureLiveThread();
+  if (tid) showToast(tr("attach.connectedToast"));
 }
 
 async function pickAndAddProject(): Promise<Project | null> {
@@ -7713,47 +8030,68 @@ function parseInlineBtwOrInterject(
   };
 }
 
-/** 旁路侧问卡片（不进主对话气泡流语义；仅 UI） */
-function paintBtwCard(
+/** 旁路侧问：画到右侧「旁路侧问」栏线程（对齐 Codex 侧边聊天，不进主 transcript） */
+function ensureBtwSideOpen(): void {
+  sidePane?.openBtwCategory(false);
+}
+
+function btwSideThreadEl(): HTMLElement | null {
+  return document.getElementById("btw-side-thread");
+}
+
+function btwSideHideEmpty(): void {
+  document.getElementById("btw-side-empty")?.classList.add("hidden");
+}
+
+function paintBtwExchange(
   question: string,
   state: "loading" | "done" | "error",
   answerOrError?: string,
-): HTMLElement {
-  const el = $("transcript");
-  let card = document.getElementById("btw-live-card") as HTMLElement | null;
-  if (!card) {
-    card = document.createElement("div");
-    card.id = "btw-live-card";
-    card.className = "btw-card";
-    el.appendChild(card);
+  exchangeId?: string,
+): string {
+  ensureBtwSideOpen();
+  const thread = btwSideThreadEl();
+  if (!thread) return exchangeId ?? "";
+  btwSideHideEmpty();
+  const id =
+    exchangeId ||
+    `btw_ex_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 7)}`;
+  let block = document.getElementById(id) as HTMLElement | null;
+  if (!block) {
+    block = document.createElement("div");
+    block.id = id;
+    block.className = "btw-ex";
+    thread.appendChild(block);
   }
-  card.classList.toggle("btw-card--error", state === "error");
-  card.classList.toggle("btw-card--done", state === "done");
-  const q = esc(question);
+  block.classList.toggle("btw-ex--error", state === "error");
+  block.classList.toggle("btw-ex--done", state === "done");
+  block.classList.toggle("btw-ex--loading", state === "loading");
+  const qHtml = `<div class="btw-ex-q"><div class="btw-ex-bubble btw-ex-bubble-user">${esc(question)}</div></div>`;
+  let aHtml: string;
   if (state === "loading") {
-    card.innerHTML = `
-      <div class="btw-card-head"><span class="btw-badge">${esc(tr("btw.badge"))}</span>
-        <button type="button" class="btw-dismiss" data-btw-dismiss="1" title="${esc(tr("btw.dismiss"))}">×</button></div>
-      <div class="btw-q">${q}</div>
-      <div class="btw-body btw-loading">${esc(tr("btw.loading"))}</div>`;
+    aHtml = `<div class="btw-ex-a"><div class="btw-ex-bubble btw-ex-bubble-ai btw-loading">${esc(tr("btw.loading"))}</div></div>`;
   } else if (state === "error") {
-    card.innerHTML = `
-      <div class="btw-card-head"><span class="btw-badge">${esc(tr("btw.badge"))}</span>
-        <button type="button" class="btw-dismiss" data-btw-dismiss="1" title="${esc(tr("btw.dismiss"))}">×</button></div>
-      <div class="btw-q">${q}</div>
-      <div class="btw-body btw-err">${esc(answerOrError || tr("btw.fail"))}</div>`;
+    aHtml = `<div class="btw-ex-a"><div class="btw-ex-bubble btw-ex-bubble-ai btw-err">${esc(answerOrError || tr("btw.fail"))}</div></div>`;
   } else {
-    const body = answerOrError ?? "";
-    card.innerHTML = `
-      <div class="btw-card-head"><span class="btw-badge">${esc(tr("btw.badge"))}</span>
-        <button type="button" class="btw-dismiss" data-btw-dismiss="1" title="${esc(tr("btw.dismiss"))}">×</button></div>
-      <div class="btw-q">${q}</div>
-      <div class="btw-body">${renderMarkdownToSafeHtml(body)}</div>`;
+    aHtml = `<div class="btw-ex-a"><div class="btw-ex-bubble btw-ex-bubble-ai">${renderMarkdownToSafeHtml(answerOrError ?? "")}</div></div>`;
   }
-  el.scrollTop = el.scrollHeight;
-  return card;
+  block.innerHTML = qHtml + aHtml;
+  thread.scrollTop = thread.scrollHeight;
+  return id;
 }
 
+function clearBtwSideThread(): void {
+  const thread = btwSideThreadEl();
+  if (!thread) return;
+  thread.querySelectorAll(".btw-ex").forEach((n) => n.remove());
+  const empty = document.getElementById("btw-side-empty");
+  if (empty) {
+    empty.classList.remove("hidden");
+    if (!thread.contains(empty)) thread.appendChild(empty);
+  }
+}
+
+/** @deprecated 主时间线卡片已弃用；保留 dismiss 以免旧 DOM 残留 */
 function dismissBtwCard(): void {
   document.getElementById("btw-live-card")?.remove();
 }
@@ -7777,6 +8115,10 @@ function paintInterjectionMessage(text: string): void {
 /** 本端已乐观绘制的 interjection id（回声去重） */
 const selfInterjectionIds = new Set<string>();
 
+/**
+ * 旁路侧问：打开右侧「旁路侧问」栏（对齐 Codex 侧边聊天布局）。
+ * 协议仍是 Grok `_x.ai/btw`；无问题正文时只展开面板。
+ */
 async function runBtwCommand(
   questionArg?: string,
 ): Promise<{ ok: boolean; message?: string }> {
@@ -7788,47 +8130,91 @@ async function runBtwCommand(
       question = inline.body;
       const ta = activeComposerInput();
       if (ta) ta.value = "";
-    } else if (fromComposer && !fromComposer.startsWith("/")) {
-      question = fromComposer;
-      const ta = activeComposerInput();
-      if (ta) ta.value = "";
+    } else if (
+      fromComposer &&
+      !fromComposer.startsWith("/") &&
+      // 主 composer 有普通正文时：用户 slash 选 btw 则当作侧问发出
+      questionArg === undefined
+    ) {
+      // 仅 palette 无参时：优先打开侧栏，不吞主输入
     }
   }
   if (!question) {
-    const typed = await promptText({
-      title: tr("btw.promptTitle"),
-      hint: tr("btw.promptHint"),
-      defaultValue: "",
-      placeholder: tr("btw.promptPh"),
-    });
-    if (typed == null) return { ok: true };
-    question = typed.trim();
+    sidePane?.openBtwCategory(true);
+    return { ok: true, message: tr("btw.sideOpened") };
   }
+  return sendBtwQuestion(question);
+}
+
+/** 从侧栏输入框发送侧问 */
+async function sendBtwFromSidePanel(): Promise<void> {
+  const ta = document.getElementById(
+    "btw-side-input",
+  ) as HTMLTextAreaElement | null;
+  if (!ta) return;
+  const question = ta.value.trim();
   if (!question) {
-    return { ok: false, message: tr("btw.empty") };
+    showToast(tr("btw.empty"), "error");
+    return;
   }
+  ta.value = "";
+  ta.style.height = "auto";
+  const res = await sendBtwQuestion(question);
+  if (res.message && !res.ok) showToast(res.message, "error");
+}
+
+async function sendBtwQuestion(
+  question: string,
+): Promise<{ ok: boolean; message?: string }> {
+  const q = question.trim();
+  if (!q) return { ok: false, message: tr("btw.empty") };
 
   showWelcome(false);
-  paintBtwCard(question, "loading");
-  recordPromptHistory(`/btw ${question}`);
+  ensureBtwSideOpen();
+  const exId = paintBtwExchange(q, "loading");
+  recordPromptHistory(`/btw ${q}`);
 
   const threadId = await ensureLiveThread();
   if (!threadId) {
-    paintBtwCard(question, "error", tr("chat.connectFail"));
+    paintBtwExchange(q, "error", tr("chat.connectFail"), exId);
     return { ok: false, message: tr("chat.connectFail") };
   }
 
   const res = await inv<{ sessionId: string; answer: string }>("threads.btw", {
     threadId,
-    question,
+    question: q,
   });
   if (!res.ok) {
     const msg = res.error?.message ?? tr("btw.fail");
-    paintBtwCard(question, "error", msg);
+    paintBtwExchange(q, "error", msg, exId);
     return { ok: false, message: msg };
   }
-  paintBtwCard(question, "done", res.data?.answer ?? "");
+  paintBtwExchange(q, "done", res.data?.answer ?? "", exId);
   return { ok: true, message: tr("btw.ok") };
+}
+
+function bindBtwSidePanel(): void {
+  const ta = document.getElementById(
+    "btw-side-input",
+  ) as HTMLTextAreaElement | null;
+  const sendBtn = document.getElementById("btn-btw-send");
+  const clearBtn = document.getElementById("btn-btw-clear");
+  sendBtn?.addEventListener("click", () => void sendBtwFromSidePanel());
+  clearBtn?.addEventListener("click", () => {
+    clearBtwSideThread();
+    showToast(tr("btw.cleared"));
+  });
+  ta?.addEventListener("keydown", (e) => {
+    if (e.key === "Enter" && !e.shiftKey) {
+      e.preventDefault();
+      void sendBtwFromSidePanel();
+    }
+  });
+  ta?.addEventListener("input", () => {
+    if (!ta) return;
+    ta.style.height = "auto";
+    ta.style.height = `${Math.min(120, ta.scrollHeight)}px`;
+  });
 }
 
 async function runInterjectCommand(
@@ -7888,10 +8274,10 @@ function tryEnqueueFromComposer(): boolean {
   const raw = activeComposerInput()?.value.trim() ?? "";
   const inline = parseInlineBtwOrInterject(raw);
   if (inline?.kind === "btw") {
-    // 旁路不占 follow-up 队列
-    void runBtwCommand(inline.body);
+    // 旁路不占 follow-up 队列；无正文则打开侧栏
     const ta = activeComposerInput();
     if (ta) ta.value = "";
+    void runBtwCommand(inline.body || undefined);
     return true;
   }
   if (inline?.kind === "interject") {
@@ -8863,6 +9249,22 @@ function onEvent(raw: unknown): void {
     handleTaskUpdated(ev);
     return;
   }
+  if (ev.type === "session.attach_state") {
+    if (ev.sessionId && activeSessionId && ev.sessionId !== activeSessionId) {
+      return;
+    }
+    setAttachUiState(ev.state, ev.lastError);
+    return;
+  }
+  if (ev.type === "queue.changed") {
+    if (ev.sessionId && activeSessionId && ev.sessionId === activeSessionId) {
+      void reloadPromptQueueFromHost();
+      if (ev.syncError) {
+        showToast(tr("queue.localOnly", { err: String(ev.syncError) }), "error");
+      }
+    }
+    return;
+  }
   if (ev.type === "session.available_commands") {
     applyAvailableCommandsEvent(ev);
     return;
@@ -9099,6 +9501,21 @@ async function handlePlanApprovalRequested(ev: {
 
 // ── Boot ───────────────────────────────────────────────────
 
+/** 将 data-sidebar-icon 占位替换为 Codex 提取的 SVG */
+function mountSidebarIcons(root: ParentNode = document): void {
+  for (const el of Array.from(
+    root.querySelectorAll<HTMLElement>("[data-sidebar-icon]"),
+  )) {
+    const name = el.dataset.sidebarIcon as SidebarIconName | undefined;
+    if (!name) continue;
+    try {
+      el.outerHTML = sidebarIcon(name, el.className || "nav-ico");
+    } catch {
+      /* 未知 icon 名时保留空占位 */
+    }
+  }
+}
+
 async function boot(): Promise<void> {
   if (!window.grokDesktop) {
     document.body.innerHTML = `
@@ -9109,6 +9526,7 @@ npm start</pre>
       </div>`;
     return;
   }
+  mountSidebarIcons();
   window.grokDesktop.onEvent(onEvent);
   sidePane = new SidePaneController({
     inv,
@@ -9173,32 +9591,27 @@ npm start</pre>
   bindSessionModeChips();
   bindGoalBanner();
   bindImagePaste();
+  bindBtwSidePanel();
   renderAttachmentChips();
   renderGoalBanner();
 
-  $("btn-model").onclick = (e) => {
-    e.stopPropagation();
-    const menu = $("model-menu");
-    if (!menu.classList.contains("hidden") && menu.dataset.anchor === "btn-model") {
-      hideModelMenu();
-      return;
-    }
-    menu.dataset.anchor = "btn-model";
-    void showModelMenu($("btn-model"));
-  };
-  $("btn-model-2").onclick = (e) => {
-    e.stopPropagation();
-    const menu = $("model-menu");
-    if (!menu.classList.contains("hidden") && menu.dataset.anchor === "btn-model-2") {
-      hideModelMenu();
-      return;
-    }
-    menu.dataset.anchor = "btn-model-2";
-    void showModelMenu($("btn-model-2"));
-  };
+  for (const id of ["btn-model", "btn-model-2", "btn-model-btw"] as const) {
+    const btn = document.getElementById(id);
+    if (!btn) continue;
+    btn.onclick = (e) => {
+      e.stopPropagation();
+      const menu = $("model-menu");
+      if (!menu.classList.contains("hidden") && menu.dataset.anchor === id) {
+        hideModelMenu();
+        return;
+      }
+      menu.dataset.anchor = id;
+      void showModelMenu(btn);
+    };
+  }
   document.addEventListener("mousedown", (e) => {
     const t = e.target as HTMLElement;
-    if (!t.closest("#model-menu, #btn-model, #btn-model-2")) {
+    if (!t.closest("#model-menu, #btn-model, #btn-model-2, #btn-model-btw")) {
       hideModelMenu();
     }
   });
@@ -9245,8 +9658,36 @@ npm start</pre>
     if (e.target === $("modal")) closeModal();
   };
 
-  // 左侧栏展开 / 收起
+  // 左侧栏展开 / 收起 + 右缘拖宽
   const LS_SIDEBAR = "grok.desktop.sidebarCollapsed";
+  const LS_SIDEBAR_W = "grok.desktop.sidebarWidth";
+  const SIDEBAR_W_DEFAULT = 220;
+  const SIDEBAR_W_MIN = 160;
+  const SIDEBAR_W_MAX = 480;
+  const applySidebarWidth = (px: number, persist = true) => {
+    const maxByViewport = Math.floor(window.innerWidth * 0.45);
+    const w = Math.min(
+      Math.max(SIDEBAR_W_MIN, Math.round(px)),
+      Math.min(SIDEBAR_W_MAX, Math.max(SIDEBAR_W_MIN, maxByViewport)),
+    );
+    document.documentElement.style.setProperty("--sidebar-w", `${w}px`);
+    if (persist) {
+      try {
+        localStorage.setItem(LS_SIDEBAR_W, String(w));
+      } catch {
+        /* ignore */
+      }
+    }
+    return w;
+  };
+  try {
+    const savedW = Number(localStorage.getItem(LS_SIDEBAR_W));
+    if (Number.isFinite(savedW) && savedW >= SIDEBAR_W_MIN) {
+      applySidebarWidth(savedW, false);
+    }
+  } catch {
+    /* keep CSS default */
+  }
   const applyLeftSidebar = (collapsed: boolean) => {
     const app = document.getElementById("app");
     const expandBtn = document.getElementById("btn-sidebar-expand");
@@ -9273,6 +9714,57 @@ npm start</pre>
     applyLeftSidebar(true);
   document.getElementById("btn-sidebar-expand")!.onclick = () =>
     applyLeftSidebar(false);
+
+  // 左栏右缘拖动改宽
+  const sidebarResizer = document.getElementById("sidebar-resizer");
+  if (sidebarResizer) {
+    sidebarResizer.addEventListener("pointerdown", (e) => {
+      const app = document.getElementById("app");
+      if (app?.classList.contains("sidebar-collapsed")) return;
+      e.preventDefault();
+      const pe = e as PointerEvent;
+      sidebarResizer.classList.add("dragging");
+      document.body.classList.add("sidebar-resizing");
+      try {
+        sidebarResizer.setPointerCapture(pe.pointerId);
+      } catch {
+        /* ignore */
+      }
+      const startX = pe.clientX;
+      const startW =
+        parseFloat(
+          getComputedStyle(document.documentElement).getPropertyValue(
+            "--sidebar-w",
+          ),
+        ) || SIDEBAR_W_DEFAULT;
+      const onMove = (ev: PointerEvent) => {
+        // 向右拖 → 侧栏变宽
+        applySidebarWidth(startW + (ev.clientX - startX), false);
+      };
+      const onUp = (ev: PointerEvent) => {
+        sidebarResizer.classList.remove("dragging");
+        document.body.classList.remove("sidebar-resizing");
+        try {
+          sidebarResizer.releasePointerCapture(ev.pointerId);
+        } catch {
+          /* ignore */
+        }
+        const cur =
+          parseFloat(
+            getComputedStyle(document.documentElement).getPropertyValue(
+              "--sidebar-w",
+            ),
+          ) || startW;
+        applySidebarWidth(cur, true);
+        sidebarResizer.removeEventListener("pointermove", onMove);
+        sidebarResizer.removeEventListener("pointerup", onUp);
+        sidebarResizer.removeEventListener("pointercancel", onUp);
+      };
+      sidebarResizer.addEventListener("pointermove", onMove);
+      sidebarResizer.addEventListener("pointerup", onUp);
+      sidebarResizer.addEventListener("pointercancel", onUp);
+    });
+  }
 
   $("btn-add-project").onclick = () => void pickAndAddProject();
 
@@ -9343,9 +9835,15 @@ npm start</pre>
   };
   $("btn-perm-mode").onclick = () => showPermMenu($("btn-perm-mode"));
   $("btn-perm-mode-2").onclick = () => showPermMenu($("btn-perm-mode-2"));
+  const permBtw = document.getElementById("btn-perm-mode-btw");
+  if (permBtw) permBtw.onclick = () => showPermMenu(permBtw);
   document.addEventListener("click", (e) => {
     if (!isPermMenuVisible()) return;
-    if (!(e.target as HTMLElement).closest("#perm-menu, #btn-perm-mode, #btn-perm-mode-2, #btn-sandbox-setup")) {
+    if (
+      !(e.target as HTMLElement).closest(
+        "#perm-menu, #btn-perm-mode, #btn-perm-mode-2, #btn-perm-mode-btw, #btn-sandbox-setup",
+      )
+    ) {
       hidePermMenu();
     }
   });

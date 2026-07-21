@@ -3,6 +3,7 @@
  * Minimal ACP agent over stdio JSON-RPC for Host integration tests.
  * Speaks the same wire protocol Host uses with real `grok agent stdio`.
  */
+import fs from "node:fs";
 import readline from "node:readline";
 import { randomUUID } from "node:crypto";
 
@@ -57,6 +58,15 @@ rl.on("line", async (line) => {
   if (!method) return;
 
   if (method === "initialize") {
+    // Capture for contract tests (FAKE_ACP_INIT_LOG=path)
+    const logPath = process.env.FAKE_ACP_INIT_LOG;
+    if (logPath) {
+      try {
+        fs.writeFileSync(logPath, JSON.stringify(params ?? {}, null, 2), "utf8");
+      } catch {
+        /* ignore */
+      }
+    }
     write({
       jsonrpc: "2.0",
       id,
@@ -64,6 +74,7 @@ rl.on("line", async (line) => {
         protocolVersion: 1,
         serverInfo: { name: "fake-acp-agent", version: "0.1.0" },
         agentCapabilities: { loadSession: true },
+        _meta: { agentVersion: "fake-0.1.0", "x.ai/hooks": true },
       },
     });
     return;

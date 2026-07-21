@@ -47,7 +47,7 @@ export type SlashAction =
   | { kind: "clear-queue" }
   | { kind: "show-tasks" }
   | { kind: "show-prompt-history" }
-  /** /btw 旁路侧问；args 为问题正文，可空（从输入框取或弹窗） */
+  /** /btw 旁路侧问；args 为问题正文，可空（无正文则打开右侧旁路侧问栏） */
   | { kind: "btw"; question?: string }
   /** 中途插话；args 为正文，可空（从输入框取） */
   | { kind: "interject"; text?: string }
@@ -226,7 +226,7 @@ export function getStaticSlashCommands(): SlashCommandDef[] {
       id: "btw",
       title: tr("slash.btw"),
       description: tr("slash.btwDesc"),
-      keywords: "btw side question 旁路 侧问 顺便问",
+      keywords: "btw side question 旁路 侧问 顺便问 侧边",
       icon: "💬",
       action: { kind: "btw" },
     },
@@ -381,9 +381,10 @@ export function skillCommands(
     icon: "⬡",
     dynamic: true,
     badge: skillScopeBadge(s.scope),
+    // Host skills.resolve 执行；降级时 insert 提示文案
     action: {
-      kind: "insert-text" as const,
-      text: tr("slash.skillInsert", { name: s.name }),
+      kind: "agent-command" as const,
+      name: s.name,
     },
   }));
 }

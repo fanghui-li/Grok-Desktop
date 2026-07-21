@@ -6,6 +6,7 @@ import type { HostIpcMethod } from "../shared/host-api.js";
 import { t as tr } from "../shared/i18n/index.js";
 import { renderMarkdownToSafeHtml } from "./markdown.js";
 import { linkifyFilePaths } from "./file-links.js";
+import { focusModeIconHtml } from "./sidebar-icons.js";
 
 type HostRes<T> = {
   ok: boolean;
@@ -35,7 +36,13 @@ const LS_OPEN = "grok.desktop.sidePaneOpen";
 const LS_WIDTH = "grok.desktop.sidePaneWidth";
 const LS_CAT = "grok.desktop.sidePaneCat";
 
-export type SideCategory = "files" | "browser" | "terminal" | "plan" | "agents";
+export type SideCategory =
+  | "files"
+  | "browser"
+  | "terminal"
+  | "plan"
+  | "agents"
+  | "btw";
 
 function $(id: string): HTMLElement {
   return document.getElementById(id) as HTMLElement;
@@ -261,6 +268,30 @@ export class SidePaneController {
     void this.refreshAgentsTree();
   }
 
+  /** 打开并聚焦「旁路侧问」分类（对齐 Codex 侧边聊天面板） */
+  openBtwCategory(focusInput = true): void {
+    this.category = "btw";
+    this.open = true;
+    // 侧问面板不需要全屏文件沉浸
+    if (this.focusMode) {
+      this.focusMode = false;
+      this.applyFocusMode();
+      this.onFocusModeChange?.(false);
+    }
+    this.applyCategory();
+    this.applyOpenState(true);
+    this.persist();
+    void this.syncFileWatch();
+    if (focusInput) {
+      requestAnimationFrame(() => {
+        const ta = document.getElementById(
+          "btw-side-input",
+        ) as HTMLTextAreaElement | null;
+        ta?.focus();
+      });
+    }
+  }
+
   /** 会话切换时清空 / 重载树 */
   onSessionChanged(): void {
     const sid = this.getSessionId();
@@ -389,7 +420,13 @@ export class SidePaneController {
       if (Number.isFinite(w) && w >= 320 && w <= 1200) this.width = w;
       const c = localStorage.getItem(LS_CAT) as SideCategory | null;
       // plan 不持久化为默认分类（避免启动落在计划栏）
-      if (c === "files" || c === "browser" || c === "terminal") {
+      if (
+        c === "files" ||
+        c === "browser" ||
+        c === "terminal" ||
+        c === "btw" ||
+        c === "agents"
+      ) {
         this.category = c;
       }
     } catch {
@@ -434,7 +471,15 @@ export class SidePaneController {
     if (focusBtn) {
       focusBtn.classList.toggle("active", this.focusMode);
       focusBtn.setAttribute("aria-pressed", this.focusMode ? "true" : "false");
-      focusBtn.title = this.focusMode ? tr("side.focusExit") : tr("side.focusEnter");
+      focusBtn.title = this.focusMode
+        ? tr("side.focusExit")
+        : tr("side.focusEnter");
+      // Codex：expand 进入全屏 · collapse 退出全屏
+      focusBtn.innerHTML = focusModeIconHtml(this.focusMode);
+      focusBtn.setAttribute(
+        "aria-label",
+        this.focusMode ? tr("side.focusExit") : tr("nav.fullscreen"),
+      );
     }
     if (dock) {
       dock.classList.toggle("hidden", !(this.focusMode && this.open));
@@ -442,7 +487,14 @@ export class SidePaneController {
   }
 
   private applyCategory(): void {
-    for (const cat of ["files", "browser", "terminal", "plan", "agents"] as const) {
+    for (const cat of [
+      "files",
+      "browser",
+      "terminal",
+      "plan",
+      "agents",
+      "btw",
+    ] as const) {
       const view = document.getElementById(`side-cat-${cat}`);
       view?.classList.toggle("hidden", cat !== this.category);
       const btn = document.querySelector(

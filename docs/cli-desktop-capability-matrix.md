@@ -3,7 +3,7 @@
 > **原则**：对齐 CLI 的**能力与语义**；交互可 Desktop 化。  
 > **入口原则**：**不要求**每个 CLI slash 在 Desktop 都有同名 `/`；能力可在 **侧栏 / chip / 气泡 / 设置页** 体现，会话 slash 只是子集加速器。  
 > **状态**：✅ 已对齐 · 🟡 部分 / 入口弱 · ❌ 未做 · — CLI 无或 Desktop 专属 · D+ Desktop 更强  
-> **日期**：2026-07-19 · **源码审计**：`tmp/grok-build-main`  
+> **日期**：2026-07-21 · **源码审计**：`tmp/grok-build-main` · **session-agent P1–P3** 已落地  
 > **数据目录**：Desktop 默认 `~/.grok-desktop`，与 CLI `~/.grok` **隔离**（session 格式兼容）
 
 **图例**
@@ -56,7 +56,7 @@
 | S1 | 新会话 | `/new` 等 | 侧栏「新对话」 | ✅ | 不进 `/` |
 | S2 | 继续最近 | `-c` | 侧栏「继续上次」+ `threads.continueRecent` | ✅ | 打开最近用户会话历史；发送时 attach |
 | S3 | 按 ID / 搜索 resume | `-r` / `/resume` | 全局搜索：session id 精确/前缀置顶 + 归档可搜 + 打开 toast | ✅ | 不在 `/`；对齐 CLI `-r` 语义 |
-| S4 | fork | `/fork`：`--worktree`/`--no-worktree`、可选首条 directive；`--at` 暂拒 | `/fork` + 侧栏 ⋯ 派生 + 树形层级 | ✅ | 复制 chat_history/updates/plan/goal；**无** worktree 询问、**无** fork 首 prompt 参数 |
+| S4 | fork | `/fork`：`--worktree`/`--no-worktree`、可选首条 directive；`--at` 暂拒 | `/fork` + 侧栏 ⋯ 派生 + F2 时序 + directive + worktree 对话框 | ✅ | F2：new→detach→copy→load→directive |
 | S5 | rewind | `/rewind` | 用户气泡 ↩ + `/rewind` | ✅ | ACP `_x.ai/rewind/*`；slash 与气泡双入口 |
 | S6 | compact | **Shell** `BuiltinAction::Compact { user_context }`：pager 入队 `/compact [说明]` → SessionActor 真压缩（two-pass、Pre/PostCompact hooks、auto-continue）；自动约 85% | `/compact` → 确认对话框 + **可选保留说明** → `threads.compact` → ACP `_x.ai/compact_conversation` | ✅ | 与 CLI 同源管道；userContext UI 已暴露 |
 | S7 | 重命名 | `/rename` `/title` | 侧栏 ⋯ | ✅ | 入口 UI；写 `summary.json` |
@@ -71,8 +71,8 @@
 | S16 | 复制最近回复 | `/copy [n]` | 用户/助手气泡复制按钮 | ✅ | 能力在 UI；无 `/copy` slash（不必强求） |
 | S17 | 本会话 prompt 历史检索 | `/history` → `OpenHistorySearch` 浮层 + ↑ 召回 | `/history` 搜索插入 + 空输入 ↑/↓ 召回；打开会话从 user 消息 seed | ✅ | 本地列表（非 agent `prompt_history` wire）；跨会话不共享 |
 | S18 | 会话信息 | Shell `/session-info`（alias status/info）→ `SessionInfoData`：model、turns、`ContextInfo` 分类明细 | `/status` → `threads.sessionInfo`（`_x.ai/session/info`）；未附着时本地简表 | ✅ | 附着后含 turns / fingerprint / ContextInfo；未附着回退本地 |
-| S19 | 中途插话 / 队列 | `/btw`（`x.ai/btw` 旁路队列）、`/queue` 列队、`xai-prompt-queue`、mid-turn interjection | **本地 follow-up 队列**（可编辑/排序/interrupt 暂停）+ **`/btw`**（`threads.btw` → `_x.ai/btw`，侧问卡片）+ **`/interject`**（`threads.interject` → `_x.ai/interject`，插话气泡） | 🟡 | 排队对齐 Codex Desktop UI；btw/interject 协议对齐 Grok CLI（Codex Desktop 无对等 btw）；QueueChanged wire / 多端 interjection 回声仍弱 |
-| S20 | 后台任务面板 | `/tasks` → 列 bg tasks + subagents + scheduled | toast + 过程区 + `/tasks` 列表 + **停止**（`threads.killTask` → `_x.ai/task/kill`） | ✅ | 附着/scheduled 仍弱；kill 对齐 CLI pager |
+| S19 | 中途插话 / 队列 | `/btw`（`x.ai/btw` 旁路队列）、`/queue` 列队、`xai-prompt-queue`、mid-turn interjection | **Host L1 持久队列**（`desktop/queues/{sid}.json` + IPC）+ composer 列表 + `/btw`/`/interject` + `queue.changed` | ✅ | L2 agent wire 可选；旧 agent 仅本地 |
+| S20 | 后台任务面板 | `/tasks` → 列 bg tasks + subagents + scheduled | `threads.tasksList` 四类聚合 + kill + Automations 深链 | ✅ | scheduled 绑 session；全局定时走侧栏自动化 |
 | S21 | 分享会话 | `/share` → 公开 URL | 无 | ❌ | |
 | S22 | recap | `/recap` → ACP `x.ai/recap`（不进对话） | 无 | ❌ | 依赖 agent 扩展事件 |
 | S23 | context 明细 | Shell `/context` → 完整 `ContextInfo`（system/tools/messages/categories/auto-compact 阈值） | `/context` + chip：优先 session/info；失败回退 `signals.json` | ✅ | 含 system/tools/messages、categories、auto-compact 阈值 |
@@ -85,7 +85,7 @@
 |---|------|-----|---------|------|------|
 | P1 | 绑定 cwd / 项目 | `--cwd` | 项目列表 + chip | ✅ | trust 门禁 |
 | P2 | 多项目切换 | 换目录 | 侧栏多项目 | D+ | |
-| P3 | Worktree | `-w` / agent 池 / fork 询问 | Host git worktree list/create；向导弱 | 🟡 | `worktreeApi` 能力位 false；旁路实现 |
+| P3 | Worktree | `-w` / agent 池 / fork 询问 | Host git worktree + fork 对话框 + `worktreeApi: true` | 🟡 | 旁路 git；非 agent 池 |
 | P4 | inspect | `grok inspect` | 无对等页 | ❌ | |
 | P5 | AGENTS.md | 自动 | 随 agent cwd | ✅ | |
 | P6 | 无项目模式 | 任意 cwd | 支持 | ✅ | |
@@ -110,11 +110,11 @@
 | A12 | Goal 运行时事件 | shell `/goal`：set / status / pause / resume / clear + **`--budget`** | slash + banner + 首启写 `goal.json`；set/status/clear/**pause/resume/budget** | ✅ | UI 更强；`--budget` 解析 + 弹窗 |
 | A13 | YOLO / always-approve | `/always-approve` toggle | chip + slash + `_meta.yoloMode` | ✅ | |
 | A14 | 模型切换 wire | `session/set_model` 等 | set_model + camel 回退 | ✅ | |
-| A15 | 能力探测 | leader / 工具 meta / initialize | `GrokCapabilities` 基线 + **消费** `available_commands_update`（`availableCommands: true`） | 🟡 | tools meta 已解析缓存；initialize 仍为固定 clientCaps |
+| A15 | 能力探测 | leader / 工具 meta / initialize | `parseInitializeCapabilities` + runtime 信号 + `worktreeApi`/`hunkTimeline` true | ✅ | 动态合并 agent initialize |
 | A16 | 打包内置 agent | CLI 安装 | agent-bin / resources/agent | D+ | 见 Y8 |
 | A17 | 定时 `/loop` | shell `PROMPT_COMMANDS` + `scheduler_create` 工具；pager 亦注册 | 无同名语义（Automations 部分替代） | 🟡 | Desktop Automations ≠ CLI `/loop` 入队调度语义 |
 | A18 | Memory 运行时 | shell `/memory` `/flush` `/dream`；pager `/remember`；tools `memory/*` | **对齐 CLI**：`GROK_HOME/memory` + `GROK_MEMORY`；设置开关；`/memory` 分栏浏览；`/remember`；`/flush` ACP；`/dream` prompt | ✅ | 旧 JSON 仅遗留提示；需 reattach 生效 |
-| A19 | Hooks | shell hooks-trust/list/add/remove/untrust + pager `/hooks` 模态 | 无管理 UI；ACP 未挂 hooks meta；`compat` 可关 hooks 扫描 | ❌ | 见 E4 |
+| A19 | Hooks | shell hooks-trust/list/add/remove/untrust + pager `/hooks` 模态 | 设置 Hooks 页 + 本地 trust 文件；config 扫描 | 🟡 | 见 E4 |
 | A20 | availableCommands | Shell 向客户端广告 builtins+skills（按 `BuiltinGate` 过滤） | 归一化 `session.available_commands` + Host 缓存 + slash 合并 agent 广告（跳过与 builtin 碰撞） | ✅ | 插入 `/name` 由用户补参发送 |
 | A21 | session-info wire | `SessionInfoResponse` / GetSessionInfo 路径 | **未调** agent session-info RPC；status/context 本地拼 | 🟡 | 与 S18/S23 同源缺口 |
 | A22 | Agent 内置工具面 | task/monitor/scheduler/update_goal/bash/… 同源二进制 | 同 agent 二进制即同工具集 | ✅ | 缺口在 **指挥面与事件 UI**，不在工具缺装 |
@@ -125,16 +125,16 @@
 |---|------|-----|---------|------|------|
 | R1 | 进程拓扑 | Leader 共享 agent 进程池（主） | Mode B：每 Thread 一 `grok agent stdio` | — | 隔离强、内存高；非 bug |
 | R2 | 同一 session 可写者 | leader driver + 只读 subscriber | Host 内 `writable` 互斥 | 🟡 | 无跨 Host↔CLI 统一锁 |
-| R3 | Attach / resume | leader `session/load` + live buffer | 新子进程 + `session/load`；attach 期挂起直播 | ✅ | Mode B 无 load live buffer；防叠双份 |
-| R4 | 崩溃恢复 | leader 可重连 / resume | 标记 failed + 释放 writable；UI 崩溃条「重新附着」 | ✅ | 磁盘 session 不丢 |
+| R3 | Attach / resume | leader `session/load` + live buffer | 懒附着 + pill 状态机 + ping + idle detach | ✅ | Mode B；打开=history_only |
+| R4 | 崩溃恢复 | leader 可重连 / resume | failed 状态 + ping + 崩溃条 reattach | ✅ | 磁盘 session 不丢 |
 | R5 | 多窗口同 Host | TUI 多附着策略 | 单实例 Host + 多窗口 IPC | 🟡 | 二次启动 handoff deep link |
 
 ### 4.2 ACP Client 能力与 `_meta`（差异摘要）
 
 | # | 字段 / 能力 | CLI（常经 leader 注入） | Desktop Host | 状态 |
 |---|-------------|-------------------------|--------------|------|
-| M1 | `initialize.clientInfo` | TUI / leader 标识 | `grok-desktop` + version | ✅ 有标识 |
-| M2 | `_meta.clientIdentifier` | 注入（如 `grok-tui`） | **未写** | ❌ |
+| M1 | `initialize.clientInfo` | TUI / leader 标识 | `grok-desktop` + `package.json` version | ✅ |
+| M2 | `_meta.clientIdentifier` | 注入（如 `grok-tui`） | `grok-desktop`（`CLIENT_IDENTIFIER`） | ✅ |
 | M3 | `_meta.yoloMode` | 有 | 有（`host.ts`） | ✅ |
 | M4 | `_meta.modelId` | 有 | 有 | ✅ |
 | M5 | `_meta.planMode` / set_mode | 有 | 有 + 显式 `session/set_mode` | ✅ |
@@ -144,7 +144,7 @@
 | M9 | `_meta.clientTerminal` | 可 true → 终端回 TUI | **未写** | ❌ |
 | M10 | `clientCapabilities.fs` | 视客户端 | `readTextFile: true, writeTextFile: false` | 🟡 |
 | M11 | `clientCapabilities.terminal` | 可 true | **false**（`acp-client.ts`） | ❌ |
-| M12 | `GROK_CLIENT_VERSION` 等诊断 env | 部分路径有 | **未见设置** | 🟡 |
+| M12 | `GROK_CLIENT_VERSION` 等诊断 env | 部分路径有 | spawn 时注入 app version | ✅ |
 | M13 | `GROK_HOME` | 默认 `~/.grok` | 强制 `~/.grok-desktop` | — 故意 |
 
 ### 4.3 事件归一化覆盖
@@ -162,7 +162,7 @@ Host 将 ACP / x.ai 通知归一为 `NormalizedEvent`（`src/host/normalize.ts` 
 | N7 | TaskCompleted / monitor 唤醒 | ✅ | `task.updated` + toast/过程区 + willWake 提示 | ✅ | 专用 method 与 session_notification 双路径 |
 | N8 | Hooks / plugins / memory dream / recap / btw 等 | ✅ 多种 | **未映射**（plugins 走 CLI 包装非事件） | ❌ | |
 | N9 | agent 进程退出 | — | `agent.error` / failed | ✅ Desktop 侧 |
-| N10 | prompt-queue 变更 | `QueueChanged` wire | **未接** | ❌ | 与 S19 同源 |
+| N10 | prompt-queue 变更 | `QueueChanged` wire | `queue.changed` 归一 + L1 落盘 + 可选 `x.ai/queue/*` 写回 | 🟡 | 旧 agent Method not found 时仅 L1 |
 
 ---
 
@@ -170,10 +170,10 @@ Host 将 ACP / x.ai 通知归一为 `NormalizedEvent`（`src/host/normalize.ts` 
 
 | # | 能力 | CLI | Desktop | 状态 | 备注 |
 |---|------|-----|---------|------|------|
-| E1 | Skills | Shell `resolve()` 真解析 skill 为 slash（与 builtin 碰撞时 qualify） | list + 动态 slash **插入提示文本**（非 shell 同路径 runner） | 🟡 | 依赖模型识别 skill 名；**非**完整 skill runner |
+| E1 | Skills | Shell `resolve()` 真解析 skill 为 slash（与 builtin 碰撞时 qualify） | `skills.resolve` 读 SKILL.md 真执行 prompt；失败降级插提示 | 🟡 | Desktop 路径读盘 resolve，非 shell 子进程同源 |
 | E2 | Plugins / 市场 | `/plugins` 模态 + shell 子命令 | 插件页 install/enable/市场 | ✅ | CLI 同源包装 |
 | E3 | MCP | `/mcps` 等 | list + add/doctor/配置入口 | ✅ | session/new 可透传 mcpServers |
-| E4 | Hooks | `/hooks` + shell hooks-\* | 无 | ❌ | |
+| E4 | Hooks | `/hooks` + shell hooks-\* | 设置 → Hooks：扫描 + 本地 trust | 🟡 | 非 shell hooks-* 全量；信任侧文件 |
 | E5 | Memory | `/memory` `/flush` `/dream` `/remember` | 设置 + 分栏浏览 + remember/flush/dream | ✅ | 真后端 `~/.grok-desktop/memory`；session 日志可删 |
 | E6 | 模型列表 | `grok models` + `/model` | chip + 设置提供商 | 🟡 | 自定义供应商见 Y1 |
 
@@ -185,7 +185,7 @@ Host 将 ACP / x.ai 通知归一为 `NormalizedEvent`（`src/host/normalize.ts` 
 |---|------|-----|---------|------|------|
 | C1 | Diff | TUI | side-pane / diff-view | 🟡 | |
 | C2 | 打开编辑器 | 有 | openInEditor / 文件链 | ✅ | |
-| C3 | Hunk 时间线 | 有 | Host 有、UI 弱 | 🟡 | `hunkTimeline: false` 能力位 |
+| C3 | Hunk 时间线 | 有 | Host `changes.timeline` + `hunkTimeline: true` | 🟡 | UI 仍可加强；能力位已开 |
 | C4 | Markdown | 终端有限 | prose + highlight | D+ | |
 | C5 | Mermaid 等 | 部分 | 视进度 | 🟡 | |
 | C6 | 集成终端 | 终端即环境 | 无；ACP `terminal: false` | ❌ | 与 M11 一致 |

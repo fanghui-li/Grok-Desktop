@@ -2,6 +2,12 @@ import { ChildProcessWithoutNullStreams, spawn } from "node:child_process";
 import readline from "node:readline";
 import { HostError } from "../shared/errors.js";
 import type { NormalizedEvent } from "../shared/events.js";
+import type { GrokCapabilities } from "../shared/types.js";
+import { CLIENT_IDENTIFIER, readAppVersion } from "./app-version.js";
+import {
+  BASELINE_CAPABILITIES,
+  parseInitializeCapabilities,
+} from "./capabilities.js";
 import type { HostLogger } from "./logger.js";
 import {
   normalizeSessionNotification,
@@ -68,11 +74,29 @@ export class AcpClient {
       }) => void;
     }
   >();
+  /** Parsed from initialize (P2-C). */
+  private agentCaps: GrokCapabilities = { ...BASELINE_CAPABILITIES };
+  /** Last initialize params (tests / diagnostics). */
+  lastInitializeParams: Record<string, unknown> | null = null;
 
   constructor(private readonly opts: AcpClientOptions) {}
 
   get attachedSessionId(): string | null {
     return this.sessionId;
+  }
+
+  get capabilities(): GrokCapabilities {
+    return { ...this.agentCaps };
+  }
+
+  /** Mode B liveness: process still running. */
+  isAlive(): boolean {
+    if (this.closed) return false;
+    const p = this.proc;
+    if (!p) return false;
+    if (p.killed) return false;
+    if (p.exitCode != null) return false;
+    return true;
   }
 
   async start(): Promise<void> {
@@ -83,9 +107,14 @@ export class AcpClient {
       args: this.opts.args,
     });
 
+    const env = {
+      ...(this.opts.env ?? process.env),
+      GROK_CLIENT_VERSION: readAppVersion(),
+    };
+
     this.proc = spawn(this.opts.command, this.opts.args, {
       cwd: this.opts.cwd,
-      env: this.opts.env ?? process.env,
+      env,
       stdio: ["pipe", "pipe", "pipe"],
       windowsHide: true,
     });
@@ -128,17 +157,30 @@ export class AcpClient {
     this.rl = readline.createInterface({ input: this.proc.stdout });
     this.rl.on("line", (line) => this.onLine(line));
 
-    await this.request("initialize", {
+    const appVersion = readAppVersion();
+    const initParams = {
       protocolVersion: 1,
       clientInfo: {
-        name: "grok-desktop",
-        version: "0.1.0",
+        name: CLIENT_IDENTIFIER,
+        version: appVersion,
       },
       clientCapabilities: {
         fs: { readTextFile: true, writeTextFile: false },
         terminal: false,
       },
+      _meta: {
+        clientIdentifier: CLIENT_IDENTIFIER,
+        clientVersion: appVersion,
+      },
+    };
+    this.lastInitializeParams = initParams;
+    this.opts.logger?.info("acp.initialize", {
+      version: appVersion,
+      clientIdentifier: CLIENT_IDENTIFIER,
     });
+
+    const initResult = await this.request("initialize", initParams);
+    this.agentCaps = parseInitializeCapabilities(initResult);
 
     this.notify("notifications/initialized", {});
   }

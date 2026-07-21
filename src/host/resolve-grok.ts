@@ -7,6 +7,7 @@ import type {
   GrokCapabilities,
   GrokInfo,
 } from "../shared/types.js";
+import { BASELINE_CAPABILITIES } from "./capabilities.js";
 
 export interface ResolveGrokOptions {
   /** 设置 / 环境变量覆盖路径 */
@@ -20,14 +21,7 @@ export interface ResolveGrokOptions {
 }
 
 const DEFAULT_CAPABILITIES: GrokCapabilities = {
-  acp: true,
-  goalEvents: true,
-  subagentTree: true,
-  hunkTimeline: false,
-  leaderRoster: false,
-  worktreeApi: false,
-  /** Desktop 会消费 session available_commands_update（A20） */
-  availableCommands: true,
+  ...BASELINE_CAPABILITIES,
 };
 
 function isExecutableFile(p: string): boolean {

@@ -40,19 +40,24 @@
         </div>
         <div class="sidebar-top-actions">
           <button type="button" class="nav-row primary-nav" id="btn-new-chat">
-            <span class="nav-ico">✎</span> <span data-i18n="nav.newChat">新对话</span>
+            <span class="nav-ico" data-sidebar-icon="compose" aria-hidden="true"></span>
+            <span data-i18n="nav.newChat">新对话</span>
           </button>
           <button type="button" class="nav-row" id="btn-continue-recent" data-i18n-title="nav.continueRecentTitle" title="继续上次">
-            <span class="nav-ico">↻</span> <span data-i18n="nav.continueRecent">继续上次</span>
+            <span class="nav-ico" data-sidebar-icon="history" aria-hidden="true"></span>
+            <span data-i18n="nav.continueRecent">继续上次</span>
           </button>
           <button type="button" class="nav-row" id="btn-search">
-            <span class="nav-ico">⌕</span> <span data-i18n="nav.search">搜索</span>
+            <span class="nav-ico" data-sidebar-icon="search" aria-hidden="true"></span>
+            <span data-i18n="nav.search">搜索</span>
           </button>
           <button type="button" class="nav-row" id="btn-plugins">
-            <span class="nav-ico">◫</span> <span data-i18n="nav.plugins">插件</span>
+            <span class="nav-ico" data-sidebar-icon="skills" aria-hidden="true"></span>
+            <span data-i18n="nav.plugins">插件</span>
           </button>
           <button type="button" class="nav-row" id="btn-automations">
-            <span class="nav-ico">⏱</span> <span data-i18n="nav.automations">自动化</span>
+            <span class="nav-ico" data-sidebar-icon="clock" aria-hidden="true"></span>
+            <span data-i18n="nav.automations">自动化</span>
           </button>
         </div>
 
@@ -60,15 +65,26 @@
           <div class="section-label" data-i18n="nav.projects">项目</div>
           <div id="project-list" class="project-list"></div>
           <button type="button" class="nav-row muted" id="btn-add-project">
-            <span class="nav-ico">+</span> <span data-i18n="nav.addProject">添加项目</span>
+            <span class="nav-ico" data-sidebar-icon="plus" aria-hidden="true"></span>
+            <span data-i18n="nav.addProject">添加项目</span>
           </button>
         </div>
 
         <div class="sidebar-bottom">
           <button type="button" class="nav-row" id="btn-settings">
-            <span class="nav-ico">⚙</span> <span data-i18n="nav.settings">设置</span>
+            <span class="nav-ico" data-sidebar-icon="settings" aria-hidden="true"></span>
+            <span data-i18n="nav.settings">设置</span>
           </button>
         </div>
+        <!-- 左侧栏右缘拖宽（对齐右侧 split-resizer） -->
+        <div
+          class="sidebar-resizer"
+          id="sidebar-resizer"
+          role="separator"
+          aria-orientation="vertical"
+          data-i18n-aria-label="nav.resizeSidebar"
+          aria-label="调整侧栏宽度"
+        ></div>
       </aside>
 
       <!-- 中间主工作区：顶栏 + 可分屏 -->
@@ -103,12 +119,9 @@
               aria-pressed="false"
               data-i18n-aria-label="nav.fullscreen" aria-label="全屏"
             >
-              <!-- 与右侧栏图标统一 4–20 外框光学尺寸 -->
-              <svg class="top-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-                <path d="M9 4H4v5"/>
-                <path d="M15 4h5v5"/>
-                <path d="M9 20H4v-5"/>
-                <path d="M15 20h5v-5"/>
+              <!-- Codex expand：进入全屏侧栏 -->
+              <svg class="top-icon" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="none" aria-hidden="true" focusable="false">
+                <path d="M4.33496 11C4.33496 10.6327 4.63273 10.335 5 10.335C5.36727 10.335 5.66504 10.6327 5.66504 11V14.335H9L9.13379 14.3486C9.43692 14.4106 9.66504 14.6786 9.66504 15C9.66504 15.3214 9.43692 15.5894 9.13379 15.6514L9 15.665H5C4.63273 15.665 4.33496 15.3673 4.33496 15V11ZM14.335 9V5.66504H11C10.6327 5.66504 10.335 5.36727 10.335 5C10.335 4.63273 10.6327 4.33496 11 4.33496H15L15.1338 4.34863C15.4369 4.41057 15.665 4.67857 15.665 5V9C15.665 9.36727 15.3673 9.66504 15 9.66504C14.6327 9.66504 14.335 9.36727 14.335 9Z" fill="currentColor"/>
               </svg>
             </button>
             <button
@@ -218,7 +231,9 @@
                         <span class="model-chip-text" id="model-label">grok</span>
                         <span aria-hidden="true">▾</span>
                       </button>
-                      <button type="button" class="send-btn" id="btn-send" data-i18n-title="composer.send" title="发送">↑</button>
+                      <button type="button" class="send-btn" id="btn-send" data-i18n-title="composer.send" title="发送" aria-label="发送">
+                        <svg class="send-btn-ico" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="none" aria-hidden="true" focusable="false"><path d="M9.33467 16.6663V4.93978L4.6374 9.63704L4.1667 9.16634L3.69599 8.69661L9.52998 2.86263L9.63447 2.77767C9.8925 2.60753 10.2433 2.63564 10.4704 2.86263L16.3034 8.69661L16.3884 8.80111C16.5588 9.05922 16.5306 9.40982 16.3034 9.63704C16.0762 9.86414 15.7255 9.89242 15.4675 9.722L15.363 9.63704L10.6647 4.9388V16.6663C10.6647 17.0336 10.367 17.3314 9.99971 17.3314C9.63259 17.3312 9.33467 17.0335 9.33467 16.6663ZM4.6374 9.63704C4.3777 9.89674 3.95569 9.89674 3.69599 9.63704C3.43657 9.37744 3.43668 8.95628 3.69599 8.69661L4.6374 9.63704Z" fill="currentColor"/></svg>
+                      </button>
                     </div>
                   </div>
                 </div>
@@ -320,7 +335,9 @@
                           <span class="model-chip-text" id="model-label-2">grok</span>
                           <span aria-hidden="true">▾</span>
                         </button>
-                        <button type="button" class="send-btn" id="btn-send-chat">↑</button>
+                        <button type="button" class="send-btn" id="btn-send-chat" data-i18n-title="composer.send" title="发送" aria-label="发送">
+                          <svg class="send-btn-ico" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="none" aria-hidden="true" focusable="false"><path d="M9.33467 16.6663V4.93978L4.6374 9.63704L4.1667 9.16634L3.69599 8.69661L9.52998 2.86263L9.63447 2.77767C9.8925 2.60753 10.2433 2.63564 10.4704 2.86263L16.3034 8.69661L16.3884 8.80111C16.5588 9.05922 16.5306 9.40982 16.3034 9.63704C16.0762 9.86414 15.7255 9.89242 15.4675 9.722L15.363 9.63704L10.6647 4.9388V16.6663C10.6647 17.0336 10.367 17.3314 9.99971 17.3314C9.63259 17.3312 9.33467 17.0335 9.33467 16.6663ZM4.6374 9.63704C4.3777 9.89674 3.95569 9.89674 3.69599 9.63704C3.43657 9.37744 3.43668 8.95628 3.69599 8.69661L4.6374 9.63704Z" fill="currentColor"/></svg>
+                        </button>
                       </div>
                     </div>
                   </div>
@@ -450,6 +467,66 @@
                 </div>
               </div>
 
+              <!-- 旁路侧问（对齐 Codex 侧边聊天：右栏独立线程 + 底栏输入） -->
+              <div class="side-cat-view hidden" id="side-cat-btw" data-cat="btw">
+                <div class="side-cat-header btw-side-header">
+                  <span class="side-cat-title btw-side-title">
+                    <span class="btw-side-title-ico" aria-hidden="true">◎</span>
+                    <span data-i18n="side.btw">旁路侧问</span>
+                  </span>
+                  <div class="plan-panel-header-actions">
+                    <button type="button" class="icon-ghost sm" id="btn-btw-clear" data-i18n-title="btw.clearThread" title="清空侧问">🗑</button>
+                    <button type="button" class="icon-ghost sm btn-side-close-any" data-i18n-title="side.collapse" title="收起侧栏">✕</button>
+                  </div>
+                </div>
+                <div class="btw-side-thread" id="btw-side-thread" aria-live="polite">
+                  <div class="btw-side-empty" id="btw-side-empty" data-i18n="btw.sideEmpty">
+                    不打断主对话的侧问。在下方输入问题后发送。
+                  </div>
+                </div>
+                <!-- 与主对话 composer-card.compact 完全同构 -->
+                <div class="btw-side-composer-wrap">
+                  <div class="composer-card compact btw-side-composer-card">
+                    <div id="btw-attachments" class="attach-chips hidden"></div>
+                    <textarea
+                      id="btw-side-input"
+                      rows="2"
+                      data-i18n-placeholder="btw.sidePh"
+                      placeholder="要求后续变更"
+                      spellcheck="true"
+                    ></textarea>
+                    <div class="composer-toolbar">
+                      <div class="composer-left">
+                        <button type="button" class="icon-ghost sm" id="btn-attach-btw" data-i18n-title="composer.attach" title="添加" aria-haspopup="menu">+</button>
+                        <button type="button" class="mode-chip" id="btn-perm-mode-btw">
+                          <span id="perm-label-btw" data-i18n="composer.permFull">完全访问</span>
+                          <span class="mode-chip-caret" aria-hidden="true">▾</span>
+                        </button>
+                        <span class="session-mode-chip hidden is-plan" id="chip-plan-btw" data-i18n-title="composer.planOn" title="计划模式已开启">
+                          <span class="session-mode-ico">≡</span>
+                          <span class="session-mode-label" data-i18n="composer.plan">计划</span>
+                          <button type="button" class="session-mode-x" data-chip-close="plan" data-i18n-title="composer.planClose" title="关闭计划模式" data-i18n-aria-label="composer.planClose" aria-label="关闭计划模式">×</button>
+                        </span>
+                        <span class="session-mode-chip hidden is-goal" id="chip-goal-btw" data-i18n-title="composer.goal" title="目标">
+                          <span class="session-mode-ico">◎</span>
+                          <span class="session-mode-label" data-i18n="composer.goal">目标</span>
+                          <button type="button" class="session-mode-x" data-chip-close="goal" data-i18n-title="composer.goalClear" title="清除目标" data-i18n-aria-label="composer.goalClear" aria-label="清除目标">×</button>
+                        </span>
+                      </div>
+                      <div class="composer-right">
+                        <button type="button" class="model-chip" id="btn-model-btw" data-i18n-title="composer.model" title="模型与推理力度">
+                          <span class="model-chip-text" id="model-label-btw">grok</span>
+                          <span aria-hidden="true">▾</span>
+                        </button>
+                        <button type="button" class="send-btn" id="btn-btw-send" data-i18n-title="btw.send" title="发送侧问" aria-label="发送">
+                          <svg class="send-btn-ico" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="none" aria-hidden="true" focusable="false"><path d="M9.33467 16.6663V4.93978L4.6374 9.63704L4.1667 9.16634L3.69599 8.69661L9.52998 2.86263L9.63447 2.77767C9.8925 2.60753 10.2433 2.63564 10.4704 2.86263L16.3034 8.69661L16.3884 8.80111C16.5588 9.05922 16.5306 9.40982 16.3034 9.63704C16.0762 9.86414 15.7255 9.89242 15.4675 9.722L15.363 9.63704L10.6647 4.9388V16.6663C10.6647 17.0336 10.367 17.3314 9.99971 17.3314C9.63259 17.3312 9.33467 17.0335 9.33467 16.6663ZM4.6374 9.63704C4.3777 9.89674 3.95569 9.89674 3.69599 9.63704C3.43657 9.37744 3.43668 8.95628 3.69599 8.69661L4.6374 9.63704Z" fill="currentColor"/></svg>
+                        </button>
+                      </div>
+                    </div>
+                  </div>
+                </div>
+              </div>
+
               <!-- 计划类：会话 plan.md 真源可编辑 + 批准条 -->
               <div class="side-cat-view hidden" id="side-cat-plan" data-cat="plan">
                 <div class="side-cat-header plan-panel-header">
@@ -494,17 +571,20 @@
             <!-- 侧栏内分类轨（文件 / 计划 / 浏览器 / 终端） -->
             <nav class="side-cat-rail" id="side-cat-rail" data-i18n-aria-label="side.cats" aria-label="侧栏分类">
               <button type="button" class="side-cat-btn active" data-cat="files" id="btn-cat-files" data-i18n-title="side.files" title="文件" data-i18n-aria-label="side.files" aria-label="文件">
-                <span class="side-cat-ico" aria-hidden="true">📄</span>
+                <span class="side-cat-ico" data-sidebar-icon="file" aria-hidden="true"></span>
+              </button>
+              <button type="button" class="side-cat-btn" data-cat="btw" id="btn-cat-btw" data-i18n-title="side.btw" title="旁路侧问" data-i18n-aria-label="side.btw" aria-label="旁路侧问">
+                <span class="side-cat-ico" data-sidebar-icon="chat" aria-hidden="true"></span>
               </button>
               <button type="button" class="side-cat-btn" data-cat="agents" id="btn-cat-agents" data-i18n-title="side.agents" title="子代理" data-i18n-aria-label="side.agents" aria-label="子代理">
-                <span class="side-cat-ico" aria-hidden="true">⑂</span>
+                <span class="side-cat-ico" data-sidebar-icon="worktree" aria-hidden="true"></span>
               </button>
               <!-- 计划栏不走分类轨：仅 /view-plan · 计划 chip · exit_plan 打开 -->
               <button type="button" class="side-cat-btn" data-cat="browser" id="btn-cat-browser" data-i18n-title="side.browser" title="浏览器" data-i18n-aria-label="side.browser" aria-label="浏览器">
-                <span class="side-cat-ico" aria-hidden="true">🌐</span>
+                <span class="side-cat-ico" data-sidebar-icon="globe" aria-hidden="true"></span>
               </button>
               <button type="button" class="side-cat-btn" data-cat="terminal" id="btn-cat-terminal" data-i18n-title="side.terminal" title="终端" data-i18n-aria-label="side.terminal" aria-label="终端">
-                <span class="side-cat-ico" aria-hidden="true">⌘</span>
+                <span class="side-cat-ico" data-sidebar-icon="terminal" aria-hidden="true"></span>
               </button>
             </nav>
           </aside>
@@ -519,7 +599,9 @@
               rows="1"
               data-i18n-placeholder="composer.placeholder" placeholder="随心输入"
             ></textarea>
-            <button type="button" class="send-btn" id="btn-focus-send" data-i18n-title="composer.send" title="发送">↑</button>
+            <button type="button" class="send-btn" id="btn-focus-send" data-i18n-title="composer.send" title="发送" aria-label="发送">
+              <svg class="send-btn-ico" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="none" aria-hidden="true" focusable="false"><path d="M9.33467 16.6663V4.93978L4.6374 9.63704L4.1667 9.16634L3.69599 8.69661L9.52998 2.86263L9.63447 2.77767C9.8925 2.60753 10.2433 2.63564 10.4704 2.86263L16.3034 8.69661L16.3884 8.80111C16.5588 9.05922 16.5306 9.40982 16.3034 9.63704C16.0762 9.86414 15.7255 9.89242 15.4675 9.722L15.363 9.63704L10.6647 4.9388V16.6663C10.6647 17.0336 10.367 17.3314 9.99971 17.3314C9.63259 17.3312 9.33467 17.0335 9.33467 16.6663ZM4.6374 9.63704C4.3777 9.89674 3.95569 9.89674 3.69599 9.63704C3.43657 9.37744 3.43668 8.95628 3.69599 8.69661L4.6374 9.63704Z" fill="currentColor"/></svg>
+            </button>
           </div>
         </div>
       </main>

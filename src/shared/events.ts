@@ -203,6 +203,30 @@ export type NormalizedEvent =
       code: string;
       message?: string;
       at?: string;
+    }
+  /** Mode B 附着状态 */
+  | {
+      type: "session.attach_state";
+      threadId: string;
+      sessionId: string;
+      state:
+        | "history_only"
+        | "attaching"
+        | "live"
+        | "failed"
+        | "detaching";
+      lastError?: string;
+    }
+  /** L1/L2 队列变更 */
+  | {
+      type: "queue.changed";
+      threadId?: string;
+      sessionId: string;
+      source: "local" | "agent";
+      itemCount: number;
+      pausedByInterrupt?: boolean;
+      syncError?: string | null;
+      raw?: unknown;
     };
 
 /** ACP AvailableCommand 精简形态 */

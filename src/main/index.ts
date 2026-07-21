@@ -377,6 +377,8 @@ async function handleHostIpc(
           title: p.title as string | undefined,
           model: p.model as string | undefined,
           effort: p.effort as string | undefined,
+          directive: p.directive as string | undefined,
+          worktree: p.worktree as never,
         }),
       );
     case "threads.detach":
@@ -471,6 +473,82 @@ async function handleHostIpc(
         await host.threadsKillTask(
           p.threadId as string,
           String(p.taskId ?? ""),
+        ),
+      );
+    case "threads.ping":
+      return resultOk(host.threadsPing(p.threadId as string));
+    case "threads.attachState":
+      return resultOk(
+        host.threadsAttachState({
+          threadId: p.threadId as string | undefined,
+          sessionId: p.sessionId as string | undefined,
+        }),
+      );
+    case "threads.tasksList":
+      return resultOk(host.tasksList(String(p.sessionId ?? "")));
+    case "queue.get":
+      return resultOk(host.queueGet(String(p.sessionId ?? "")));
+    case "queue.set":
+      return resultOk(
+        host.queueSet(String(p.sessionId ?? ""), p as never),
+      );
+    case "queue.enqueue":
+      return resultOk(
+        host.queueEnqueue(String(p.sessionId ?? ""), {
+          id: p.id as string | undefined,
+          display: p.display as string | undefined,
+          content: String(p.content ?? ""),
+          attachments: p.attachments as never,
+        }),
+      );
+    case "queue.remove":
+      return resultOk(
+        host.queueRemove(String(p.sessionId ?? ""), String(p.itemId ?? "")),
+      );
+    case "queue.reorder":
+      return resultOk(
+        host.queueReorder(
+          String(p.sessionId ?? ""),
+          (p.orderedIds as string[]) ?? [],
+        ),
+      );
+    case "queue.update":
+      return resultOk(
+        host.queueUpdate(
+          String(p.sessionId ?? ""),
+          String(p.itemId ?? ""),
+          (p.patch as never) ?? {
+            display: p.display as string | undefined,
+            content: p.content as string | undefined,
+            status: p.status as never,
+            lastError: p.lastError as string | null | undefined,
+            attachments: p.attachments as never,
+          },
+        ),
+      );
+    case "queue.clear":
+      return resultOk(host.queueClear(String(p.sessionId ?? "")));
+    case "queue.setFlags":
+      return resultOk(
+        host.queueSetFlags(String(p.sessionId ?? ""), {
+          queueingEnabled: p.queueingEnabled as boolean | undefined,
+          pausedByInterrupt: p.pausedByInterrupt as boolean | undefined,
+          syncError: p.syncError as string | null | undefined,
+        }),
+      );
+    case "hooks.list":
+      return resultOk(host.hooksList());
+    case "hooks.trust":
+      return resultOk(host.hooksTrust(String(p.id ?? "")));
+    case "hooks.untrust":
+      return resultOk(host.hooksUntrust(String(p.id ?? "")));
+    case "hooks.reload":
+      return resultOk(host.hooksReload());
+    case "skills.resolve":
+      return resultOk(
+        host.skillsResolve(
+          String(p.name ?? ""),
+          p.cwd as string | undefined,
         ),
       );
     case "threads.pin":

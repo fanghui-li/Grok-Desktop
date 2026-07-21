@@ -142,6 +142,36 @@ export function normalizeSessionUpdate(
       });
       break;
     }
+    case "queue_changed":
+    case "QueueChanged": {
+      const items = update.items ?? update.queue;
+      const itemCount =
+        typeof update.itemCount === "number"
+          ? update.itemCount
+          : typeof update.item_count === "number"
+            ? (update.item_count as number)
+            : Array.isArray(items)
+              ? items.length
+              : 0;
+      events.push({
+        type: "queue.changed",
+        threadId,
+        sessionId,
+        source: "agent",
+        itemCount,
+        pausedByInterrupt: Boolean(
+          update.pausedByInterrupt ?? update.paused_by_interrupt,
+        ),
+        syncError:
+          typeof update.syncError === "string"
+            ? update.syncError
+            : typeof update.sync_error === "string"
+              ? (update.sync_error as string)
+              : null,
+        raw: update,
+      });
+      break;
+    }
     case "goal_updated": {
       const objective =
         (update.objective as string) ?? (update.title as string) ?? "";
@@ -217,6 +247,36 @@ export function normalizeSessionNotification(
   };
 
   switch (k) {
+    case "queue_changed": {
+      const items = update.items ?? update.queue;
+      const itemCount =
+        typeof update.itemCount === "number"
+          ? update.itemCount
+          : typeof update.item_count === "number"
+            ? (update.item_count as number)
+            : Array.isArray(items)
+              ? items.length
+              : 0;
+      return [
+        {
+          type: "queue.changed",
+          threadId,
+          sessionId,
+          source: "agent",
+          itemCount,
+          pausedByInterrupt: Boolean(
+            update.pausedByInterrupt ?? update.paused_by_interrupt,
+          ),
+          syncError:
+            typeof update.syncError === "string"
+              ? update.syncError
+              : typeof update.sync_error === "string"
+                ? (update.sync_error as string)
+                : null,
+          raw: update,
+        },
+      ];
+    }
     case "auto_compact_started":
       return [
         {

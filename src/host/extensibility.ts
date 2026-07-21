@@ -291,6 +291,10 @@ export interface DesktopConfig {
    * 真存储在 GROK_HOME/memory/，非 desktop/memory/entries.json。
    */
   experimentalMemory?: boolean;
+  /** Mode B：空闲超过该毫秒则 detach（0=关闭） */
+  idleDetachMs?: number;
+  /** 同时 live 附着上限 */
+  maxLiveAttaches?: number;
 }
 
 export interface DesktopConfigView extends DesktopConfig {

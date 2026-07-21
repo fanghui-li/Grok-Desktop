@@ -92,6 +92,7 @@ import {
 import { InboxStore } from "./inbox.js";
 import { HostLogger } from "./logger.js";
 import {
+  desktopDir,
   encodeCwdForSessionDir,
   ensureDesktopDirs,
   findSessionDir,
@@ -166,6 +167,37 @@ import {
   listRemoteProjects,
   removeRemoteProject,
 } from "./remote.js";
+import {
+  applyRuntimeCapabilitySignal,
+  BASELINE_CAPABILITIES,
+} from "./capabilities.js";
+import type { AttachState } from "./attach-policy.js";
+import {
+  DEFAULT_IDLE_DETACH,
+  pickLruDetachTargets,
+  type LiveAttachSnapshot,
+} from "./attach-policy.js";
+import { listDesktopHooks, setHookTrusted } from "./hooks-trust.js";
+import {
+  clearQueue,
+  completeSending,
+  enqueueItem,
+  loadQueue,
+  removeItem,
+  reorderItems,
+  saveQueue,
+  setQueueFlags,
+  takeNextPending,
+  updateItem,
+  type PromptQueueAttachment,
+  type PromptQueueFile,
+  type PromptQueueItem,
+} from "./prompt-queue.js";
+import {
+  copySessionHistoryForFork,
+  writeForkSummary,
+} from "./fork-session.js";
+import { aggregateTasksLoose } from "./tasks-aggregate.js";
 
 export interface DesktopHostOptions {
   home?: string;
@@ -184,6 +216,24 @@ interface LiveThread {
   /** agent 最近广告的 slash 命令（available_commands_update） */
   availableCommands?: import("../shared/events.js").AvailableCommandInfo[];
   availableTools?: string[];
+  attachState: AttachState;
+  lastAttachError?: string;
+  attachedAtMs?: number;
+  lastActiveAtMs?: number;
+  /** process snaps for tasks.list */
+  taskSnaps?: Map<
+    string,
+    {
+      taskId: string;
+      sessionId?: string;
+      phase: string;
+      description?: string;
+      command?: string;
+      isMonitor?: boolean;
+      success?: boolean;
+      updatedAt?: number;
+    }
+  >;
 }
 
 type EventListener = (event: NormalizedEvent) => void;
@@ -211,6 +261,9 @@ export class DesktopHost {
   private handoffWatcher: fs.FSWatcher | null = null;
   private handoffWatchTimer: ReturnType<typeof setTimeout> | null = null;
   private handoffConsumer: (() => void) | null = null;
+  /** Latest dynamic caps from any live agent initialize */
+  private runtimeCaps = { ...BASELINE_CAPABILITIES };
+  private idleDetachTimer: ReturnType<typeof setInterval> | null = null;
 
   readonly projects: ProjectRegistry;
   readonly inbox: InboxStore;
@@ -245,6 +298,7 @@ export class DesktopHost {
     this.worktrees = new WorktreeService(opts.home);
     this.automations = new AutomationStore(opts.home);
     this.threadMeta = new ThreadMetaStore(opts.home);
+    this.startIdleDetachLoop();
   }
 
   get logPath(): string {
@@ -278,7 +332,18 @@ export class DesktopHost {
   }
 
   grokInfo(): GrokInfo {
-    return buildGrokInfo(this.resolveOpts);
+    const base = buildGrokInfo(this.resolveOpts);
+    // Prefer runtime caps from last initialize when agent is/was live
+    return {
+      ...base,
+      capabilities: {
+        ...base.capabilities,
+        ...this.runtimeCaps,
+        // Host-provided degraded features always on when binary present
+        worktreeApi: Boolean(base.path) && true,
+        hunkTimeline: Boolean(base.path) && true,
+      },
+    };
   }
 
   authStatus() {
@@ -690,10 +755,21 @@ export class DesktopHost {
       onEvent: (ev) => this.onClientEvent(threadId, ev),
     });
 
-    this.threads.set(threadId, { thread, client, writable: true });
+    const nowMs = Date.now();
+    this.threads.set(threadId, {
+      thread,
+      client,
+      writable: true,
+      attachState: "attaching",
+      attachedAtMs: nowMs,
+      lastActiveAtMs: nowMs,
+      taskSnaps: new Map(),
+    });
+    this.emitAttachState(threadId, "", "attaching");
 
     try {
       await client.start();
+      this.runtimeCaps = { ...this.runtimeCaps, ...client.capabilities };
       const meta: Record<string, unknown> = {};
       // Build：yolo 可在 plan 底下保持 armed
       if (alwaysApprove) meta.yoloMode = true;
@@ -727,6 +803,14 @@ export class DesktopHost {
       });
       if (worktreeId) this.worktrees.bindSession(worktreeId, sessionId);
 
+      const live = this.threads.get(threadId);
+      if (live) {
+        live.attachState = "live";
+        live.attachedAtMs = Date.now();
+        live.lastActiveAtMs = Date.now();
+      }
+      this.emitAttachState(threadId, sessionId, "live");
+
       // planMode meta alone 不够：显式 session/set_mode，对齐 CLI /plan 激活
       if (planActive) {
         try {
@@ -743,6 +827,7 @@ export class DesktopHost {
         await client.prompt(params.prompt);
       }
 
+      await this.enforceLiveAttachBudget();
       this.logger.info("threads.create", { threadId, sessionId, cwd });
       return { threadId, sessionId, cwd, worktreeId };
     } catch (err) {
@@ -818,24 +903,48 @@ export class DesktopHost {
     thread.model = resolvedModel;
     if (smeta.effort) thread.effort = smeta.effort;
 
-    this.threads.set(threadId, { thread, client, writable: true });
+    this.threads.set(threadId, {
+      thread,
+      client,
+      writable: true,
+      attachState: "attaching",
+      attachedAtMs: Date.now(),
+      lastActiveAtMs: Date.now(),
+      taskSnaps: new Map(),
+    });
     this.sessionIndex.set(sessionId, threadId);
+    this.emitAttachState(threadId, sessionId, "attaching");
 
     try {
       await client.start();
+      this.runtimeCaps = { ...this.runtimeCaps, ...client.capabilities };
       await client.loadSession({ sessionId, cwd: resolvedCwd });
       thread.sessionId = sessionId;
       thread.updatedAt = new Date().toISOString();
       thread.status = "idle";
+      const liveOk = this.threads.get(threadId);
+      if (liveOk) {
+        liveOk.attachState = "live";
+        liveOk.attachedAtMs = Date.now();
+        liveOk.lastActiveAtMs = Date.now();
+        liveOk.lastAttachError = undefined;
+      }
+      this.emitAttachState(threadId, sessionId, "live");
+      await this.enforceLiveAttachBudget();
       this.logger.info("threads.attach", { threadId, sessionId });
       return { threadId };
     } catch (err) {
       await client.close().catch(() => undefined);
+      const msg = err instanceof Error ? err.message : String(err);
       this.threads.set(threadId, {
         thread: { ...thread, status: "failed" },
         client: null,
         writable: false,
+        attachState: "failed",
+        lastAttachError: msg,
+        taskSnaps: new Map(),
       });
+      this.emitAttachState(threadId, sessionId, "failed", msg);
       throw this.wrap(err);
     }
   }
@@ -865,11 +974,102 @@ export class DesktopHost {
     if (!live) {
       throw new HostError("SESSION_NOT_FOUND", `Unknown Thread: ${threadId}`);
     }
+    live.attachState = "detaching";
+    this.emitAttachState(
+      threadId,
+      live.thread.sessionId,
+      "detaching",
+    );
     if (live.client) await live.client.close();
     live.client = null;
     live.writable = false;
+    live.attachState = "history_only";
     live.thread.status = "inactive";
     live.thread.updatedAt = new Date().toISOString();
+    this.emitAttachState(
+      threadId,
+      live.thread.sessionId,
+      "history_only",
+    );
+  }
+
+  /**
+   * Ping live attach: process alive + writable. On failure mark failed.
+   */
+  threadsPing(threadId: string): {
+    ok: boolean;
+    state: AttachState;
+    sessionId: string;
+    alive: boolean;
+  } {
+    const live = this.threads.get(threadId);
+    if (!live) {
+      throw new HostError("SESSION_NOT_FOUND", `Unknown Thread: ${threadId}`);
+    }
+    const sessionId = live.thread.sessionId;
+    if (!live.client || !live.writable) {
+      return {
+        ok: false,
+        state: live.attachState,
+        sessionId,
+        alive: false,
+      };
+    }
+    const alive = live.client.isAlive();
+    if (!alive) {
+      live.writable = false;
+      live.client = null;
+      live.attachState = "failed";
+      live.lastAttachError = "Agent process not alive";
+      live.thread.status = "failed";
+      this.emitAttachState(threadId, sessionId, "failed", live.lastAttachError);
+      return { ok: false, state: "failed", sessionId, alive: false };
+    }
+    live.lastActiveAtMs = Date.now();
+    live.attachState = "live";
+    return { ok: true, state: "live", sessionId, alive: true };
+  }
+
+  threadsAttachState(
+    threadIdOrSession: { threadId?: string; sessionId?: string },
+  ): {
+    threadId?: string;
+    sessionId: string;
+    state: AttachState;
+    lastError?: string;
+    attachedAt?: string;
+    lastActiveAt?: string;
+  } {
+    let live: LiveThread | undefined;
+    if (threadIdOrSession.threadId) {
+      live = this.threads.get(threadIdOrSession.threadId);
+    } else if (threadIdOrSession.sessionId) {
+      const tid = this.sessionIndex.get(threadIdOrSession.sessionId);
+      if (tid) live = this.threads.get(tid);
+    }
+    if (!live) {
+      return {
+        sessionId: threadIdOrSession.sessionId ?? "",
+        state: "history_only",
+      };
+    }
+    // refresh failed if process died
+    if (live.writable && live.client && !live.client.isAlive()) {
+      this.threadsPing(live.thread.id);
+      live = this.threads.get(live.thread.id) ?? live;
+    }
+    return {
+      threadId: live.thread.id,
+      sessionId: live.thread.sessionId,
+      state: live.attachState,
+      lastError: live.lastAttachError,
+      attachedAt: live.attachedAtMs
+        ? new Date(live.attachedAtMs).toISOString()
+        : undefined,
+      lastActiveAt: live.lastActiveAtMs
+        ? new Date(live.lastActiveAtMs).toISOString()
+        : undefined,
+    };
   }
 
   async threadsStop(threadId: string): Promise<void> {
@@ -1119,8 +1319,8 @@ export class DesktopHost {
   }
 
   /**
-   * Fork：复制源会话磁盘历史到新 session 目录，再 attach 打开。
-   * 对齐 CLI fork 的「复制 chat_history / updates / plan / goal」语义（同 cwd）。
+   * Fork（P1-D F2）：session/new → detach → copy history → re-attach load → optional directive.
+   * Avoids race where a live empty session overwrites copied history.
    */
   async threadsFork(params: {
     sourceSessionId: string;
@@ -1129,7 +1329,16 @@ export class DesktopHost {
     title?: string;
     model?: string;
     effort?: string;
-  }): Promise<ThreadsCreateResult & { parentSessionId: string; historyCopied: boolean }> {
+    /** First user prompt on the child session */
+    directive?: string;
+    worktree?: ThreadsCreateParams["worktree"];
+  }): Promise<
+    ThreadsCreateResult & {
+      parentSessionId: string;
+      historyCopied: boolean;
+      directiveSent?: boolean;
+    }
+  > {
     this.assertNotDisposed();
     const sourceId = params.sourceSessionId?.trim();
     if (!sourceId) {
@@ -1140,78 +1349,71 @@ export class DesktopHost {
       throw new HostError("SESSION_NOT_FOUND", `Source session not found: ${sourceId}`);
     }
 
-    // 先创建空会话（agent session/new）
+    // 1) Create empty session (may create worktree via threadsCreate)
     const created = await this.threadsCreate({
       cwd: params.cwd,
       projectId: params.projectId,
       title: params.title,
       model: params.model,
       effort: params.effort,
+      worktree: params.worktree,
     });
 
-    // 真实 agent 会在 sessions 下落盘；fake/慢落盘时主动建目标目录以便复制历史
+    // 2) Detach / close agent so disk copy is not racing a live empty session
+    try {
+      await this.threadsDetach(created.threadId);
+    } catch (err) {
+      this.logger.warn("threads.fork_detach_failed", { err: String(err) });
+    }
+
+    // 3) Ensure dest dir and copy history
     let destDir = findSessionDir(created.sessionId, this.home);
     if (!destDir) {
       destDir = path.join(
         sessionsRoot(this.home),
-        encodeCwdForSessionDir(params.cwd),
+        encodeCwdForSessionDir(created.cwd || params.cwd),
         created.sessionId,
       );
       fs.mkdirSync(destDir, { recursive: true });
     }
     let historyCopied = false;
-    if (destDir) {
-      const copyNames = [
-        "chat_history.jsonl",
-        "updates.jsonl",
-        "plan.md",
-        "plan_status.json",
-        "goal.json",
-        "subagents.json",
-      ];
-      for (const name of copyNames) {
-        const from = path.join(srcDir, name);
-        if (!fs.existsSync(from)) continue;
-        try {
-          fs.copyFileSync(from, path.join(destDir, name));
-          historyCopied = true;
-        } catch (err) {
-          this.logger.warn("threads.fork_copy_failed", {
-            name,
-            err: String(err),
-          });
-        }
-      }
-      // summary：保留新 session id，标注 fork 来源
+    try {
+      const copy = copySessionHistoryForFork(srcDir, destDir);
+      historyCopied = copy.historyCopied;
+      writeForkSummary({
+        destDir,
+        sessionId: created.sessionId,
+        parentSessionId: sourceId,
+        cwd: created.cwd || params.cwd,
+        title: params.title,
+        sourceSummaryPath: path.join(srcDir, "summary.json"),
+      });
+    } catch (err) {
+      this.logger.warn("threads.fork_copy_failed", { err: String(err) });
+    }
+
+    // 4) Re-attach via session/load
+    let liveThreadId = created.threadId;
+    try {
+      const att = await this.threadsAttach(
+        created.sessionId,
+        created.cwd || params.cwd,
+      );
+      liveThreadId = att.threadId;
+    } catch (err) {
+      this.logger.warn("threads.fork_reattach_failed", { err: String(err) });
+      throw this.wrap(err);
+    }
+
+    // 5) Optional first directive prompt
+    let directiveSent = false;
+    const directive = params.directive?.trim();
+    if (directive) {
       try {
-        const sumPath = path.join(destDir, "summary.json");
-        let summary: Record<string, unknown> = {};
-        if (fs.existsSync(sumPath)) {
-          summary = JSON.parse(fs.readFileSync(sumPath, "utf8")) as Record<
-            string,
-            unknown
-          >;
-        }
-        const srcSumPath = path.join(srcDir, "summary.json");
-        if (fs.existsSync(srcSumPath)) {
-          const srcSum = JSON.parse(
-            fs.readFileSync(srcSumPath, "utf8"),
-          ) as Record<string, unknown>;
-          if (srcSum.title && !params.title) {
-            summary.title = `分支 · ${String(srcSum.title)}`.slice(0, 80);
-          }
-        }
-        if (params.title) summary.title = params.title;
-        summary.session_kind = "fork";
-        summary.parent_session_id = sourceId;
-        summary.updated_at = new Date().toISOString();
-        const info = (summary.info as Record<string, unknown>) || {};
-        info.id = created.sessionId;
-        info.cwd = path.resolve(params.cwd);
-        summary.info = info;
-        fs.writeFileSync(sumPath, JSON.stringify(summary, null, 2), "utf8");
+        await this.turnsPrompt(liveThreadId, directive);
+        directiveSent = true;
       } catch (err) {
-        this.logger.warn("threads.fork_summary_failed", { err: String(err) });
+        this.logger.warn("threads.fork_directive_failed", { err: String(err) });
       }
     }
 
@@ -1219,12 +1421,17 @@ export class DesktopHost {
       sourceSessionId: sourceId,
       sessionId: created.sessionId,
       historyCopied,
+      directiveSent,
     });
 
     return {
-      ...created,
+      threadId: liveThreadId,
+      sessionId: created.sessionId,
+      cwd: created.cwd,
+      worktreeId: created.worktreeId,
       parentSessionId: sourceId,
       historyCopied,
+      directiveSent,
     };
   }
 
@@ -2668,6 +2875,10 @@ export class DesktopHost {
 
   async dispose(): Promise<void> {
     this.disposed = true;
+    if (this.idleDetachTimer) {
+      clearInterval(this.idleDetachTimer);
+      this.idleDetachTimer = null;
+    }
     this.filesWatchStop();
     this.shellStopHandoffWatch();
     this.handoffConsumer = null;
@@ -2689,14 +2900,397 @@ export class DesktopHost {
     if (!live.writable || !live.client) {
       throw new HostError("NOT_ATTACHED", `Thread not writable: ${threadId}`);
     }
+    if (!live.client.isAlive()) {
+      live.writable = false;
+      live.client = null;
+      live.attachState = "failed";
+      live.lastAttachError = "Agent process not alive";
+      live.thread.status = "failed";
+      this.emitAttachState(
+        threadId,
+        live.thread.sessionId,
+        "failed",
+        live.lastAttachError,
+      );
+      throw new HostError("NOT_ATTACHED", `Thread not writable: ${threadId}`);
+    }
+    live.lastActiveAtMs = Date.now();
     return live;
+  }
+
+  private emitAttachState(
+    threadId: string,
+    sessionId: string,
+    state: AttachState,
+    lastError?: string,
+  ): void {
+    this.emit({
+      type: "session.attach_state",
+      threadId,
+      sessionId,
+      state,
+      lastError,
+    });
+  }
+
+  private idleDetachConfig(): {
+    idleDetachMs: number;
+    maxLiveAttaches: number;
+  } {
+    const cfg = readDesktopConfig(this.home);
+    return {
+      idleDetachMs:
+        typeof cfg.idleDetachMs === "number"
+          ? cfg.idleDetachMs
+          : DEFAULT_IDLE_DETACH.idleDetachMs,
+      maxLiveAttaches:
+        typeof cfg.maxLiveAttaches === "number"
+          ? cfg.maxLiveAttaches
+          : DEFAULT_IDLE_DETACH.maxLiveAttaches,
+    };
+  }
+
+  private startIdleDetachLoop(): void {
+    if (this.idleDetachTimer) return;
+    this.idleDetachTimer = setInterval(() => {
+      void this.enforceLiveAttachBudget().catch((err) =>
+        this.logger.warn("idle_detach.tick_failed", { err: String(err) }),
+      );
+    }, 60_000);
+    // unref if available (Node)
+    try {
+      (this.idleDetachTimer as NodeJS.Timeout).unref?.();
+    } catch {
+      /* ignore */
+    }
+  }
+
+  private liveSnapshots(): LiveAttachSnapshot[] {
+    const out: LiveAttachSnapshot[] = [];
+    for (const [threadId, live] of this.threads) {
+      if (!live.writable || !live.client) continue;
+      out.push({
+        threadId,
+        sessionId: live.thread.sessionId,
+        state: live.attachState === "live" ? "live" : live.attachState,
+        attachedAt: live.attachedAtMs,
+        lastActiveAt: live.lastActiveAtMs,
+        working: live.thread.status === "working",
+        hasPendingPermission: live.thread.status === "needs_input",
+        hasRunningTask: Boolean(
+          [...(live.taskSnaps?.values() ?? [])].some(
+            (t) =>
+              t.phase === "backgrounded" ||
+              t.phase === "monitor" ||
+              t.phase === "running",
+          ),
+        ),
+        hasSendingQueueItem: loadQueue(live.thread.sessionId, this.home).items.some(
+          (i) => i.status === "sending",
+        ),
+      });
+    }
+    return out;
+  }
+
+  async enforceLiveAttachBudget(): Promise<string[]> {
+    const cfg = this.idleDetachConfig();
+    const targets = pickLruDetachTargets(this.liveSnapshots(), cfg, Date.now());
+    for (const tid of targets) {
+      try {
+        await this.threadsDetach(tid);
+        this.logger.info("idle_detach", { threadId: tid });
+      } catch (err) {
+        this.logger.warn("idle_detach_failed", {
+          threadId: tid,
+          err: String(err),
+        });
+      }
+    }
+    return targets;
+  }
+
+  // ── Prompt queue (L1 durable) ─────────────────────────────
+
+  queueGet(sessionId: string): PromptQueueFile {
+    return loadQueue(sessionId, this.home);
+  }
+
+  queueSet(sessionId: string, file: PromptQueueFile): PromptQueueFile {
+    const next = saveQueue({ ...file, sessionId }, this.home);
+    this.emitQueueChanged(sessionId, "local", next);
+    return next;
+  }
+
+  queueEnqueue(
+    sessionId: string,
+    item: {
+      display?: string;
+      content: string;
+      attachments?: PromptQueueAttachment[];
+      id?: string;
+    },
+  ): PromptQueueFile {
+    const next = enqueueItem(
+      sessionId,
+      {
+        id: item.id,
+        display: item.display || item.content.slice(0, 80),
+        content: item.content,
+        attachments: item.attachments ?? [],
+      },
+      this.home,
+    );
+    this.emitQueueChanged(sessionId, "local", next);
+    return next;
+  }
+
+  queueRemove(sessionId: string, itemId: string): PromptQueueFile {
+    const next = removeItem(sessionId, itemId, this.home);
+    void this.tryQueueWire(sessionId, "remove", { itemId });
+    this.emitQueueChanged(sessionId, "local", next);
+    return next;
+  }
+
+  queueReorder(sessionId: string, orderedIds: string[]): PromptQueueFile {
+    const next = reorderItems(sessionId, orderedIds, this.home);
+    void this.tryQueueWire(sessionId, "reorder", { orderedIds });
+    this.emitQueueChanged(sessionId, "local", next);
+    return next;
+  }
+
+  queueUpdate(
+    sessionId: string,
+    itemId: string,
+    patch: Partial<
+      Pick<PromptQueueItem, "display" | "content" | "attachments" | "status" | "lastError">
+    >,
+  ): PromptQueueFile {
+    const next = updateItem(sessionId, itemId, patch, this.home);
+    void this.tryQueueWire(sessionId, "edit", { itemId, ...patch });
+    this.emitQueueChanged(sessionId, "local", next);
+    return next;
+  }
+
+  queueClear(sessionId: string): PromptQueueFile {
+    const next = clearQueue(sessionId, this.home);
+    void this.tryQueueWire(sessionId, "clear", {});
+    this.emitQueueChanged(sessionId, "local", next);
+    return next;
+  }
+
+  queueSetFlags(
+    sessionId: string,
+    flags: {
+      queueingEnabled?: boolean;
+      pausedByInterrupt?: boolean;
+      syncError?: string | null;
+    },
+  ): PromptQueueFile {
+    const next = setQueueFlags(sessionId, flags, this.home);
+    this.emitQueueChanged(sessionId, "local", next);
+    return next;
+  }
+
+  queueTakeNext(sessionId: string): {
+    queue: PromptQueueFile;
+    item: PromptQueueItem | null;
+  } {
+    return takeNextPending(sessionId, this.home);
+  }
+
+  queueCompleteSending(
+    sessionId: string,
+    itemId: string,
+    ok: boolean,
+    error?: string,
+  ): PromptQueueFile {
+    const next = completeSending(sessionId, itemId, ok, error, this.home);
+    this.emitQueueChanged(sessionId, "local", next);
+    return next;
+  }
+
+  private emitQueueChanged(
+    sessionId: string,
+    source: "local" | "agent",
+    q: PromptQueueFile,
+  ): void {
+    const tid = this.sessionIndex.get(sessionId);
+    this.emit({
+      type: "queue.changed",
+      threadId: tid,
+      sessionId,
+      source,
+      itemCount: q.items.length,
+      pausedByInterrupt: q.pausedByInterrupt,
+      syncError: q.syncError,
+    });
+  }
+
+  /** Best-effort agent queue writeback (P2-A); never throws to UI. */
+  private async tryQueueWire(
+    sessionId: string,
+    op: string,
+    params: Record<string, unknown>,
+  ): Promise<void> {
+    const tid = this.sessionIndex.get(sessionId);
+    if (!tid) return;
+    const live = this.threads.get(tid);
+    if (!live?.client || !live.writable) return;
+    try {
+      await live.client.extMethod(
+        `_x.ai/queue/${op}`,
+        { sessionId, ...params },
+        15_000,
+      );
+      setQueueFlags(sessionId, { syncError: null }, this.home);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      if (/method not found/i.test(msg)) return;
+      setQueueFlags(sessionId, { syncError: msg }, this.home);
+      this.logger.warn("queue.wire_failed", { op, msg });
+    }
+  }
+
+  // ── Tasks aggregate (P2-B) ────────────────────────────────
+
+  tasksList(sessionId: string): {
+    sessionId: string;
+    items: ReturnType<typeof aggregateTasksLoose>;
+  } {
+    const tid = this.sessionIndex.get(sessionId);
+    const live = tid ? this.threads.get(tid) : undefined;
+    const snaps = live?.taskSnaps
+      ? [...live.taskSnaps.values()]
+      : [];
+    let subagents: import("../shared/types.js").SubagentNode[] = [];
+    try {
+      subagents = loadSubagentTree(sessionId, this.home) ?? [];
+    } catch {
+      subagents = [];
+    }
+    // Session-bound automations: those with matching sessionId field if any
+    const autos = this.automations.list().filter((a) => {
+      const any = a as { sessionId?: string; threadSessionId?: string };
+      return any.sessionId === sessionId || any.threadSessionId === sessionId;
+    });
+    const items = aggregateTasksLoose({
+      sessionId,
+      processSnaps: snaps,
+      subagents,
+      automationsForSession: autos,
+    });
+    return { sessionId, items };
+  }
+
+  // ── Hooks (P3-B) ─────────────────────────────────────────
+
+  hooksList(): {
+    hooks: Array<{
+      id: string;
+      source: string;
+      event?: string;
+      command?: string;
+      trusted: boolean;
+      path?: string;
+    }>;
+    note?: string;
+  } {
+    return listDesktopHooks(this.home);
+  }
+
+  hooksTrust(id: string): { ok: true; id: string } {
+    setHookTrusted(id, true, this.home);
+    return { ok: true, id };
+  }
+
+  hooksUntrust(id: string): { ok: true; id: string } {
+    setHookTrusted(id, false, this.home);
+    return { ok: true, id };
+  }
+
+  hooksReload(): { ok: true; hooks: ReturnType<DesktopHost["hooksList"]>["hooks"] } {
+    const list = this.hooksList();
+    return { ok: true, hooks: list.hooks };
+  }
+
+  // ── Skills resolve (P3-A) ────────────────────────────────
+
+  skillsResolve(name: string, cwd?: string): {
+    name: string;
+    mode: "resolved" | "prompt_fallback";
+    prompt: string;
+    path?: string;
+  } {
+    const n = name.trim().replace(/^\//, "");
+    if (!n) {
+      throw new HostError("INVALID_ARGUMENT", "skill name required");
+    }
+    // Search GROK_HOME/skills and project .grok/skills for SKILL.md
+    const roots = [
+      path.join(grokHomeDir(this.home), "skills", n),
+      path.join(grokHomeDir(this.home), "skills", n.replace(/:/g, path.sep)),
+    ];
+    if (cwd) {
+      roots.unshift(path.join(cwd, ".grok", "skills", n));
+    }
+    for (const dir of roots) {
+      const skillMd = path.join(dir, "SKILL.md");
+      if (fs.existsSync(skillMd)) {
+        try {
+          const body = fs.readFileSync(skillMd, "utf8");
+          // Full runner path: send skill invocation prompt (shell resolve equivalent for Desktop)
+          return {
+            name: n,
+            mode: "resolved",
+            path: skillMd,
+            prompt: `Use the skill "${n}" defined at ${skillMd}. Follow SKILL.md instructions.\n\n---\n${body.slice(0, 12000)}`,
+          };
+        } catch {
+          /* continue */
+        }
+      }
+    }
+    return {
+      name: n,
+      mode: "prompt_fallback",
+      prompt: `Please run the skill named "${n}" if available.`,
+    };
   }
 
   private onClientEvent(threadId: string, ev: NormalizedEvent): void {
     const live = this.threads.get(threadId);
+    if (live) {
+      live.lastActiveAtMs = Date.now();
+    }
     if (live && ev.type === "session.status") {
       live.thread.status = ev.status;
       live.thread.updatedAt = new Date().toISOString();
+    }
+    if (live && ev.type === "task.updated") {
+      if (!live.taskSnaps) live.taskSnaps = new Map();
+      live.taskSnaps.set(ev.taskId, {
+        taskId: ev.taskId,
+        sessionId: ev.sessionId,
+        phase: ev.phase,
+        description: ev.description,
+        command: ev.command,
+        isMonitor: ev.isMonitor || ev.phase === "monitor",
+        success: ev.success,
+        updatedAt: Date.now(),
+      });
+    }
+    if (ev.type === "queue.changed") {
+      this.runtimeCaps = applyRuntimeCapabilitySignal(
+        this.runtimeCaps,
+        "queue_changed",
+      );
+    }
+    if (ev.type === "session.available_commands") {
+      this.runtimeCaps = applyRuntimeCapabilitySignal(
+        this.runtimeCaps,
+        "available_commands",
+      );
     }
     if (ev.type === "permission.requested" && live) {
       // Build：always-approve 可在 plan 底下 armed；非 edit 类由 agent/yolo 或此处代批
@@ -2753,9 +3347,17 @@ export class DesktopHost {
       const crashed = live.client;
       live.writable = false;
       live.client = null;
+      live.attachState = "failed";
+      live.lastAttachError = ev.message;
       live.thread.status = "failed";
       live.thread.updatedAt = new Date().toISOString();
       void crashed?.close().catch(() => undefined);
+      this.emitAttachState(
+        threadId,
+        live.thread.sessionId,
+        "failed",
+        ev.message,
+      );
       this.inbox.add({
         type: "agent_failed",
         title: "Agent error",
