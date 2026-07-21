@@ -258,6 +258,7 @@ export const enUS: MessageDict = {
   "settings.perm.normalSub":
     "Read/write workspace files; sensitive actions need approval",
   "settings.perm.full": "Full access",
+  "settings.perm.fullConfirm": "Set default to full access (skip permission prompts) for new chats?",
   "settings.perm.fullSub":
     "Read, write, and run without step-by-step approval (high risk)",
   "settings.perm.plan": "Plan mode",
@@ -570,6 +571,9 @@ export const enUS: MessageDict = {
   "chat.connecting": "Connecting…",
   "chat.connectFail": "Could not connect session; send manually",
   "chat.sendFail": "Send failed",
+  "chat.turnTimeout": "Turn timed out (agent idle too long). Try again or split the task.",
+  "chat.turnEmpty": "Turn finished with no assistant reply. Check agent logs or retry.",
+  "chat.turnToolsOnly": "Turn finished after tools ran, but no final reply text was streamed.",
   "chat.goalCancelled": "Goal setup cancelled",
   "chat.turnBusy": "A turn is in progress; try again later",
   "chat.planReady": "Plan ready · /view-plan or click the Plan chip",

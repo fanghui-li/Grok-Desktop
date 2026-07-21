@@ -94,4 +94,20 @@ describe("contract audit", () => {
     expect(HOST_IPC_CHANNEL).toBe("grok-desktop-host");
     expect(HOST_EVENT_CHANNEL).toBe("grok-desktop-host-event");
   });
+
+  it("turn completion UX and full-access confirm exist", () => {
+    const events = read("src/shared/events.ts");
+    expect(events).toMatch(/hadAssistantText/);
+    expect(events).toMatch(/hadToolActivity/);
+    const acp = read("src/host/acp-client.ts");
+    expect(acp).toMatch(/hadToolActivityThisTurn/);
+    expect(acp).toMatch(/error: message/);
+    const renderer = read("src/renderer/main.ts");
+    expect(renderer).toMatch(/chat\.turnTimeout/);
+    const settings = read("src/renderer/settings-page.ts");
+    expect(settings).toMatch(/settings\.perm\.fullConfirm/);
+    const en = read("src/shared/i18n/locales/en-US.ts");
+    expect(en).toMatch(/chat\.turnTimeout/);
+    expect(en).toMatch(/settings\.perm\.fullConfirm/);
+  });
 });

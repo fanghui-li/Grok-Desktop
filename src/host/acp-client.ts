@@ -38,6 +38,8 @@ export class AcpClient {
   private closed = false;
   /** True if we already streamed assistant message chunks this turn. */
   private streamedAssistantThisTurn = false;
+  /** True if any tool/process activity was observed this turn. */
+  private hadToolActivityThisTurn = false;
   private permissionWaiters = new Map<
     string,
     { resolve: (optionId: string) => void }
@@ -180,6 +182,7 @@ export class AcpClient {
     }
 
     this.streamedAssistantThisTurn = false;
+    this.hadToolActivityThisTurn = false;
     this.opts.onEvent({
       type: "turn.started",
       threadId: this.opts.threadId,
@@ -193,6 +196,8 @@ export class AcpClient {
     });
 
     try {
+      // Note: idle-reset timeout lives in security PR (#5). Keep 300s here on main
+      // until that lands; always emit turn.completed metadata for UI settle UX.
       const result = (await this.request(
         "session/prompt",
         {
@@ -200,7 +205,7 @@ export class AcpClient {
           prompt: [{ type: "text", text }],
         },
         300_000,
-      )) as { stopReason?: string; text?: string };
+      )) as { stopReason?: string; stop_reason?: string; text?: string };
 
       // Only emit final text if no streaming chunks were received (avoid duplicate full paste)
       if (result?.text && !this.streamedAssistantThisTurn) {
@@ -217,7 +222,10 @@ export class AcpClient {
         type: "turn.completed",
         threadId: this.opts.threadId,
         sessionId: this.sessionId,
-        stopReason: result?.stopReason,
+        stopReason: result?.stopReason ?? result?.stop_reason,
+        hadAssistantText:
+          this.streamedAssistantThisTurn || Boolean(result?.text),
+        hadToolActivity: this.hadToolActivityThisTurn,
       });
       this.opts.onEvent({
         type: "session.status",
@@ -227,10 +235,26 @@ export class AcpClient {
       });
       return result ?? {};
     } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      const code =
+        err && typeof err === "object" && "code" in err
+          ? String((err as { code?: string }).code ?? "")
+          : "";
+      const stopReason =
+        code === "TIMEOUT" || /timed out/i.test(message) ? "timeout" : "error";
+      this.opts.onEvent({
+        type: "turn.completed",
+        threadId: this.opts.threadId,
+        sessionId: this.sessionId ?? "",
+        stopReason,
+        error: message,
+        hadAssistantText: this.streamedAssistantThisTurn,
+        hadToolActivity: this.hadToolActivityThisTurn,
+      });
       this.opts.onEvent({
         type: "session.status",
         threadId: this.opts.threadId,
-        sessionId: this.sessionId,
+        sessionId: this.sessionId ?? "",
         status: "failed",
       });
       throw err;

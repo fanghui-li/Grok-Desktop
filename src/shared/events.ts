@@ -16,6 +16,12 @@ export type NormalizedEvent =
       threadId: string;
       sessionId: string;
       stopReason?: string;
+      /** Present on timeout/error completion paths */
+      error?: string;
+      /** True if any assistant text was streamed or returned this turn */
+      hadAssistantText?: boolean;
+      /** True if any tool/process activity was observed this turn */
+      hadToolActivity?: boolean;
     }
   | {
       type: "message.delta";

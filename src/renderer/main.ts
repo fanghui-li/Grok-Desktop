@@ -8980,16 +8980,41 @@ function onEvent(raw: unknown): void {
       if (!turnActive) beginTurn();
       else setTurnStatus(tr("turn.thinking"));
       break;
-    case "turn.completed":
+    case "turn.completed": {
+      const stop = String((ev as { stopReason?: string }).stopReason || "");
+      const errMsg = (ev as { error?: string }).error
+        ? String((ev as { error?: string }).error)
+        : "";
+      const hadText = Boolean((ev as { hadAssistantText?: boolean }).hadAssistantText);
+      const hadTools = Boolean((ev as { hadToolActivity?: boolean }).hadToolActivity);
       endTurn();
-      // 回合结束：强制从 agent updates.jsonl 同步（complete 常在 turn 末尾）
+      if (stop === "timeout" || /timed out/i.test(errMsg)) {
+        appendLine(
+          tr("chat.turnTimeout") ||
+            "Turn timed out (agent idle too long). Try again or split the task.",
+          "error",
+        );
+      } else if (errMsg && stop === "error") {
+        appendLine(errMsg, "error");
+      } else if (!hadText && !hadTools) {
+        appendLine(
+          tr("chat.turnEmpty") ||
+            "Turn finished with no assistant reply. Check agent logs or retry.",
+          "system",
+        );
+      } else if (!hadText && hadTools) {
+        appendLine(
+          tr("chat.turnToolsOnly") ||
+            "Turn finished after tools ran, but no final reply text was streamed.",
+          "system",
+        );
+      }
       void syncGoalFromAgent();
       void refreshContextUsage();
-      // 回合可能批量改文件；再刷一次目录
       sidePane?.scheduleRefreshFileTree(400);
-      // 回补可能因 IPC 乱序丢失的末条助手消息；计划模式尝试打开 plan
       void afterTurnSettled();
       break;
+    }
     case "context.compacted":
       // auto-compact：系统提示 + 乐观刷新 chip（signals 写回有延迟）
       if (ev.status === "completed" && ev.kind === "auto") {
