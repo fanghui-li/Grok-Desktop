@@ -104,10 +104,30 @@ export class WorktreeService {
     this.write(data);
   }
 
-  cleanup(worktreeId: string, opts?: { force?: boolean; activeSessionIds?: string[] }): void {
+  cleanup(
+    worktreeId: string,
+    opts?: { force?: boolean; activeSessionIds?: string[] },
+  ): {
+    removed: boolean;
+    path: string;
+    forced: boolean;
+    busy: boolean;
+    missingOnDisk?: boolean;
+    diskDeleteFailed?: boolean;
+    error?: string;
+  } {
     const data = this.read();
     const w = data.worktrees.find((x) => x.id === worktreeId);
     if (!w) throw new HostError("INVALID_ARGUMENT", `Unknown worktree: ${worktreeId}`);
+    const abs = path.resolve(w.path);
+    // Only remove Desktop-managed worktrees under .grok-worktrees (defense in depth).
+    const norm = abs.replace(/\\/g, "/").toLowerCase();
+    if (!norm.includes("/.grok-worktrees/")) {
+      throw new HostError(
+        "PERMISSION_DENIED",
+        `Refusing to remove path outside .grok-worktrees: ${abs}`,
+      );
+    }
     const active = opts?.activeSessionIds ?? [];
     const busy = w.boundSessionIds.some((s) => active.includes(s));
     if (busy && !opts?.force) {
@@ -116,14 +136,46 @@ export class WorktreeService {
         "Worktree has active Threads; stop them or pass force",
       );
     }
-    // Remove git worktree
-    const repo = findGitRoot(w.path) ?? path.dirname(path.dirname(w.path));
-    spawnSync("git", ["worktree", "remove", "--force", w.path], {
+    const repo = findGitRoot(abs) ?? path.dirname(path.dirname(abs));
+    const force = Boolean(opts?.force);
+    // Prefer soft remove; --force only when caller explicitly requests.
+    const args = force
+      ? ["worktree", "remove", "--force", abs]
+      : ["worktree", "remove", abs];
+    const r = spawnSync("git", args, {
       cwd: repo,
+      encoding: "utf8",
       windowsHide: true,
     });
+    if (r.status !== 0) {
+      if (!fs.existsSync(abs)) {
+        data.worktrees = data.worktrees.filter((x) => x.id !== worktreeId);
+        this.write(data);
+        return { removed: true, missingOnDisk: true, path: abs, forced: force, busy };
+      }
+      const detail = (r.stderr || r.stdout || "").toString().trim().slice(0, 400);
+      // force=true: drop registry even if Windows file locks block disk delete
+      // (soft remove still surfaces the git error).
+      if (force) {
+        data.worktrees = data.worktrees.filter((x) => x.id !== worktreeId);
+        this.write(data);
+        return {
+          removed: true,
+          path: abs,
+          forced: true,
+          busy,
+          diskDeleteFailed: true,
+          error: detail || `exit ${r.status}`,
+        };
+      }
+      throw new HostError(
+        "IO_ERROR",
+        `git worktree remove failed: ${detail || `exit ${r.status}`}`,
+      );
+    }
     data.worktrees = data.worktrees.filter((x) => x.id !== worktreeId);
     this.write(data);
+    return { removed: true, path: abs, forced: force, busy };
   }
 
   get(id: string): WorktreeInfo | undefined {

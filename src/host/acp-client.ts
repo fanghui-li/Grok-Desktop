@@ -34,6 +34,20 @@ export class AcpClient {
   private rl: readline.Interface | null = null;
   private nextId = 1;
   private pending = new Map<JsonRpcId, Pending>();
+  /**
+   * Pending RPC idle timers — reset on any ACP traffic so long tool chains
+   * do not hit a fixed wall-clock timeout while the agent is still working.
+   */
+  private pendingTimers = new Map<
+    JsonRpcId,
+    {
+      idleMs: number;
+      maxMs: number;
+      startedAt: number;
+      timer: ReturnType<typeof setTimeout>;
+      fire: () => void;
+    }
+  >();
   private sessionId: string | null = null;
   private closed = false;
   /** True if we already streamed assistant message chunks this turn. */
@@ -103,6 +117,8 @@ export class AcpClient {
     this.proc.stderr.on("data", (buf: Buffer) => {
       const text = buf.toString("utf8").trim();
       if (text) {
+        // stderr chatter also proves the agent is alive
+        this.touchPendingActivity();
         this.opts.logger?.debug("acp.stderr", { text: text.slice(0, 2000) });
       }
     });
@@ -199,7 +215,7 @@ export class AcpClient {
           sessionId: this.sessionId,
           prompt: [{ type: "text", text }],
         },
-        300_000,
+        { idleMs: 15 * 60_000, maxMs: 2 * 60 * 60_000 },
       )) as { stopReason?: string; text?: string };
 
       // Only emit final text if no streaming chunks were received (avoid duplicate full paste)
@@ -227,10 +243,25 @@ export class AcpClient {
       });
       return result ?? {};
     } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      const code =
+        err && typeof err === "object" && "code" in err
+          ? String((err as { code?: string }).code ?? "")
+          : "";
+      const stopReason =
+        code === "TIMEOUT" || /timed out/i.test(message)
+          ? "timeout"
+          : "error";
+      this.opts.onEvent({
+        type: "turn.completed",
+        threadId: this.opts.threadId,
+        sessionId: this.sessionId ?? "",
+        stopReason,
+      });
       this.opts.onEvent({
         type: "session.status",
         threadId: this.opts.threadId,
-        sessionId: this.sessionId,
+        sessionId: this.sessionId ?? "",
         status: "failed",
       });
       throw err;
@@ -871,6 +902,10 @@ export class AcpClient {
   }
 
   private failAll(err: Error): void {
+    for (const [, meta] of this.pendingTimers) {
+      clearTimeout(meta.timer);
+    }
+    this.pendingTimers.clear();
     for (const [, p] of this.pending) p.reject(err);
     this.pending.clear();
     // 未决 plan 审批：放弃
@@ -884,30 +919,87 @@ export class AcpClient {
     this.write({ jsonrpc: "2.0", method, params });
   }
 
+  /**
+   * @param timeout
+   *   number = fixed wall-clock ms (legacy)
+   *   object = idle-reset timeout (resets on any ACP line while pending)
+   */
   private request(
     method: string,
     params: unknown,
-    timeoutMs = 120_000,
+    timeout: number | { idleMs?: number; maxMs?: number } = 120_000,
   ): Promise<unknown> {
     const id = this.nextId++;
+    const idleMs =
+      typeof timeout === "number"
+        ? timeout
+        : Math.max(5_000, Number(timeout?.idleMs) || 120_000);
+    const maxMs =
+      typeof timeout === "number"
+        ? timeout
+        : Math.max(idleMs, Number(timeout?.maxMs) || idleMs);
+    const startedAt = Date.now();
     return new Promise((resolve, reject) => {
-      const timer = setTimeout(() => {
+      const fire = () => {
+        const entry = this.pendingTimers.get(id);
+        if (entry) clearTimeout(entry.timer);
+        this.pendingTimers.delete(id);
         this.pending.delete(id);
-        reject(new HostError("TIMEOUT", `ACP request timed out: ${method}`));
-      }, timeoutMs);
-
+        reject(
+          new HostError(
+            "TIMEOUT",
+            `ACP request timed out: ${method} (idle ${Math.round(idleMs / 1000)}s / max ${Math.round(maxMs / 1000)}s)`,
+          ),
+        );
+      };
+      const arm = () => {
+        const prev = this.pendingTimers.get(id);
+        if (prev) clearTimeout(prev.timer);
+        const elapsed = Date.now() - startedAt;
+        const remainingMax = Math.max(0, maxMs - elapsed);
+        const wait = Math.min(idleMs, remainingMax || idleMs);
+        if (remainingMax <= 0) {
+          fire();
+          return;
+        }
+        const timer = setTimeout(fire, wait);
+        this.pendingTimers.set(id, { idleMs, maxMs, startedAt, timer, fire });
+      };
+      arm();
       this.pending.set(id, {
         resolve: (v) => {
-          clearTimeout(timer);
+          const entry = this.pendingTimers.get(id);
+          if (entry) clearTimeout(entry.timer);
+          this.pendingTimers.delete(id);
           resolve(v);
         },
         reject: (e) => {
-          clearTimeout(timer);
+          const entry = this.pendingTimers.get(id);
+          if (entry) clearTimeout(entry.timer);
+          this.pendingTimers.delete(id);
           reject(e);
         },
       });
       this.write({ jsonrpc: "2.0", id, method, params });
     });
+  }
+
+  /** Reset idle countdown for all pending RPCs (agent still producing traffic). */
+  private touchPendingActivity(): void {
+    for (const [id, meta] of this.pendingTimers) {
+      const elapsed = Date.now() - meta.startedAt;
+      const remainingMax = Math.max(0, meta.maxMs - elapsed);
+      if (remainingMax <= 0) {
+        clearTimeout(meta.timer);
+        this.pendingTimers.delete(id);
+        meta.fire();
+        continue;
+      }
+      clearTimeout(meta.timer);
+      const wait = Math.min(meta.idleMs, remainingMax);
+      meta.timer = setTimeout(meta.fire, wait);
+      this.pendingTimers.set(id, meta);
+    }
   }
 
   private respond(id: JsonRpcId, result: unknown): void {
@@ -932,6 +1024,8 @@ export class AcpClient {
   private onLine(line: string): void {
     const trimmed = line.trim();
     if (!trimmed) return;
+    // Any stdout traffic means the agent is alive — reset idle timeouts.
+    this.touchPendingActivity();
 
     let msg: Record<string, unknown>;
     try {

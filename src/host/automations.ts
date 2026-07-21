@@ -11,6 +11,11 @@ interface AutoFile {
   runs: AutomationRun[];
 }
 
+/** Interval schedule strings like every_15_minutes */
+export function isIntervalSchedule(schedule: string | undefined | null): boolean {
+  return /^every_\d+_minutes?$/i.test(String(schedule ?? "").trim());
+}
+
 export class AutomationStore {
   private timers = new Map<string, ReturnType<typeof setInterval>>();
 
@@ -57,8 +62,14 @@ export class AutomationStore {
     },
   ): Automation {
     const now = new Date().toISOString();
+    const schedule = String(input.schedule ?? "").trim();
+    const isScheduled = isIntervalSchedule(schedule);
+    // Explicit false default; interval jobs never store YOLO.
+    const alwaysApprove = isScheduled ? false : input.alwaysApprove === true;
     const a: Automation = {
       ...input,
+      schedule,
+      alwaysApprove,
       id: `auto_${randomUUID()}`,
       status: input.status ?? "active",
       createdAt: now,
@@ -93,6 +104,12 @@ export class AutomationStore {
     const a = data.automations.find((x) => x.id === id);
     if (!a) throw new HostError("INVALID_ARGUMENT", `Unknown automation: ${id}`);
     Object.assign(a, patch, { updatedAt: new Date().toISOString() });
+    const schedule = String(a.schedule ?? "").trim();
+    if (isIntervalSchedule(schedule)) {
+      a.alwaysApprove = false;
+    } else if (patch.alwaysApprove !== undefined) {
+      a.alwaysApprove = patch.alwaysApprove === true;
+    }
     this.write(data);
     return a;
   }
@@ -128,10 +145,33 @@ export class AutomationStore {
     this.write(data);
   }
 
+  /**
+   * Drop YOLO on interval jobs (legacy data may have alwaysApprove true).
+   * Also normalize undefined alwaysApprove to false.
+   */
+  migrateSafeDefaults(): number {
+    const data = this.read();
+    let changed = 0;
+    for (const a of data.automations) {
+      const sched = String(a.schedule ?? "").trim();
+      if (isIntervalSchedule(sched) && a.alwaysApprove !== false) {
+        a.alwaysApprove = false;
+        changed++;
+      }
+      if (a.alwaysApprove === undefined) {
+        a.alwaysApprove = false;
+        changed++;
+      }
+    }
+    if (changed) this.write(data);
+    return changed;
+  }
+
   /** Simple interval scheduler: schedule string "every_N_minutes" or ignore. */
   startScheduler(
     onFire: (automation: Automation) => void | Promise<void>,
   ): void {
+    this.migrateSafeDefaults();
     for (const a of this.list()) {
       if (a.status !== "active") continue;
       this.arm(a, onFire);

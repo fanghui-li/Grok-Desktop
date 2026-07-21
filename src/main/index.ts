@@ -217,6 +217,7 @@ async function handleHostIpc(
         host.filesReadDataUrl({
           path: p.path as string,
           maxBytes: p.maxBytes as number | undefined,
+          cwd: p.cwd as string | undefined,
         }),
       );
     case "files.list":

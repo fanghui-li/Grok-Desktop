@@ -46,8 +46,11 @@ export function resolveUnderRoots(
     ...extraRoots,
   ]);
   if (!roots.length) {
-    // 无项目时仅允许已是绝对路径的读取（宽松但记录）
-    return abs;
+    // No project roots: deny by default (callers must pass paste-images / cwd).
+    throw new HostError(
+      "INVALID_ARGUMENT",
+      `Path outside project roots: ${abs}`,
+    );
   }
   const absN = abs.toLowerCase().replace(/\\/g, "/");
   const ok = roots.some(
@@ -178,8 +181,16 @@ export function writeProjectFile(opts: {
 export function readFileDataUrl(opts: {
   path: string;
   maxBytes?: number;
+  cwd?: string | null;
+  roots?: string[];
+  home?: string;
 }): { dataUrl: string; mime: string; bytes: number } {
-  const abs = path.resolve(opts.path);
+  // Must stay under project roots (or paste-images temp) — never arbitrary FS.
+  const extra = [...(opts.roots ?? [])];
+  if (opts.home) {
+    extra.push(path.join(desktopDir(opts.home), "paste-images"));
+  }
+  const abs = resolveUnderRoots(opts.path, opts.cwd, extra);
   if (!fs.existsSync(abs) || !fs.statSync(abs).isFile()) {
     throw new HostError("IO_ERROR", `Not a file: ${abs}`);
   }

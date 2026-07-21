@@ -635,11 +635,27 @@ export class DesktopHost {
     }
 
     const cfg = this.configGet();
-    // 两维：访问权限 × plan（对齐 Grok Build；可同时 true）
-    const alwaysApprove =
-      params.alwaysApprove === true ||
-      params.mode === "always_approve" ||
-      cfg.alwaysApproveDefault === true;
+    // Explicit session mode/alwaysApprove always wins over desktop defaults.
+    // (Previously alwaysApproveDefault could force YOLO even when mode=normal.)
+    // Keep two dimensions: access mode × plan (align Grok Build; may both be true).
+    let alwaysApprove: boolean;
+    if (params.mode === "always_approve") {
+      alwaysApprove = true;
+    } else if (params.mode === "normal" || params.mode === "plan") {
+      // mode=plan only arms plan; access still defaults unless alwaysApprove true.
+      alwaysApprove = params.alwaysApprove === true;
+    } else if (params.alwaysApprove === true) {
+      alwaysApprove = true;
+    } else if (params.alwaysApprove === false) {
+      alwaysApprove = false;
+    } else if (
+      cfg.defaultPermMode === "always_approve" ||
+      cfg.alwaysApproveDefault === true
+    ) {
+      alwaysApprove = true;
+    } else {
+      alwaysApprove = false;
+    }
     const planActive =
       params.plan === true || params.mode === "plan";
     const accessMode: AccessMode = alwaysApprove ? "always_approve" : "normal";
@@ -1607,7 +1623,12 @@ export class DesktopHost {
 
   worktreesCleanup(worktreeId: string, force?: boolean): void {
     const active = this.listThreads()
-      .filter((t) => t.status === "working" || t.status === "needs_input")
+      .filter(
+        (t) =>
+          t.status === "working" ||
+          t.status === "needs_input" ||
+          t.status === "blocked",
+      )
       .map((t) => t.sessionId);
     this.worktrees.cleanup(worktreeId, { force, activeSessionIds: active });
   }
@@ -1708,12 +1729,25 @@ export class DesktopHost {
   }
 
   /** 本地图片 → data URL（输入框缩略图 / 大图预览） */
-  filesReadDataUrl(opts: { path: string; maxBytes?: number }): {
+  filesReadDataUrl(opts: {
+    path: string;
+    maxBytes?: number;
+    cwd?: string;
+  }): {
     dataUrl: string;
     mime: string;
     bytes: number;
   } {
-    return readFileDataUrl(opts);
+    const roots = this.projects
+      .list({ includeArchived: true })
+      .map((p) => p.path);
+    return readFileDataUrl({
+      path: opts.path,
+      cwd: opts.cwd,
+      maxBytes: opts.maxBytes,
+      roots,
+      home: this.home,
+    });
   }
 
   /** 文件树：列一层目录 */
@@ -1929,14 +1963,30 @@ export class DesktopHost {
   automationsCreate(
     input: Parameters<AutomationStore["create"]>[0],
   ): Automation {
-    return this.automations.create(input);
+    // Host-enforced: interval schedules cannot enable alwaysApprove.
+    const schedule = String(input.schedule ?? "").trim();
+    const isScheduled = /^every_\d+_minutes?$/i.test(schedule);
+    return this.automations.create({
+      ...input,
+      schedule,
+      alwaysApprove: isScheduled ? false : input.alwaysApprove === true,
+    });
   }
 
   automationsUpdate(
     id: string,
     patch: Parameters<AutomationStore["update"]>[1],
   ): Automation {
-    return this.automations.update(id, patch);
+    const next = { ...patch };
+    const existing = this.automations.list().find((x) => x.id === id);
+    const schedule = String(next.schedule ?? existing?.schedule ?? "").trim();
+    const isScheduled = /^every_\d+_minutes?$/i.test(schedule);
+    if (isScheduled) {
+      next.alwaysApprove = false;
+    } else if (next.alwaysApprove !== undefined) {
+      next.alwaysApprove = next.alwaysApprove === true;
+    }
+    return this.automations.update(id, next);
   }
 
   automationsDelete(id: string): void {
@@ -1978,12 +2028,15 @@ export class DesktopHost {
         });
         cwd = wt.path;
       }
+      // Scheduled (interval) runs never auto-approve — unattended YOLO is too risky.
+      const isScheduled = /^every_\d+_minutes?$/i.test(String(a.schedule || "").trim());
+      const alwaysApprove = isScheduled ? false : a.alwaysApprove === true;
       const created = await this.threadsCreate({
         cwd,
         projectId: proj.id,
         title: `Automation: ${a.name}`,
         prompt: a.prompt,
-        alwaysApprove: a.alwaysApprove,
+        alwaysApprove,
         model: a.model,
       });
       this.automations.finishRun(run.id, {
