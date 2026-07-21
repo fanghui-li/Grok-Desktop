@@ -1,15 +1,24 @@
-import fs from "node:fs";
+﻿import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { acquireSingleInstance } from "../src/host/single-instance.js";
+import { DesktopHost } from "../src/host/host.js";
 import {
+  computeTrayBadge,
   extractHandoffPayload,
   extractNavView,
+  handoffFilePath,
   parseDeepLink,
   readAndClearHandoff,
   writeHandoff,
 } from "../src/host/shell-state.js";
+import {
+  shellEventFromLegacyActivity,
+  shellHandoffEvent,
+  shellNavigateEvent,
+  shellNoticeEvent,
+} from "../src/shared/events.js";
 
 const cleanups: Array<() => void> = [];
 
@@ -37,6 +46,64 @@ describe("handoff / deep link shell fixes", () => {
     expect(parseDeepLink("grok://automation/a1").kind).toBe("automation");
   });
 
+  it("shell event helpers and legacy activity mapping", () => {
+    expect(shellHandoffEvent("grok://focus").type).toBe("shell.handoff");
+    expect(shellNavigateEvent("command").view).toBe("command");
+    expect(shellNoticeEvent("agent_missing").code).toBe("agent_missing");
+    expect(shellEventFromLegacyActivity("nav:inbox")).toMatchObject({
+      type: "shell.navigate",
+      view: "inbox",
+    });
+    expect(shellEventFromLegacyActivity("handoff:grok://x")).toMatchObject({
+      type: "shell.handoff",
+      payload: "grok://x",
+    });
+    expect(shellEventFromLegacyActivity("system:agent_missing")?.type).toBe(
+      "shell.notice",
+    );
+    expect(shellEventFromLegacyActivity("working")).toBeNull();
+  });
+
+  it("computeTrayBadge supports zh locale labels", () => {
+    const en = computeTrayBadge(
+      [
+        {
+          sessionId: "a",
+          title: "t1",
+          cwd: "/x",
+          status: "needs_input",
+          source: "live",
+          updatedAt: new Date().toISOString(),
+        },
+      ],
+      [],
+      { locale: "en" },
+    );
+    expect(en.label).toContain("needs input");
+    const zh = computeTrayBadge(
+      [
+        {
+          sessionId: "a",
+          title: "t1",
+          cwd: "/x",
+          status: "needs_input",
+          source: "live",
+          updatedAt: new Date().toISOString(),
+        },
+      ],
+      [],
+      { locale: "zh-CN" },
+    );
+    expect(zh.label).toContain("待输入");
+  });
+
+  it("handoffFilePath is under desktop dir", () => {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "grok-handoff-path-"));
+    const f = handoffFilePath(home);
+    expect(f.endsWith(`${path.sep}handoff.json`)).toBe(true);
+    expect(f.includes("desktop")).toBe(true);
+  });
+
   it("primary TCP server persists secondary payload via writeHandoff", async () => {
     const home = fs.mkdtempSync(path.join(os.tmpdir(), "grok-handoff-tcp-"));
     const received: string[] = [];
@@ -61,8 +128,7 @@ describe("handoff / deep link shell fixes", () => {
 
     // Callback and/or FS handoff must see payload
     const fromFs = readAndClearHandoff(home);
-    const payload =
-      received[0] ?? fromFs?.payload ?? null;
+    const payload = received[0] ?? fromFs?.payload ?? null;
     expect(payload).toBe("grok://session/from-tcp");
     expect(extractHandoffPayload(`handoff:${payload}`)).toBe(
       "grok://session/from-tcp",
@@ -75,5 +141,27 @@ describe("handoff / deep link shell fixes", () => {
     const h = readAndClearHandoff(home);
     expect(h?.payload).toBe("grok://inbox/x");
     expect(readAndClearHandoff(home)).toBeNull();
+  });
+
+  it("Host handoff consumer is woken by shellWriteHandoff", async () => {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "grok-handoff-host-"));
+    const host = new DesktopHost({ home, grokPath: null, bundledPath: null });
+    cleanups.push(() => {
+      void host.dispose();
+    });
+    let n = 0;
+    host.shellSetHandoffConsumer(() => {
+      n += 1;
+    });
+    host.shellWriteHandoff("grok://focus");
+    await new Promise((r) => setTimeout(r, 80));
+    expect(n).toBeGreaterThanOrEqual(1);
+    const h = host.shellReadHandoff();
+    expect(h?.payload).toBe("grok://focus");
+    const watch = host.shellStartHandoffWatch();
+    expect(watch.path).toBe(handoffFilePath(home));
+    expect(["fs.watch", "poll"]).toContain(watch.mode);
+    host.shellStopHandoffWatch();
+    host.shellSetHandoffConsumer(null);
   });
 });

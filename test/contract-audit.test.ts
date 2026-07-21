@@ -68,6 +68,17 @@ describe("contract audit", () => {
     expect(main).toMatch(/e\.preventDefault\(\)/);
     expect(main).toMatch(/showMainWindow/);
     expect(main).toMatch(/isQuitting/);
+    expect(main).toMatch(/shellStartHandoffWatch/);
+    expect(main).toMatch(/shell\.navigate|shellNavigateEvent/);
+  });
+
+  it("shell control events and turn settle guard exist", () => {
+    const events = read("src/shared/events.ts");
+    expect(events).toMatch(/shell\.handoff/);
+    expect(events).toMatch(/shellEventFromLegacyActivity/);
+    const renderer = read("src/renderer/main.ts");
+    expect(renderer).toMatch(/Never force-end an active turn/);
+    expect(renderer).toMatch(/shell\.handoff/);
   });
 
   it("Host API product vocabulary and errors", () => {

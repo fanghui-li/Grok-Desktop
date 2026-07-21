@@ -4130,9 +4130,13 @@ function clearPlanApprovalWaitingUi(nextLabel?: string): void {
 
 /** invoke 返回后若仍 turnActive，延迟 endTurn，并回补 history */
 function scheduleTurnSettle(turnId: number): void {
+  // Never force-end an active turn from the 1.5s settle timer.
+  // (Previously endTurn() at 1.5s killed long tool runs while IPC still awaited.)
   window.setTimeout(() => {
-    if (turnActive && currentTurnId === turnId) {
-      endTurn();
+    if (currentTurnId !== turnId) return;
+    if (turnActive) {
+      // Still running - leave UI as-is; turn.completed / error path will settle.
+      return;
     }
     void afterTurnSettled();
   }, 1500);
@@ -8702,8 +8706,150 @@ async function handleDeepLinkPayload(payload: string): Promise<void> {
   }
 }
 
+function handleShellNavigate(view: "command" | "inbox" | string): void {
+  if (view === "inbox") {
+    void (async () => {
+      try {
+        const res = await inv<
+          Array<{
+            id: string;
+            title?: string;
+            body?: string;
+            read?: boolean;
+            type?: string;
+            createdAt?: string;
+            sessionId?: string;
+            threadId?: string;
+            projectId?: string;
+          }>
+        >("inbox.list", {});
+        const items = res.ok ? (res.data ?? []) : [];
+        const rows = items.length
+          ? items
+              .map((it) => {
+                const unread = it.read ? "" : " is-unread";
+                const when = it.createdAt
+                  ? esc(it.createdAt.replace("T", " ").slice(0, 16))
+                  : "";
+                return (
+                  '<div class="item inbox-item' +
+                  unread +
+                  '" data-inbox-id="' +
+                  esc(it.id) +
+                  '">' +
+                  '<div class="item-title">' +
+                  esc(it.title || it.type || "notice") +
+                  "</div>" +
+                  '<div class="item-sub">' +
+                  esc((it.body || "").slice(0, 200)) +
+                  "</div>" +
+                  '<div class="item-sub mono">' +
+                  esc(it.type || "") +
+                  " · " +
+                  when +
+                  "</div>" +
+                  '<div style="display:flex;gap:6px;margin-top:8px;flex-wrap:wrap">' +
+                  '<button type="button" class="btn-dark" data-inbox-act="open" data-id="' +
+                  esc(it.id) +
+                  '">' +
+                  esc(tr("common.open")) +
+                  "</button>" +
+                  '<button type="button" class="btn-ghost" data-inbox-act="dismiss" data-id="' +
+                  esc(it.id) +
+                  '">' +
+                  esc(tr("common.delete")) +
+                  "</button>" +
+                  "</div></div>"
+                );
+              })
+              .join("")
+          : '<div class="item-sub">' + esc(tr("common.none")) + "</div>";
+        openModal(
+          tr("nav.inbox"),
+          '<div style="display:flex;justify-content:flex-end;margin-bottom:8px">' +
+            '<button type="button" class="btn-ghost" id="btn-inbox-mark-all">' +
+            esc(tr("common.ok")) +
+            "</button></div><div class=\"inbox-list\">" +
+            rows +
+            "</div>",
+        );
+        const body = $("modal-body");
+        body.onclick = async (e) => {
+          const target = e.target;
+          if (!(target instanceof HTMLElement)) return;
+          if (target.id === "btn-inbox-mark-all") {
+            await inv("inbox.markAllRead");
+            handleShellNavigate("inbox");
+            return;
+          }
+          const act = target.dataset.inboxAct;
+          const id = target.dataset.id;
+          if (!act || !id) return;
+          const item = items.find((x) => x.id === id);
+          if (act === "open") {
+            if (item?.id) await inv("inbox.markRead", { id: item.id });
+            if (item?.sessionId) {
+              const row = threads.find((x) => x.sessionId === item.sessionId);
+              if (row) {
+                closeModal();
+                await openThread(row);
+              }
+            } else if (item?.projectId) {
+              selectedProjectId = item.projectId;
+              await refreshProjectsAndThreads();
+            }
+            return;
+          }
+          if (act === "dismiss") {
+            await inv("inbox.dismiss", { id });
+            handleShellNavigate("inbox");
+          }
+        };
+      } catch (err) {
+        showToast(
+          err instanceof Error ? err.message : tr("common.error"),
+          "error",
+        );
+      }
+    })();
+    return;
+  }
+  if (view === "command") {
+    try {
+      closeModal();
+    } catch {
+      /* ignore */
+    }
+    showWelcome(true);
+  }
+}
+
+function handleShellNotice(code: string, message?: string): void {
+  if (code === "agent_missing") {
+    showToast(message || tr("agent.missing"), "error");
+  } else if (message) {
+    showToast(message, "info");
+  }
+}
+
 function onEvent(raw: unknown): void {
   const ev = raw as NormalizedEvent & { activity?: string };
+  // Dedicated shell control bus (preferred over session.status activity)
+  if (ev.type === "shell.handoff") {
+    void handleDeepLinkPayload((ev as { payload?: string }).payload || "");
+    return;
+  }
+  if (ev.type === "shell.navigate") {
+    handleShellNavigate((ev as { view?: string }).view || "command");
+    return;
+  }
+  if (ev.type === "shell.notice") {
+    handleShellNotice(
+      (ev as { code?: string }).code || "",
+      (ev as { message?: string }).message,
+    );
+    return;
+  }
   // goal 与 agent 同源：不因 transcript 挂起而丢状态
   if (ev.type === "goal.updated") {
     applyAgentGoalEvent(ev);
@@ -8763,10 +8909,18 @@ function onEvent(raw: unknown): void {
   }
   // handoff / 全局状态始终处理
   if (ev.type === "session.status") {
+    // Legacy control bus (pre shell.* events) - keep for older host builds
+    if (ev.activity === "nav:inbox" || ev.activity === "nav:command") {
+      handleShellNavigate(ev.activity === "nav:inbox" ? "inbox" : "command");
+      return;
+    }
+    if (ev.activity === "system:agent_missing") {
+      handleShellNotice("agent_missing");
+      return;
+    }
     if (ev.activity?.startsWith("handoff:")) {
       void handleDeepLinkPayload(ev.activity.slice("handoff:".length));
     }
-    // 侧栏 working 点
     if (ev.sessionId) {
       const busy =
         ev.status === "working" ||

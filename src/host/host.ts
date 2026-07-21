@@ -155,6 +155,7 @@ import {
 import {
   buildVersionMatrix,
   computeTrayBadge,
+  handoffFilePath,
   parseDeepLink,
   readAndClearHandoff,
   writeHandoff,
@@ -206,6 +207,10 @@ export class DesktopHost {
   private fileTreeWatcher: fs.FSWatcher | null = null;
   private fileTreeWatchCwd: string | null = null;
   private fileTreeWatchTimer: ReturnType<typeof setTimeout> | null = null;
+  /** handoff.json FS watch + optional consumer (main process) */
+  private handoffWatcher: fs.FSWatcher | null = null;
+  private handoffWatchTimer: ReturnType<typeof setTimeout> | null = null;
+  private handoffConsumer: (() => void) | null = null;
 
   readonly projects: ProjectRegistry;
   readonly inbox: InboxStore;
@@ -251,14 +256,8 @@ export class DesktopHost {
       home: this.home,
       onSecondaryPayload: (payload) => {
         this.logger.info("single_instance.secondary_payload", { payload });
-        // FS handoff already written by TCP server; emit for in-process listeners
-        this.emit({
-          type: "session.status",
-          threadId: "",
-          sessionId: "",
-          status: "idle",
-          activity: `handoff:${payload}`,
-        } as never);
+        // FS already written by TCP layer; wake consumer (watch + main deliver)
+        this.notifyHandoffConsumer();
       },
     });
     this.logger.info("single_instance", {
@@ -2457,8 +2456,8 @@ export class DesktopHost {
 
   // ── S6 shell ─────────────────────────────────────────────
 
-  shellTrayBadge() {
-    return computeTrayBadge(this.rosterList(), this.inboxList());
+  shellTrayBadge(opts?: { locale?: string } | string) {
+    return computeTrayBadge(this.rosterList(), this.inboxList(), opts);
   }
 
   shellParseDeepLink(raw: string) {
@@ -2479,6 +2478,100 @@ export class DesktopHost {
 
   shellWriteHandoff(payload: string) {
     writeHandoff(payload, this.home);
+    this.notifyHandoffConsumer();
+  }
+
+  shellHandoffPath() {
+    return handoffFilePath(this.home);
+  }
+
+  /**
+   * Main registers a single consumer that read+deliver handoff (shows window).
+   * FS watch and TCP secondary both call notifyHandoffConsumer → debounced.
+   */
+  shellSetHandoffConsumer(fn: (() => void) | null): void {
+    this.handoffConsumer = typeof fn === "function" ? fn : null;
+  }
+
+  private notifyHandoffConsumer(): void {
+    if (!this.handoffConsumer || this.disposed) return;
+    if (this.handoffWatchTimer) clearTimeout(this.handoffWatchTimer);
+    this.handoffWatchTimer = setTimeout(() => {
+      this.handoffWatchTimer = null;
+      if (this.disposed || !this.handoffConsumer) return;
+      try {
+        this.handoffConsumer();
+      } catch (err) {
+        this.logger.warn("handoff.consumer_error", {
+          err: err instanceof Error ? err.message : String(err),
+        });
+      }
+    }, 50);
+  }
+
+  /**
+   * Watch desktop dir for handoff.json. Returns { watching, path, mode }.
+   * Falls back to polling if fs.watch fails.
+   */
+  shellStartHandoffWatch(): {
+    watching: boolean;
+    path: string;
+    mode: "fs.watch" | "poll";
+  } {
+    this.shellStopHandoffWatch();
+    const file = handoffFilePath(this.home);
+    const dir = path.dirname(file);
+    try {
+      fs.mkdirSync(dir, { recursive: true });
+    } catch {
+      /* ignore */
+    }
+    try {
+      const base = path.basename(file);
+      this.handoffWatcher = fs.watch(dir, (eventType, filename) => {
+        const name =
+          typeof filename === "string"
+            ? filename
+            : filename
+              ? String(filename)
+              : "";
+        // On some platforms filename may be empty; still notify.
+        if (name && name.toLowerCase() !== base.toLowerCase()) return;
+        if (eventType === "rename" || eventType === "change" || !name) {
+          this.notifyHandoffConsumer();
+        }
+      });
+      this.handoffWatcher.on("error", (err) => {
+        this.logger.warn("handoff.watch_error", {
+          err: err instanceof Error ? err.message : String(err),
+        });
+        this.shellStopHandoffWatch();
+      });
+      this.logger.info("handoff.watch_start", { path: file, mode: "fs.watch" });
+      // Drain any pending file from before watch attached
+      this.notifyHandoffConsumer();
+      return { watching: true, path: file, mode: "fs.watch" };
+    } catch (err) {
+      this.logger.warn("handoff.watch_unavailable", {
+        err: err instanceof Error ? err.message : String(err),
+      });
+      return { watching: false, path: file, mode: "poll" };
+    }
+  }
+
+  shellStopHandoffWatch(): void {
+    if (this.handoffWatchTimer) {
+      clearTimeout(this.handoffWatchTimer);
+      this.handoffWatchTimer = null;
+    }
+    if (this.handoffWatcher) {
+      try {
+        this.handoffWatcher.close();
+      } catch {
+        /* ignore */
+      }
+      this.handoffWatcher = null;
+    }
   }
 
   /** Secondary instance: notify primary with deep link / focus payload. */
@@ -2486,6 +2579,7 @@ export class DesktopHost {
     if (!this.single) await this.initSingleInstance();
     if (this.single?.isPrimary) {
       writeHandoff(payload, this.home);
+      this.notifyHandoffConsumer();
       return true;
     }
     writeHandoff(payload, this.home);
@@ -2522,6 +2616,8 @@ export class DesktopHost {
   async dispose(): Promise<void> {
     this.disposed = true;
     this.filesWatchStop();
+    this.shellStopHandoffWatch();
+    this.handoffConsumer = null;
     this.automations.stopAllTimers();
     for (const [tid, live] of this.threads) {
       if (live.client) await live.client.close().catch(() => undefined);

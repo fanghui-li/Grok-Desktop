@@ -180,6 +180,23 @@ export type NormalizedEvent =
       /** meta.tools 工具名集合（可选） */
       tools?: string[];
       raw?: unknown;
+    }
+  | {
+      type: "shell.handoff";
+      /** deep link / focus payload */
+      payload: string;
+      at?: string;
+    }
+  | {
+      type: "shell.navigate";
+      view: "command" | "inbox";
+      at?: string;
+    }
+  | {
+      type: "shell.notice";
+      code: string;
+      message?: string;
+      at?: string;
     };
 
 /** ACP AvailableCommand 精简形态 */
@@ -187,4 +204,65 @@ export interface AvailableCommandInfo {
   name: string;
   description?: string;
   input?: { hint?: string };
+}
+
+
+/** Shell-only control events on HOST_EVENT_CHANNEL (preferred over session.status activity). */
+export const SHELL_EVENT = {
+  handoff: "shell.handoff",
+  navigate: "shell.navigate",
+  notice: "shell.notice",
+} as const;
+
+export type ShellNavigateView = "command" | "inbox";
+
+export function shellHandoffEvent(payload: string): Extract<NormalizedEvent, { type: "shell.handoff" }> {
+  return {
+    type: SHELL_EVENT.handoff,
+    payload: String(payload ?? ""),
+    at: new Date().toISOString(),
+  };
+}
+
+export function shellNavigateEvent(
+  view: ShellNavigateView,
+): Extract<NormalizedEvent, { type: "shell.navigate" }> {
+  return {
+    type: SHELL_EVENT.navigate,
+    view,
+    at: new Date().toISOString(),
+  };
+}
+
+export function shellNoticeEvent(
+  code: string,
+  message?: string,
+): Extract<NormalizedEvent, { type: "shell.notice" }> {
+  return {
+    type: SHELL_EVENT.notice,
+    code,
+    message: message || undefined,
+    at: new Date().toISOString(),
+  };
+}
+
+/**
+ * Map legacy session.status activity fields used as a control bus.
+ * Returns a shell event object or null.
+ */
+export function shellEventFromLegacyActivity(
+  activity?: string | null,
+):
+  | Extract<NormalizedEvent, { type: "shell.handoff" }>
+  | Extract<NormalizedEvent, { type: "shell.navigate" }>
+  | Extract<NormalizedEvent, { type: "shell.notice" }>
+  | null {
+  if (!activity) return null;
+  if (activity === "nav:inbox") return shellNavigateEvent("inbox");
+  if (activity === "nav:command") return shellNavigateEvent("command");
+  if (activity === "system:agent_missing") return shellNoticeEvent("agent_missing");
+  if (activity.startsWith("handoff:")) {
+    return shellHandoffEvent(activity.slice("handoff:".length));
+  }
+  return null;
 }

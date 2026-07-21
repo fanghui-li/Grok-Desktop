@@ -32,7 +32,11 @@ export interface VersionMatrix {
 export function computeTrayBadge(
   roster: RosterEntry[],
   inbox: InboxItem[],
+  opts?: { locale?: string } | string,
 ): TrayBadgeState {
+  const locale =
+    typeof opts === "string" ? opts : opts?.locale || "en";
+  const zh = String(locale).toLowerCase().startsWith("zh");
   const unreadInbox = inbox.filter((i) => !i.read).length;
   const needsInput = roster.filter(
     (r) => r.status === "needs_input" || r.status === "blocked",
@@ -40,15 +44,21 @@ export function computeTrayBadge(
   const working = roster.filter((r) => r.status === "working").length;
   const badge = unreadInbox + needsInput;
   const parts: string[] = [];
-  if (needsInput) parts.push(`${needsInput} needs input`);
-  if (unreadInbox) parts.push(`${unreadInbox} inbox`);
-  if (working) parts.push(`${working} working`);
+  if (needsInput) {
+    parts.push(zh ? `${needsInput} 待输入` : `${needsInput} needs input`);
+  }
+  if (unreadInbox) {
+    parts.push(zh ? `${unreadInbox} 收件箱` : `${unreadInbox} inbox`);
+  }
+  if (working) {
+    parts.push(zh ? `${working} 运行中` : `${working} working`);
+  }
   return {
     unreadInbox,
     needsInput,
     working,
     badge,
-    label: parts.length ? parts.join(" · ") : "idle",
+    label: parts.length ? parts.join(" · ") : zh ? "空闲" : "idle",
   };
 }
 
@@ -167,10 +177,15 @@ export interface PendingHandoff {
   receivedAt: string;
 }
 
+/** Absolute path to handoff.json (FS bus between primary / secondary). */
+export function handoffFilePath(home?: string): string {
+  return path.join(desktopDir(home), "handoff.json");
+}
+
 /** Persist last secondary-instance payload for primary to consume. */
 export function writeHandoff(payload: string, home?: string): void {
   ensureDesktopDirs(home);
-  const f = path.join(desktopDir(home), "handoff.json");
+  const f = handoffFilePath(home);
   fs.writeFileSync(
     f,
     JSON.stringify({ payload, receivedAt: new Date().toISOString() }, null, 2),
@@ -179,7 +194,7 @@ export function writeHandoff(payload: string, home?: string): void {
 }
 
 export function readAndClearHandoff(home?: string): PendingHandoff | null {
-  const f = path.join(desktopDir(home), "handoff.json");
+  const f = handoffFilePath(home);
   if (!fs.existsSync(f)) return null;
   try {
     const data = JSON.parse(fs.readFileSync(f, "utf8")) as PendingHandoff;

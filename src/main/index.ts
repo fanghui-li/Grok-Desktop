@@ -23,6 +23,12 @@ import { readDesktopConfig } from "../host/extensibility.js";
 import { HOST_EVENT_CHANNEL, HOST_IPC_CHANNEL } from "../shared/host-api.js";
 import type { HostIpcMethod } from "../shared/host-api.js";
 import { HostError, isHostError } from "../shared/errors.js";
+import {
+  shellHandoffEvent,
+  shellNavigateEvent,
+  shellNoticeEvent,
+  type ShellNavigateView,
+} from "../shared/events.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 /** 应用根（dist/main → ../.. = 项目根） */
@@ -96,6 +102,7 @@ let host: DesktopHost | null = null;
 let mainWindow: BrowserWindow | null = null;
 let tray: Tray | null = null;
 let trayTimer: ReturnType<typeof setInterval> | null = null;
+let handoffPollTimer: ReturnType<typeof setInterval> | null = null;
 let isQuitting = false;
 
 function resultOk<T>(data: T) {
@@ -948,20 +955,59 @@ function sendToRenderer(payload: unknown): void {
 }
 
 function deliverHandoffPayload(payload: string): void {
-  sendToRenderer({
-    type: "session.status",
-    threadId: "",
-    sessionId: "",
-    status: "idle",
-    activity: `handoff:${payload}`,
-  });
+  // Dedicated shell.handoff (legacy session.status activity kept only for old hosts)
+  sendToRenderer(shellHandoffEvent(payload));
+}
+
+function deliverNavigate(view: ShellNavigateView): void {
+  sendToRenderer(shellNavigateEvent(view));
+}
+
+function deliverNotice(code: string, message?: string): void {
+  sendToRenderer(shellNoticeEvent(code, message));
+}
+
+/** Prefer Chinese tray copy when OS / Electron locale is zh*. */
+function isZhUi(): boolean {
+  try {
+    const loc = (app.getLocale?.() || process.env.LANG || "").toLowerCase();
+    return loc.startsWith("zh");
+  } catch {
+    return false;
+  }
+}
+
+function trayStrings(): {
+  show: string;
+  command: string;
+  inbox: string;
+  quit: string;
+  tipIdle: string;
+} {
+  if (isZhUi()) {
+    return {
+      show: "显示 Grok Desktop",
+      command: "命令中心",
+      inbox: "收件箱",
+      quit: "退出",
+      tipIdle: "空闲",
+    };
+  }
+  return {
+    show: "Show Grok Desktop",
+    command: "Command Center",
+    inbox: "Inbox",
+    quit: "Quit",
+    tipIdle: "idle",
+  };
 }
 
 function updateTray(): void {
   if (!host || !tray) return;
   try {
-    const badge = host.shellTrayBadge();
-    tray.setToolTip(`Grok Desktop — ${badge.label}`);
+    const badge = host.shellTrayBadge({ locale: isZhUi() ? "zh" : "en" });
+    const tip = badge.label || trayStrings().tipIdle;
+    tray.setToolTip(`Grok Desktop — ${tip}`);
     if (process.platform === "darwin") {
       tray.setTitle(badge.badge > 0 ? String(badge.badge) : "");
     }
@@ -980,28 +1026,33 @@ function createTray(): void {
             "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==",
           );
     tray = new Tray(img);
+    const labels = trayStrings();
     const menu = Menu.buildFromTemplate([
       {
-        label: "Show Grok Desktop",
+        label: labels.show,
         click: () => {
           void showMainWindow();
         },
       },
       {
-        label: "Command Center",
+        label: labels.command,
         click: () => {
-          sendToRenderer({
-            type: "session.status",
-            threadId: "",
-            sessionId: "",
-            status: "idle",
-            activity: "nav:command",
+          void showMainWindow().then(() => {
+            deliverNavigate("command");
+          });
+        },
+      },
+      {
+        label: labels.inbox,
+        click: () => {
+          void showMainWindow().then(() => {
+            deliverNavigate("inbox");
           });
         },
       },
       { type: "separator" },
       {
-        label: "Quit",
+        label: labels.quit,
         click: () => {
           isQuitting = true;
           app.quit();
@@ -1013,7 +1064,8 @@ function createTray(): void {
       void showMainWindow();
     });
     updateTray();
-    trayTimer = setInterval(updateTray, 5000);
+    // 8s is enough for badge freshness; cuts idle wake-ups vs 5s
+    trayTimer = setInterval(updateTray, 8000);
   } catch (err) {
     console.warn("Tray unavailable:", err);
   }
@@ -1033,6 +1085,10 @@ app.whenReady().then(async () => {
     console.warn(
       "[grok-desktop] grok binary not found. Place agent-bin/grok.exe or: npm run sync:agent",
     );
+    // Notify renderer after window is ready
+    setTimeout(() => {
+      deliverNotice("agent_missing");
+    }, 1500);
   }
   const si = await host.initSingleInstance();
   if (!si.isPrimary) {
@@ -1095,14 +1151,28 @@ app.whenReady().then(async () => {
   await createWindow();
   createTray();
 
-  // Consume handoff (FS + TCP-written) periodically
-  setInterval(() => {
+  // Handoff: FS watch (preferred) + slow poll fallback; single consumer path
+  const consumeHandoff = (): void => {
     if (!host) return;
     const h = host.shellReadHandoff();
-    if (h) {
+    if (h?.payload != null && h.payload !== "") {
       deliverHandoffPayload(h.payload);
+    } else if (h) {
+      // empty focus handoff still raises window
+      void showMainWindow();
     }
-  }, 1000);
+  };
+  host.shellSetHandoffConsumer(consumeHandoff);
+  const watchInfo = host.shellStartHandoffWatch();
+  console.log(
+    `[grok-desktop] handoff watch mode=${watchInfo.mode} path=${watchInfo.path}`,
+  );
+  if (!watchInfo.watching) {
+    // Rare: fs.watch failed — poll slowly as safety net
+    handoffPollTimer = setInterval(consumeHandoff, 3000);
+  }
+  // One immediate drain (boot race / pending file)
+  consumeHandoff();
 });
 
 app.on("window-all-closed", () => {
@@ -1119,6 +1189,15 @@ app.on("window-all-closed", () => {
 app.on("before-quit", () => {
   isQuitting = true;
   if (trayTimer) clearInterval(trayTimer);
+  trayTimer = null;
+  if (handoffPollTimer) clearInterval(handoffPollTimer);
+  handoffPollTimer = null;
+  try {
+    host?.shellStopHandoffWatch();
+    host?.shellSetHandoffConsumer(null);
+  } catch {
+    /* ignore */
+  }
   tray?.destroy();
   tray = null;
   void host?.dispose();
@@ -1130,6 +1209,10 @@ app.on("activate", () => {
 
 app.on("open-url", (event, url) => {
   event.preventDefault();
-  void host?.shellNotifyPrimary(url);
-  deliverHandoffPayload(url);
+  // Primary wakes handoff consumer; secondary notifies primary via TCP/FS.
+  if (host) {
+    void host.shellNotifyPrimary(url);
+  } else {
+    deliverHandoffPayload(url);
+  }
 });
