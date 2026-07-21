@@ -608,6 +608,41 @@ describe("saveQueue roundtrip", () => {
   });
 });
 
+describe("P2 fork partial failure flags", () => {
+  it("threadsFork reports historyCopied and sourceHistoryLines", async () => {
+    const home = tempHome();
+    const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "cwd-fork2-"));
+    homes.push(cwd);
+    const host = trackHost(
+      new DesktopHost({
+        home,
+        grokPath: process.execPath,
+        agentArgs: [fakeAgent],
+      }),
+    );
+    const created = await host.threadsCreate({ cwd, title: "src" });
+    // plant more history on source disk
+    let srcDir = host.findSessionDir(created.sessionId);
+    if (!srcDir) srcDir = plantSession(home, created.sessionId, cwd);
+    fs.appendFileSync(
+      path.join(srcDir, "chat_history.jsonl"),
+      JSON.stringify({ role: "user", content: "second" }) + "\n",
+      "utf8",
+    );
+    const forked = await host.threadsFork({
+      sourceSessionId: created.sessionId,
+      cwd,
+      title: "child",
+      directive: "continue please",
+    });
+    expect(forked.sessionId).not.toBe(created.sessionId);
+    expect(forked.sourceHistoryLines).toBeGreaterThan(0);
+    expect(forked.historyCopied).toBe(true);
+    expect(forked.directiveSent).toBe(true);
+    expect(forked.historyCopyError).toBeUndefined();
+  });
+});
+
 describe("P1 pin + roster cache", () => {
   it("threadsPin works for disk_ session and persists", () => {
     const home = tempHome();

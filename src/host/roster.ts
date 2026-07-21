@@ -12,6 +12,7 @@ type DiskRosterRow = {
   title: string;
   cwd: string;
   updatedAt: string;
+  createdAt: string;
   sessionKind?: string;
   parentSessionId?: string;
   isSubagent: boolean;
@@ -47,6 +48,7 @@ function loadDiskRosterRows(home?: string): DiskRosterRow[] {
         title: meta.title,
         cwd: meta.cwd,
         updatedAt: meta.updatedAt,
+        createdAt: meta.createdAt,
         sessionKind: meta.sessionKind,
         parentSessionId: meta.parentSessionId,
         isSubagent: meta.isSubagent,
@@ -79,6 +81,7 @@ export function buildRoster(opts: {
       status: t.status,
       source: "live",
       updatedAt: t.updatedAt,
+      createdAt: t.createdAt,
       pinned: t.pinned,
     });
   }
@@ -97,6 +100,7 @@ export function buildRoster(opts: {
       status: "inactive" as ThreadStatus,
       source: "disk",
       updatedAt: row.updatedAt,
+      createdAt: row.createdAt,
       sessionKind: row.sessionKind,
       parentSessionId: row.parentSessionId,
     });

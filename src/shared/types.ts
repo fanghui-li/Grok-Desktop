@@ -170,7 +170,8 @@ export interface HistoryEntry {
   /** role=tool 时：与直播过程块对齐 */
   toolCallId?: string;
   toolName?: string;
-  toolStatus?: "done" | "failed" | "running";
+  /** incomplete：历史中有 tool_call 无 tool_result（非成功完成） */
+  toolStatus?: "done" | "failed" | "running" | "incomplete";
   /** 调用参数（供 tool card 摘要） */
   toolInput?: unknown;
   /** 工具输出摘要/原文 */
@@ -207,6 +208,8 @@ export interface RosterEntry {
   activity?: string;
   source: "live" | "disk";
   updatedAt: string;
+  /** 磁盘 summary.created_at 或 live thread 创建时间 */
+  createdAt?: string;
   pinned?: boolean;
   sessionKind?: string;
   parentSessionId?: string;

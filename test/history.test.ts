@@ -22,6 +22,35 @@ describe("chat history parsing (UI transcript)", () => {
     expect(extractText("plain")).toBe("plain");
   });
 
+  it("pending tool_call without result is incomplete not done", () => {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "grok-hist-inc-"));
+    const cwdEnc = encodeURIComponent("D:\\tmp\\inc");
+    const sessionId = "sess_tool_inc";
+    const dir = path.join(home, ".grok-desktop", "sessions", cwdEnc, sessionId);
+    fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(
+      path.join(dir, "chat_history.jsonl"),
+      [
+        JSON.stringify({
+          type: "user",
+          content: [{ type: "text", text: "<user_query>\nhi\n</user_query>" }],
+        }),
+        JSON.stringify({
+          type: "assistant",
+          content: "",
+          tool_calls: [{ id: "tc1", name: "read_file" }],
+        }),
+        // no tool_result
+      ].join("\n"),
+      "utf8",
+    );
+    const page = loadChatHistory(sessionId, home);
+    const tools = page.entries.filter((e) => e.role === "tool");
+    expect(tools).toHaveLength(1);
+    expect(tools[0]?.toolStatus).toBe("incomplete");
+    expect(tools[0]?.toolName).toBe("read_file");
+  });
+
   it("skips system / synthetic; maps reasoning to thought; tool_result alone is tool", () => {
     expect(
       mapHistoryLine({

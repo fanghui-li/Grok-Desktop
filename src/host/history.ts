@@ -69,14 +69,14 @@ export function loadChatHistory(
     }
   }
 
-  // 未收到 result 的 tool_call：仍回放为已结束卡（无输出）
+  // 未收到 result 的 tool_call：标 incomplete（勿伪装成功完成）
   for (const [id, meta] of pendingTools) {
     entries.push({
       role: "tool",
       text: "",
       toolCallId: id,
       toolName: meta.name,
-      toolStatus: "done",
+      toolStatus: "incomplete",
       toolInput: meta.input,
     });
   }

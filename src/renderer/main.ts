@@ -5767,6 +5767,9 @@ async function forkSessionFrom(
     historyCopied?: boolean;
     parentSessionId?: string;
     directiveSent?: boolean;
+    historyCopyError?: string;
+    directiveError?: string;
+    sourceHistoryLines?: number;
   }>("threads.fork", {
     sourceSessionId: source.sessionId,
     cwd,
@@ -5802,10 +5805,23 @@ async function forkSessionFrom(
   }
   await openThread(row);
   await refreshProjectsAndThreads();
-  let msg = res.data?.historyCopied
+  const d = res.data!;
+  let msg = d.historyCopied
     ? tr("slash.forkOkCopied")
-    : tr("slash.forkOkEmpty");
-  if (res.data?.directiveSent) msg += " · " + tr("slash.forkDirectiveSent");
+    : (d.sourceHistoryLines ?? 0) > 0 || d.historyCopyError
+      ? tr("slash.forkOkCopyFailed", {
+          err: d.historyCopyError || tr("slash.forkCopyUnknown"),
+        })
+      : tr("slash.forkOkEmpty");
+  if (d.directiveSent) {
+    msg += " · " + tr("slash.forkDirectiveSent");
+  } else if (directive && d.directiveError) {
+    msg += " · " + tr("slash.forkDirectiveFail", { err: d.directiveError });
+  }
+  // 复制失败时用 error toast 更醒目（会话仍已打开）
+  if (!d.historyCopied && ((d.sourceHistoryLines ?? 0) > 0 || d.historyCopyError)) {
+    showToast(msg, "error");
+  }
   return { ok: true, message: msg };
 }
 
@@ -7980,6 +7996,7 @@ function replayHistoryTool(e: {
   toolInput?: unknown;
   toolOutput?: unknown;
   text?: string;
+  toolStatus?: string;
 }): void {
   const name = (e.toolName || "tool").trim() || "tool";
   const id = e.toolCallId || `hist_${name}_${processItemCount}`;
@@ -7991,9 +8008,57 @@ function replayHistoryTool(e: {
     (e.text
       ? { content: e.text, title: e.text.slice(0, 120) }
       : rawIn);
-  // 与直播路径相同：先 started 再 completed，共用 markTool*
   markToolStarted(name, id, rawIn);
-  markToolCompleted(id, name, rawOut);
+  // 无 tool_result：incomplete，勿伪装成功 ✓
+  if (e.toolStatus === "incomplete" || e.toolStatus === "running") {
+    markToolIncomplete(id, name);
+  } else if (e.toolStatus === "failed") {
+    markToolIncomplete(id, name, true);
+  } else {
+    markToolCompleted(id, name, rawOut);
+  }
+}
+
+/** 历史/异常：工具未完成（无 result 或失败） */
+function markToolIncomplete(
+  toolCallId?: string,
+  name?: string,
+  failed?: boolean,
+): void {
+  const el = $("transcript");
+  let row: HTMLElement | null = null;
+  if (toolCallId) {
+    row = el.querySelector(
+      `.line.tool[data-tool-id="${CSS.escape(toolCallId)}"]`,
+    ) as HTMLElement | null;
+  }
+  if (!row && name) {
+    const rows = Array.from(el.querySelectorAll(".line.tool.running"));
+    for (const r of rows) {
+      if ((r.textContent ?? "").includes(name)) {
+        row = r as HTMLElement;
+        break;
+      }
+    }
+  }
+  if (!row) {
+    const all = el.querySelectorAll(".line.tool.running");
+    row = (all[all.length - 1] as HTMLElement) ?? null;
+  }
+  if (!row) return;
+  row.classList.remove("running");
+  row.classList.add(failed ? "failed" : "incomplete");
+  const spin = row.querySelector(".tool-spin");
+  if (spin) {
+    spin.classList.add("done");
+    spin.textContent = failed ? "!" : "…";
+  }
+  const st = row.querySelector(".tool-state");
+  if (st) {
+    st.textContent = failed
+      ? tr("tool.failed") || "失败"
+      : tr("tool.incomplete") || "未完成";
+  }
 }
 
 /**

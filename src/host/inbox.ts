@@ -68,6 +68,22 @@ export class InboxStore {
     this.write(data);
   }
 
+  /** 仅标记匹配 requestId 的权限项已读（避免权限响应扫光全部 Inbox） */
+  markReadByRequestId(requestId: string): number {
+    const rid = requestId.trim();
+    if (!rid) return 0;
+    const data = this.read();
+    let n = 0;
+    for (const i of data.items) {
+      if (i.requestId === rid && !i.read) {
+        i.read = true;
+        n += 1;
+      }
+    }
+    if (n) this.write(data);
+    return n;
+  }
+
   markAllRead(): void {
     const data = this.read();
     for (const i of data.items) i.read = true;

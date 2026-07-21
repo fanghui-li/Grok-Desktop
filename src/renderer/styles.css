@@ -3169,6 +3169,11 @@ html[data-theme="dark"] .send-btn:hover { filter: brightness(0.92); }
   max-width: 100%;
   border: 1px solid var(--border-soft);
 }
+.line.tool.incomplete .tool-state,
+.line.tool.failed .tool-state {
+  color: var(--danger, #c44);
+  opacity: 0.9;
+}
 .line.tool.running {
   background: #fff7f2;
   border-color: #f0d0c0;

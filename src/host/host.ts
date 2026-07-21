@@ -197,6 +197,7 @@ import {
 } from "./prompt-queue.js";
 import {
   copySessionHistoryForFork,
+  countHistoryLines,
   writeForkSummary,
 } from "./fork-session.js";
 import { aggregateTasksLoose } from "./tasks-aggregate.js";
@@ -519,7 +520,7 @@ export class DesktopHost {
   // ── Threads ──────────────────────────────────────────────
 
   /**
-   * Live ACP threads + disk sessions under ~/.grok/sessions.
+   * Live ACP threads + disk sessions under ~/.grok-desktop/sessions.
    * Disk rows use id `disk_<sessionId>` until attach creates a live thread.
    */
   listThreads(): Thread[] {
@@ -578,7 +579,10 @@ export class DesktopHost {
         archived,
         sessionKind,
         parentSessionId,
-        createdAt: r.updatedAt,
+        createdAt:
+          r.createdAt ||
+          liveHit?.createdAt ||
+          r.updatedAt,
         updatedAt: r.updatedAt,
       });
     }
@@ -1419,6 +1423,11 @@ export class DesktopHost {
       parentSessionId: string;
       historyCopied: boolean;
       directiveSent?: boolean;
+      /** 源会话有历史但复制失败/未复制时的说明 */
+      historyCopyError?: string;
+      /** 指定了 directive 但发送失败 */
+      directiveError?: string;
+      sourceHistoryLines?: number;
     }
   > {
     this.assertNotDisposed();
@@ -1430,6 +1439,8 @@ export class DesktopHost {
     if (!srcDir) {
       throw new HostError("SESSION_NOT_FOUND", `Source session not found: ${sourceId}`);
     }
+
+    const sourceHistoryLines = countHistoryLines(srcDir);
 
     // 1) Create empty session (may create worktree via threadsCreate)
     const created = await this.threadsCreate({
@@ -1459,6 +1470,7 @@ export class DesktopHost {
       fs.mkdirSync(destDir, { recursive: true });
     }
     let historyCopied = false;
+    let historyCopyError: string | undefined;
     try {
       const copy = copySessionHistoryForFork(srcDir, destDir);
       historyCopied = copy.historyCopied;
@@ -1470,8 +1482,25 @@ export class DesktopHost {
         title: params.title,
         sourceSummaryPath: path.join(srcDir, "summary.json"),
       });
+      if (sourceHistoryLines > 0 && !historyCopied) {
+        historyCopyError =
+          copy.missing.length > 0
+            ? `missing: ${copy.missing.join(", ")}`
+            : "history not copied";
+        this.logger.warn("threads.fork_history_missing", {
+          sourceId,
+          sourceHistoryLines,
+          missing: copy.missing,
+        });
+      }
     } catch (err) {
-      this.logger.warn("threads.fork_copy_failed", { err: String(err) });
+      const msg = err instanceof Error ? err.message : String(err);
+      historyCopyError = msg;
+      this.logger.warn("threads.fork_copy_failed", { err: msg });
+      // 源有历史却复制异常：仍继续建分支，但向上返回错误说明
+      if (sourceHistoryLines > 0 && !historyCopyError) {
+        historyCopyError = msg;
+      }
     }
 
     // 4) Re-attach via session/load
@@ -1489,13 +1518,17 @@ export class DesktopHost {
 
     // 5) Optional first directive prompt
     let directiveSent = false;
+    let directiveError: string | undefined;
     const directive = params.directive?.trim();
     if (directive) {
       try {
         await this.turnsPrompt(liveThreadId, directive);
         directiveSent = true;
       } catch (err) {
-        this.logger.warn("threads.fork_directive_failed", { err: String(err) });
+        directiveError = err instanceof Error ? err.message : String(err);
+        this.logger.warn("threads.fork_directive_failed", {
+          err: directiveError,
+        });
       }
     }
 
@@ -1504,6 +1537,9 @@ export class DesktopHost {
       sessionId: created.sessionId,
       historyCopied,
       directiveSent,
+      historyCopyError,
+      directiveError,
+      sourceHistoryLines,
     });
 
     return {
@@ -1514,6 +1550,9 @@ export class DesktopHost {
       parentSessionId: sourceId,
       historyCopied,
       directiveSent,
+      historyCopyError,
+      directiveError,
+      sourceHistoryLines,
     };
   }
 
@@ -1815,11 +1854,23 @@ export class DesktopHost {
   }
 
   permissionsRespond(requestId: string, decision: PermissionDecision): void {
+    const rid = requestId?.trim();
+    if (!rid) {
+      throw new HostError("INVALID_ARGUMENT", "requestId required");
+    }
+    // 1) 精确匹配：仅响应持有该 requestId 的 client
+    for (const live of this.threads.values()) {
+      if (!live.client?.hasPermission(rid)) continue;
+      live.client.respondPermission(rid, decision);
+      this.inbox.markReadByRequestId(rid);
+      return;
+    }
+    // 2) 兼容旧路径：requestId 格式异常时再扫一遍（仍只 mark 该 requestId）
     for (const live of this.threads.values()) {
       if (!live.client) continue;
       try {
-        live.client.respondPermission(requestId, decision);
-        this.inbox.markAllRead(); // crude: mark permission items
+        live.client.respondPermission(rid, decision);
+        this.inbox.markReadByRequestId(rid);
         return;
       } catch (err) {
         if (isHostError(err) && err.code === "INVALID_ARGUMENT") continue;
@@ -1828,7 +1879,7 @@ export class DesktopHost {
     }
     throw new HostError(
       "INVALID_ARGUMENT",
-      `No pending permission request: ${requestId}`,
+      `No pending permission request: ${rid}`,
     );
   }
 
@@ -1843,7 +1894,7 @@ export class DesktopHost {
     return findSessionDir(sessionId, this.home);
   }
 
-  /** 会话上下文占用（读 ~/.grok/sessions/.../signals.json） */
+  /** 会话上下文占用（读 ~/.grok-desktop/sessions/.../signals.json） */
   sessionContext(sessionId: string): SessionContextUsage {
     return loadSessionContextUsage(sessionId, this.home);
   }
@@ -3364,6 +3415,8 @@ export class DesktopHost {
 
   private onClientEvent(threadId: string, ev: NormalizedEvent): void {
     const live = this.threads.get(threadId);
+    /** YOLO 自动批准成功时不向 UI 再弹 permission */
+    let suppressEmit = false;
     if (live) {
       live.lastActiveAtMs = Date.now();
     }
@@ -3396,6 +3449,7 @@ export class DesktopHost {
         "available_commands",
       );
     }
+    // YOLO 自动批准成功：不向 UI 再弹 permission 对话框
     if (ev.type === "permission.requested" && live) {
       // Build：always-approve 可在 plan 底下 armed；非 edit 类由 agent/yolo 或此处代批
       const yolo =
@@ -3409,7 +3463,7 @@ export class DesktopHost {
             requestId: ev.requestId,
             planActive: live.thread.planActive,
           });
-          // 仍下发事件供 UI 可选展示，但不进 Inbox 打扰
+          suppressEmit = true;
         } catch (err) {
           this.logger.warn("permission.auto_approve_failed", {
             threadId,
@@ -3567,7 +3621,7 @@ export class DesktopHost {
         this.logger.warn("task.project_failed", { err: String(err) });
       }
     }
-    this.emit(ev);
+    if (!suppressEmit) this.emit(ev);
   }
 
   private assertNotDisposed(): void {

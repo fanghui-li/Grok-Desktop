@@ -1,5 +1,5 @@
 /**
- * 会话元数据（归档等）持久化到 ~/.grok/desktop/thread-meta.json
+ * 会话元数据（归档等）持久化到 ~/.grok-desktop/desktop/thread-meta.json
  * 按 sessionId 索引，与 live ACP 线程解耦，磁盘会话同样可用。
  */
 import fs from "node:fs";

@@ -343,6 +343,8 @@ export const zhCN = {
 
   // ── tools / process ────────────────────────────────────
   "tool.completed": "已完成",
+  "tool.incomplete": "未完成",
+  "tool.failed": "失败",
   "tool.running": "运行中",
   "process.label": "过程",
   "process.expand": "点击展开详情",
@@ -474,6 +476,9 @@ export const zhCN = {
   "slash.forkFail": "派生失败",
   "slash.forkOkCopied": "已派生并复制历史",
   "slash.forkOkEmpty": "已派生（源会话无磁盘历史可复制）",
+  "slash.forkOkCopyFailed": "已派生，但历史复制失败：{err}",
+  "slash.forkCopyUnknown": "未知原因",
+  "slash.forkDirectiveFail": "首条指令未发送：{err}",
   "session.menuRename": "重命名",
   "session.menuExportClipboard": "复制为 Markdown",
   "session.menuExportFile": "导出为文件…",

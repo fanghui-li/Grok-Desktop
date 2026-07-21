@@ -356,6 +356,8 @@ export const enUS: MessageDict = {
 
   // ── tools / process ────────────────────────────────────
   "tool.completed": "Done",
+  "tool.incomplete": "Incomplete",
+  "tool.failed": "Failed",
   "tool.running": "Running",
   "process.label": "Process",
   "process.expand": "Click to expand",
@@ -491,6 +493,9 @@ export const enUS: MessageDict = {
   "slash.forkFail": "Fork failed",
   "slash.forkOkCopied": "Forked with history copied",
   "slash.forkOkEmpty": "Forked (no source history to copy)",
+  "slash.forkOkCopyFailed": "Forked, but history copy failed: {err}",
+  "slash.forkCopyUnknown": "unknown reason",
+  "slash.forkDirectiveFail": "First directive not sent: {err}",
   "session.menuRename": "Rename",
   "session.menuExportClipboard": "Copy as Markdown",
   "session.menuExportFile": "Export to file…",

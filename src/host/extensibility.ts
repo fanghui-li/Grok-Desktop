@@ -253,7 +253,7 @@ export function authLogout(home?: string): {
   return { cleared, authPath };
 }
 
-/** Desktop UI / defaults persisted under ~/.grok/desktop/settings.json */
+/** Desktop UI / defaults persisted under ~/.grok-desktop/desktop/settings.json */
 /** 默认访问权限（不含 plan；plan 是独立会话模式） */
 export type DesktopPermMode = "always_approve" | "normal";
 /** explorer | code | cursor | codium | windsurf | editor(遗留) */

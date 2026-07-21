@@ -865,6 +865,12 @@ export class AcpClient {
       : new HostError("INTERNAL", String(lastErr));
   }
 
+  /** 是否有未决 permission（含精确 requestId 或任意一个） */
+  hasPermission(requestId?: string): boolean {
+    if (requestId) return this.permissionWaiters.has(requestId);
+    return this.permissionWaiters.size > 0;
+  }
+
   respondPermission(
     requestId: string,
     decision: "allow_once" | "allow_session" | "allow_always" | "deny",
