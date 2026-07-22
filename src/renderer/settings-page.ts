@@ -224,6 +224,13 @@ export class SettingsPageController {
     return this.open;
   }
 
+  /** 语言切换后重绘当前设置分区 */
+  async refreshLocale(): Promise<void> {
+    if (!this.open) return;
+    this.renderNav();
+    await this.renderContent();
+  }
+
   async show(section?: SectionId): Promise<void> {
     this.open = true;
     if (section) this.section = section;
@@ -747,12 +754,10 @@ export class SettingsPageController {
 
       <section class="settings-block">
         <h2 class="settings-h2">${this.cb.esc(tr("settings.language"))}</h2>
-        <p class="settings-desc">${this.cb.esc(tr("settings.languageSub"))}</p>
         <div class="settings-card">
           <div class="settings-row">
             <div class="settings-row-text">
               <div class="settings-row-title">${this.cb.esc(tr("settings.language"))}</div>
-              <div class="settings-row-sub">${this.cb.esc(tr("settings.languageSub"))}</div>
             </div>
             <select id="cfg-locale" class="settings-select">
               <option value="system" ${locale === "system" ? "selected" : ""}>${this.cb.esc(tr("settings.language.system"))}</option>
@@ -765,7 +770,6 @@ export class SettingsPageController {
 
       <section class="settings-block">
         <h2 class="settings-h2">${this.cb.esc(tr("settings.defaultPerm"))}</h2>
-        <p class="settings-desc">${this.cb.esc(tr("settings.defaultPermDesc"))}</p>
         <div class="settings-choice-row">
           ${this.choiceCard("perm", "normal", mode === "normal", tr("settings.perm.normal"), tr("settings.perm.normalSub"))}
           ${this.choiceCard("perm", "always_approve", mode === "always_approve", tr("settings.perm.full"), tr("settings.perm.fullSub"))}
@@ -792,7 +796,6 @@ export class SettingsPageController {
 
       <section class="settings-block">
         <h2 class="settings-h2">${this.cb.esc(tr("settings.busySend"))}</h2>
-        <p class="settings-desc">${this.cb.esc(tr("settings.busySendDesc"))}</p>
         <div class="settings-choice-row">
           ${this.choiceCard(
             "busySend",
@@ -813,7 +816,6 @@ export class SettingsPageController {
 
       <section class="settings-block">
         <h2 class="settings-h2">${this.cb.esc(tr("settings.idleDetach"))}</h2>
-        <p class="settings-desc">${this.cb.esc(tr("settings.idleDetachDesc"))}</p>
         <div class="settings-card">
           <div class="settings-row">
             <div class="settings-row-text">
@@ -1734,43 +1736,139 @@ export class SettingsPageController {
     }
   }
 
-  private htmlAboutUpdateSection(): string {
+  /** 主按钮文案 / 模式：check | download | install | open | busy */
+  private aboutPrimaryMode(): {
+    mode: "check" | "download" | "install" | "open" | "busy";
+    label: string;
+    disabled: boolean;
+  } {
     const u = this.aboutUpdate;
-    const cur = u?.currentVersion ?? "—";
-    const latest = u?.latestVersion ?? "—";
-    const status = this.aboutUpdateStatusText();
     const phase = u?.phase ?? "idle";
     const canUpdate = Boolean(u?.canUpdate);
+    const latest = (u?.latestVersion || "").trim();
     const busy = phase === "checking" || phase === "downloading";
-    const showDownload =
-      canUpdate && (phase === "available" || (phase === "error" && !!u?.latestVersion));
-    const showInstall = canUpdate && phase === "downloaded";
-    const showProgress = phase === "downloading";
+    if (!canUpdate || u?.error === "dev-only") {
+      return {
+        mode: "open",
+        label: tr("settings.updateOpenReleases"),
+        disabled: false,
+      };
+    }
+    if (phase === "downloaded") {
+      return {
+        mode: "install",
+        label: tr("settings.updateInstall"),
+        disabled: false,
+      };
+    }
+    if (phase === "available" || (phase === "error" && latest)) {
+      return {
+        mode: "download",
+        label: latest
+          ? tr("settings.updateToVersion", { version: latest })
+          : tr("settings.updateDownload"),
+        disabled: busy,
+      };
+    }
+    if (phase === "downloading") {
+      return {
+        mode: "busy",
+        label: tr("settings.updateDownloading", {
+          percent: String(Math.round(u?.percent ?? 0)),
+        }),
+        disabled: true,
+      };
+    }
+    if (phase === "checking") {
+      return {
+        mode: "busy",
+        label: tr("settings.updateChecking"),
+        disabled: true,
+      };
+    }
+    return {
+      mode: "check",
+      label: tr("settings.updateCheck"),
+      disabled: false,
+    };
+  }
+
+  private aboutBannerText(): { text: string; tone: "info" | "ok" | "warn" | "hidden" } {
+    const u = this.aboutUpdate;
+    const phase = u?.phase ?? "idle";
+    const latest = (u?.latestVersion || "").trim();
+    if (!u?.canUpdate || u.error === "dev-only") {
+      return { text: tr("settings.updateDevOnly"), tone: "warn" };
+    }
+    if (phase === "available" || (phase === "error" && latest)) {
+      return {
+        text: tr("settings.updateDetected", { version: latest || "—" }),
+        tone: "info",
+      };
+    }
+    if (phase === "downloaded") {
+      return { text: tr("settings.updateDownloaded"), tone: "ok" };
+    }
+    if (phase === "downloading") {
+      return {
+        text: tr("settings.updateDownloading", {
+          percent: String(Math.round(u?.percent ?? 0)),
+        }),
+        tone: "info",
+      };
+    }
+    if (phase === "not-available") {
+      return { text: tr("settings.updateNotAvailable"), tone: "ok" };
+    }
+    if (phase === "error" && u.error && u.error !== "dev-only") {
+      return {
+        text: tr("settings.updateError", { message: u.error }),
+        tone: "warn",
+      };
+    }
+    if (phase === "checking") {
+      return { text: tr("settings.updateChecking"), tone: "info" };
+    }
+    return { text: tr("settings.updateIdle"), tone: "hidden" };
+  }
+
+  private htmlAboutUpdateSection(): string {
+    const u = this.aboutUpdate;
+    const cur = (u?.currentVersion || "—").replace(/^v/i, "");
+    const primary = this.aboutPrimaryMode();
+    const banner = this.aboutBannerText();
+    const showProgress = u?.phase === "downloading";
     const pct = Math.max(0, Math.min(100, Math.round(u?.percent ?? 0)));
-    const checkDisabled = !canUpdate || busy ? " disabled" : "";
-    const downloadDisabled = busy ? " disabled" : "";
+    const bannerClass =
+      banner.tone === "ok"
+        ? "about-hero-banner about-hero-banner--ok"
+        : banner.tone === "warn"
+          ? "about-hero-banner about-hero-banner--warn"
+          : "about-hero-banner";
     return `
       <section class="settings-block" id="settings-update-block">
-        <h2 class="settings-h2">${this.cb.esc(tr("settings.updateTitle"))}</h2>
-        <div class="settings-card">
-          <div class="settings-kv"><span>${this.cb.esc(tr("settings.updateCurrent"))}</span><span class="mono" id="upd-current">${this.cb.esc(cur)}</span></div>
-          <div class="settings-kv"><span>${this.cb.esc(tr("settings.updateLatest"))}</span><span class="mono" id="upd-latest">${this.cb.esc(latest)}</span></div>
-          <div class="settings-row-sub" id="upd-status">${this.cb.esc(status)}</div>
-          ${
-            showProgress
-              ? `<div class="settings-update-progress" id="upd-progress-wrap" aria-hidden="false">
+        <div class="about-hero-card">
+          <div class="about-hero-row">
+            <div class="about-hero-brand">
+              <img class="about-hero-icon" src="./favicon.png" width="48" height="48" alt="" />
+              <div class="about-hero-brand-text">
+                <div class="about-hero-name">${this.cb.esc(tr("settings.appName"))}</div>
+                <span class="about-hero-ver-badge" id="upd-current">${this.cb.esc(
+                  tr("settings.updateVersionBadge", { version: cur }),
+                )}</span>
+              </div>
+            </div>
+            <div class="about-hero-actions">
+              <button type="button" class="about-hero-btn" id="btn-upd-github">${this.cb.esc(tr("settings.updateGithub"))}</button>
+              <button type="button" class="about-hero-btn about-hero-btn--primary" id="btn-upd-primary" data-mode="${primary.mode}"${primary.disabled ? " disabled" : ""}>${this.cb.esc(primary.label)}</button>
+            </div>
+          </div>
+          <div class="${bannerClass}" id="upd-banner"${banner.tone === "hidden" && !(u?.phase === "checking") ? " hidden" : ""}>${this.cb.esc(banner.text)}</div>
+          <div class="settings-update-progress about-hero-progress" id="upd-progress-wrap"${showProgress ? "" : " hidden"}>
             <div class="settings-update-progress-bar" id="upd-progress-bar" style="width:${pct}%"></div>
-          </div>`
-              : `<div class="settings-update-progress" id="upd-progress-wrap" hidden>
-            <div class="settings-update-progress-bar" id="upd-progress-bar" style="width:0%"></div>
-          </div>`
-          }
-        </div>
-        <div class="settings-inline-actions settings-update-actions">
-          <button type="button" class="btn-dark settings-mini-btn" id="btn-upd-check"${checkDisabled}>${this.cb.esc(tr("settings.updateCheck"))}</button>
-          <button type="button" class="btn-dark settings-mini-btn" id="btn-upd-download"${showDownload ? downloadDisabled : " hidden"}${downloadDisabled}>${this.cb.esc(tr("settings.updateDownload"))}</button>
-          <button type="button" class="btn-dark settings-mini-btn" id="btn-upd-install"${showInstall ? "" : " hidden"}>${this.cb.esc(tr("settings.updateInstall"))}</button>
-          <button type="button" class="btn-ghost settings-mini-btn" id="btn-upd-releases">${this.cb.esc(tr("settings.updateOpenReleases"))}</button>
+          </div>
+          <span class="hidden" id="upd-status" hidden>${this.cb.esc(this.aboutUpdateStatusText())}</span>
+          <span class="hidden" id="upd-latest" hidden>${this.cb.esc(u?.latestVersion ?? "")}</span>
         </div>
       </section>`;
   }
@@ -1779,31 +1877,43 @@ export class SettingsPageController {
     const host = root ?? document.getElementById("settings-content");
     if (!host) return;
     const u = this.aboutUpdate;
-    const statusEl = host.querySelector("#upd-status");
+    const curRaw = (u?.currentVersion || "—").replace(/^v/i, "");
     const curEl = host.querySelector("#upd-current");
     const latestEl = host.querySelector("#upd-latest");
+    const statusEl = host.querySelector("#upd-status");
+    const banner = host.querySelector("#upd-banner") as HTMLElement | null;
     const bar = host.querySelector("#upd-progress-bar") as HTMLElement | null;
     const wrap = host.querySelector("#upd-progress-wrap") as HTMLElement | null;
-    const btnCheck = host.querySelector("#btn-upd-check") as HTMLButtonElement | null;
-    const btnDl = host.querySelector("#btn-upd-download") as HTMLButtonElement | null;
-    const btnInst = host.querySelector("#btn-upd-install") as HTMLButtonElement | null;
-    if (curEl) curEl.textContent = u?.currentVersion ?? "—";
-    if (latestEl) latestEl.textContent = u?.latestVersion ?? "—";
+    const btnPrimary = host.querySelector(
+      "#btn-upd-primary",
+    ) as HTMLButtonElement | null;
+    if (curEl) {
+      curEl.textContent = tr("settings.updateVersionBadge", { version: curRaw });
+    }
+    if (latestEl) latestEl.textContent = u?.latestVersion ?? "";
     if (statusEl) statusEl.textContent = this.aboutUpdateStatusText();
+    const b = this.aboutBannerText();
+    if (banner) {
+      banner.textContent = b.text;
+      banner.className =
+        b.tone === "ok"
+          ? "about-hero-banner about-hero-banner--ok"
+          : b.tone === "warn"
+            ? "about-hero-banner about-hero-banner--warn"
+            : "about-hero-banner";
+      const hide =
+        b.tone === "hidden" &&
+        u?.phase !== "checking" &&
+        u?.phase !== "downloading";
+      banner.hidden = hide;
+    }
+    const primary = this.aboutPrimaryMode();
+    if (btnPrimary) {
+      btnPrimary.textContent = primary.label;
+      btnPrimary.dataset.mode = primary.mode;
+      btnPrimary.disabled = primary.disabled;
+    }
     const phase = u?.phase ?? "idle";
-    const canUpdate = Boolean(u?.canUpdate);
-    const busy = phase === "checking" || phase === "downloading";
-    if (btnCheck) btnCheck.disabled = !canUpdate || busy;
-    if (btnDl) {
-      const show =
-        canUpdate &&
-        (phase === "available" || (phase === "error" && !!u?.latestVersion));
-      btnDl.hidden = !show;
-      btnDl.disabled = busy;
-    }
-    if (btnInst) {
-      btnInst.hidden = !(canUpdate && phase === "downloaded");
-    }
     if (wrap && bar) {
       if (phase === "downloading") {
         wrap.hidden = false;
@@ -1839,13 +1949,7 @@ export class SettingsPageController {
   }
 
   private async htmlAbout(): Promise<string> {
-    const [ver, auth, info, upd] = await Promise.all([
-      this.cb.inv<Record<string, unknown>>("shell.versionMatrix"),
-      this.cb.inv<{
-        authenticated: boolean;
-        label?: string;
-        grokHome?: string;
-      }>("system.auth.status"),
+    const [info, upd] = await Promise.all([
       this.cb.inv<{
         path: string | null;
         version: string | null;
@@ -1888,13 +1992,8 @@ export class SettingsPageController {
         releasesUrl: "https://github.com/fanghui-li/Grok-Desktop/releases",
       };
     }
-    const a = auth.data;
     const g = info.data;
-    const v = ver.data ?? {};
     const meta = g?.agentBinMeta;
-    const authLine = a?.authenticated
-      ? `${tr("settings.loggedIn")}${a.label ? ` · ${this.cb.esc(a.label)}` : ""}`
-      : tr("settings.loggedOut");
     const sourceLabel =
       g?.source === "bundled"
         ? tr("settings.source.bundled")
@@ -1919,16 +2018,6 @@ export class SettingsPageController {
       <h1 class="settings-title">${this.cb.esc(tr("settings.aboutTitle"))}</h1>
       ${this.htmlAboutUpdateSection()}
       <section class="settings-block">
-        <h2 class="settings-h2">${this.cb.esc(tr("settings.accountSummary"))}</h2>
-        <div class="settings-card">
-          <div class="settings-kv"><span>${this.cb.esc(tr("settings.officialAccount"))}</span><span>${authLine}</span></div>
-          <div class="settings-kv"><span>${this.cb.esc(tr("settings.desktopHome"))}</span><span class="mono">${this.cb.esc(a?.grokHome ?? this.cfg.paths?.grokHome ?? "—")}</span></div>
-        </div>
-        <div class="settings-inline-actions">
-          <button type="button" class="btn-dark settings-mini-btn" id="btn-goto-account">${this.cb.esc(tr("settings.manageAccount"))}</button>
-        </div>
-      </section>
-      <section class="settings-block">
         <h2 class="settings-h2">${this.cb.esc(tr("settings.runtime"))}</h2>
         <div class="settings-card">
           <div class="settings-kv"><span>${this.cb.esc(tr("settings.grokPath"))}</span><span class="mono">${this.cb.esc(g?.path ?? "—")}</span></div>
@@ -1937,27 +2026,23 @@ export class SettingsPageController {
           ${metaRows}
         </div>
       </section>
-      <section class="settings-block">
-        <h2 class="settings-h2">${this.cb.esc(tr("settings.diagnostics"))}</h2>
-        <pre class="settings-pre">${this.cb.esc(JSON.stringify(v, null, 2))}</pre>
-      </section>
     `;
   }
 
   private bindAbout(root: HTMLElement): void {
-    const go = root.querySelector("#btn-goto-account") as HTMLElement | null;
-    if (go) {
-      go.onclick = () => {
-        this.section = "account";
-        this.renderNav();
-        void this.renderContent();
-      };
-    }
+    const releasesUrl =
+      () =>
+        this.aboutUpdate?.releasesUrl ||
+        "https://github.com/fanghui-li/Grok-Desktop/releases";
+    const openUrl = (url: string) => {
+      void this.cb.inv("system.openExternal", { url });
+    };
     const setBusy = (busy: boolean) => {
-      const check = root.querySelector("#btn-upd-check") as HTMLButtonElement | null;
-      const dl = root.querySelector("#btn-upd-download") as HTMLButtonElement | null;
-      if (check && this.aboutUpdate?.canUpdate) check.disabled = busy;
-      if (dl) dl.disabled = busy;
+      const primary = root.querySelector(
+        "#btn-upd-primary",
+      ) as HTMLButtonElement | null;
+      if (primary && busy) primary.disabled = true;
+      else this.applyAboutUpdateDom(root);
     };
     const applyState = (data: {
       phase: string;
@@ -1981,77 +2066,82 @@ export class SettingsPageController {
       };
       this.applyAboutUpdateDom(root);
     };
-    const btnCheck = root.querySelector("#btn-upd-check") as HTMLButtonElement | null;
-    if (btnCheck) {
-      btnCheck.onclick = () => {
+    const runCheck = async () => {
+      setBusy(true);
+      const res = await this.cb.inv<Parameters<typeof applyState>[0]>(
+        "app.update.check",
+      );
+      if (res.ok && res.data) applyState(res.data);
+      else {
+        this.aboutUpdate = {
+          ...(this.aboutUpdate ?? {
+            currentVersion: "—",
+            canUpdate: false,
+            releasesUrl: releasesUrl(),
+          }),
+          phase: "error",
+          error: res.error?.message ?? "check failed",
+        };
+        this.applyAboutUpdateDom(root);
+      }
+      setBusy(false);
+    };
+    const runDownload = async () => {
+      setBusy(true);
+      const res = await this.cb.inv<Parameters<typeof applyState>[0]>(
+        "app.update.download",
+      );
+      if (res.ok && res.data) applyState(res.data);
+      else {
+        this.aboutUpdate = {
+          ...(this.aboutUpdate ?? {
+            currentVersion: "—",
+            canUpdate: false,
+            releasesUrl: releasesUrl(),
+          }),
+          phase: "error",
+          error: res.error?.message ?? "download failed",
+        };
+        this.applyAboutUpdateDom(root);
+      }
+      setBusy(false);
+    };
+    const btnPrimary = root.querySelector(
+      "#btn-upd-primary",
+    ) as HTMLButtonElement | null;
+    if (btnPrimary) {
+      btnPrimary.onclick = () => {
         void (async () => {
-          setBusy(true);
-          const res = await this.cb.inv<Parameters<typeof applyState>[0]>(
-            "app.update.check",
-          );
-          if (res.ok && res.data) applyState(res.data);
-          else {
-            this.aboutUpdate = {
-              ...(this.aboutUpdate ?? {
-                currentVersion: "—",
-                canUpdate: false,
-                releasesUrl:
-                  "https://github.com/fanghui-li/Grok-Desktop/releases",
-              }),
-              phase: "error",
-              error: res.error?.message ?? "check failed",
-            };
-            this.applyAboutUpdateDom(root);
+          const mode = btnPrimary.dataset.mode || this.aboutPrimaryMode().mode;
+          if (mode === "open") {
+            openUrl(releasesUrl());
+            return;
           }
-          setBusy(false);
+          if (mode === "install") {
+            const res = await this.cb.inv("app.update.install");
+            if (!res.ok) {
+              window.alert(
+                res.error?.message ??
+                  tr("settings.updateError", { message: "—" }),
+              );
+            }
+            return;
+          }
+          if (mode === "download") {
+            await runDownload();
+            return;
+          }
+          if (mode === "check" || mode === "busy") {
+            if (mode === "busy") return;
+            await runCheck();
+          }
         })();
       };
     }
-    const btnDl = root.querySelector("#btn-upd-download") as HTMLButtonElement | null;
-    if (btnDl) {
-      btnDl.onclick = () => {
-        void (async () => {
-          setBusy(true);
-          const res = await this.cb.inv<Parameters<typeof applyState>[0]>(
-            "app.update.download",
-          );
-          if (res.ok && res.data) applyState(res.data);
-          else {
-            this.aboutUpdate = {
-              ...(this.aboutUpdate ?? {
-                currentVersion: "—",
-                canUpdate: false,
-                releasesUrl:
-                  "https://github.com/fanghui-li/Grok-Desktop/releases",
-              }),
-              phase: "error",
-              error: res.error?.message ?? "download failed",
-            };
-            this.applyAboutUpdateDom(root);
-          }
-          setBusy(false);
-        })();
-      };
-    }
-    const btnInst = root.querySelector("#btn-upd-install") as HTMLButtonElement | null;
-    if (btnInst) {
-      btnInst.onclick = () => {
-        void (async () => {
-          const res = await this.cb.inv("app.update.install");
-          if (!res.ok) {
-            window.alert(res.error?.message ?? tr("settings.updateError", { message: "—" }));
-          }
-        })();
-      };
-    }
-    const btnRel = root.querySelector("#btn-upd-releases") as HTMLButtonElement | null;
-    if (btnRel) {
-      btnRel.onclick = () => {
-        const url =
-          this.aboutUpdate?.releasesUrl ||
-          "https://github.com/fanghui-li/Grok-Desktop/releases";
-        void this.cb.inv("system.openExternal", { url });
-      };
+    const btnGh = root.querySelector("#btn-upd-github") as HTMLButtonElement | null;
+    if (btnGh) {
+      btnGh.onclick = () =>
+        openUrl("https://github.com/fanghui-li/Grok-Desktop");
     }
   }
 
@@ -2110,8 +2200,6 @@ export class SettingsPageController {
             .join("");
     return `
       <h1 class="settings-title">${this.cb.esc(tr("settings.memoryTitle"))}</h1>
-      <p class="settings-desc">${this.cb.esc(tr("settings.memoryDesc"))}</p>
-      <div class="settings-callout">${this.cb.esc(s?.productNote || tr("memory.productNote"))}</div>
       <div class="settings-card">
         <div class="settings-row">
           <div class="settings-row-text">
@@ -2145,7 +2233,6 @@ export class SettingsPageController {
             : ""
         }
       </div>
-      <p class="settings-desc">${this.cb.esc(tr("memory.slashHint"))}</p>
     `;
   }
 

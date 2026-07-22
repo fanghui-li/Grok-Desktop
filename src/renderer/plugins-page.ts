@@ -203,6 +203,13 @@ export class PluginsPageController {
     return this.open;
   }
 
+  /** 语言切换后刷新标题/占位/列表文案（须在插件页打开时） */
+  refreshLocale(): void {
+    if (!this.open) return;
+    this.syncChrome();
+    this.renderBody();
+  }
+
   async show(tab?: TabId): Promise<void> {
     this.open = true;
     if (tab) this.tab = tab;
@@ -470,8 +477,18 @@ export class PluginsPageController {
       return;
     }
     if (action === "market-remove" && t.dataset.url) {
-      if (!confirm(`移除市场源并卸载其插件？\n${t.dataset.url}`)) return;
-      await this.runMut("plugins.marketplace.remove", { url: t.dataset.url }, "移除市场源…");
+      if (
+        !confirm(
+          tr("plug.confirmMarketRemove", { url: t.dataset.url }),
+        )
+      ) {
+        return;
+      }
+      await this.runMut(
+        "plugins.marketplace.remove",
+        { url: t.dataset.url },
+        tr("plug.removingMarket"),
+      );
       return;
     }
     if (action === "market-refresh") {
@@ -642,18 +659,18 @@ export class PluginsPageController {
     const footer = document.getElementById("plugins-footer");
 
     if (this.tab === "plugins") {
-      if (title) title.textContent = "插件";
-      if (search) search.placeholder = "搜索插件…";
+      if (title) title.textContent = tr("plug.titlePlugins");
+      if (search) search.placeholder = tr("plug.searchPlugins");
       if (chips) {
         chips.classList.remove("hidden");
         chips.innerHTML = `
-          ${this.chip("user", "个人")}
-          ${this.chip("project", "项目")}`;
+          ${this.chip("user", tr("plug.scope.user"))}
+          ${this.chip("project", tr("plug.scope.project"))}`;
       }
       if (footer) {
         footer.innerHTML = `
-          <button type="button" class="plugins-link-btn" data-action="reload">刷新</button>
-          <button type="button" class="plugins-link-btn" data-action="open-plugins-dir">打开 Plugins 目录</button>`;
+          <button type="button" class="plugins-link-btn" data-action="reload">${this.cb.esc(tr("plug.refresh"))}</button>
+          <button type="button" class="plugins-link-btn" data-action="open-plugins-dir">${this.cb.esc(tr("plug.openPluginsDir"))}</button>`;
       }
     } else if (this.tab === "market") {
       if (title) title.textContent = tr("plug.titleMarket");
@@ -673,11 +690,11 @@ export class PluginsPageController {
       }
       if (footer) {
         footer.innerHTML = `
-          <button type="button" class="plugins-link-btn" data-action="reload">刷新目录</button>
-          <button type="button" class="plugins-link-btn" data-action="market-refresh">更新所有源</button>`;
+          <button type="button" class="plugins-link-btn" data-action="reload">${this.cb.esc(tr("plug.refreshCatalog"))}</button>
+          <button type="button" class="plugins-link-btn" data-action="market-refresh">${this.cb.esc(tr("plug.updateAllSources"))}</button>`;
       }
     } else if (this.tab === "mcp") {
-      if (title) title.textContent = "MCP";
+      if (title) title.textContent = tr("plug.titleMcp");
       if (search) search.placeholder = tr("plug.searchMcp");
       if (chips) {
         chips.classList.add("hidden");
@@ -685,23 +702,23 @@ export class PluginsPageController {
       }
       if (footer) {
         footer.innerHTML = `
-          <button type="button" class="plugins-link-btn" data-action="reload">刷新</button>
-          <button type="button" class="plugins-link-btn" data-action="open-mcp-config">编辑 MCP 配置</button>
-          <button type="button" class="plugins-link-btn" data-action="mcp-doctor">MCP doctor</button>`;
+          <button type="button" class="plugins-link-btn" data-action="reload">${this.cb.esc(tr("plug.refresh"))}</button>
+          <button type="button" class="plugins-link-btn" data-action="open-mcp-config">${this.cb.esc(tr("plug.editMcpConfig"))}</button>
+          <button type="button" class="plugins-link-btn" data-action="mcp-doctor">${this.cb.esc(tr("plug.mcpDoctor"))}</button>`;
       }
     } else {
-      if (title) title.textContent = "技能";
-      if (search) search.placeholder = "搜索技能…";
+      if (title) title.textContent = tr("plug.titleSkills");
+      if (search) search.placeholder = tr("plug.searchSkills");
       if (chips) {
         chips.classList.remove("hidden");
         chips.innerHTML = `
-          ${this.chip("user", "个人")}
-          ${this.chip("project", "项目")}`;
+          ${this.chip("user", tr("plug.scope.user"))}
+          ${this.chip("project", tr("plug.scope.project"))}`;
       }
       if (footer) {
         footer.innerHTML = `
           <button type="button" class="plugins-link-btn" data-action="create-skill">${this.cb.esc(tr("plug.createSkill"))}</button>
-          <button type="button" class="plugins-link-btn" data-action="reload">刷新</button>
+          <button type="button" class="plugins-link-btn" data-action="reload">${this.cb.esc(tr("plug.refresh"))}</button>
           <button type="button" class="plugins-link-btn" data-action="open-skills-dir">${this.cb.esc(tr("plug.openSkillsDir"))}</button>`;
       }
     }
@@ -855,17 +872,17 @@ export class PluginsPageController {
 
     let html = "";
     html += `<section class="plugins-section">
-      <h2 class="plugins-section-title">安装插件</h2>
+      <h2 class="plugins-section-title">${this.cb.esc(tr("plug.installSection"))}</h2>
       <div class="plugins-form-row">
-        <input id="plugin-install-source" class="plugins-input" placeholder="user/repo、git URL 或本地路径" />
-        <button type="button" class="plugins-card-btn primary" data-action="install-custom" id="btn-plugin-install">安装</button>
+        <input id="plugin-install-source" class="plugins-input" placeholder="${this.cb.esc(tr("plug.installPh"))}" />
+        <button type="button" class="plugins-card-btn primary" data-action="install-custom" id="btn-plugin-install">${this.cb.esc(tr("plug.install"))}</button>
       </div>
-      <p class="plugins-form-hint">等同 <span class="mono">grok plugin install &lt;source&gt; --trust</span></p>
+      <p class="plugins-form-hint">${this.cb.esc(tr("plug.installHint"))}</p>
     </section>`;
 
     if (plugs.length) {
       html += `<section class="plugins-section">
-        <h2 class="plugins-section-title">插件 · ${plugs.length}</h2>
+        <h2 class="plugins-section-title">${this.cb.esc(tr("plug.listTitle", { n: plugs.length }))}</h2>
         <div class="plugins-grid">
           ${plugs.map((p) => this.pluginCard(p, false)).join("")}
         </div>
@@ -884,24 +901,24 @@ export class PluginsPageController {
       ),
     );
     return `<section class="plugins-section">
-      <h2 class="plugins-section-title">添加 MCP</h2>
+      <h2 class="plugins-section-title">${this.cb.esc(tr("plug.addMcp"))}</h2>
       <div class="plugins-form-card">
         <div class="plugins-form-grid">
-          <input id="mcp-add-name" class="plugins-input" placeholder="名称" />
+          <input id="mcp-add-name" class="plugins-input" placeholder="${this.cb.esc(tr("plug.mcpName"))}" />
           <select id="mcp-add-transport" class="plugins-input">
             <option value="stdio">stdio</option>
             <option value="http">http</option>
             <option value="sse">sse</option>
           </select>
-          <input id="mcp-add-cmd" class="plugins-input" placeholder="命令 或 URL" />
-          <input id="mcp-add-args" class="plugins-input" placeholder="stdio 参数（空格分隔，可选）" />
+          <input id="mcp-add-cmd" class="plugins-input" placeholder="${this.cb.esc(tr("plug.mcpCmd"))}" />
+          <input id="mcp-add-args" class="plugins-input" placeholder="${this.cb.esc(tr("plug.mcpArgs"))}" />
         </div>
-        <button type="button" class="plugins-card-btn primary" data-action="mcp-add-submit">添加 MCP</button>
+        <button type="button" class="plugins-card-btn primary" data-action="mcp-add-submit">${this.cb.esc(tr("plug.mcpAddBtn"))}</button>
       </div>
-      <p class="plugins-form-hint">等同 <span class="mono">grok mcp add</span> · 配置写入 Desktop GROK_HOME</p>
+      <p class="plugins-form-hint">${this.cb.esc(tr("plug.mcpHint"))}</p>
     </section>
     <section class="plugins-section">
-      <h2 class="plugins-section-title">已配置 · ${mcps.length}</h2>
+      <h2 class="plugins-section-title">${this.cb.esc(tr("plug.mcpConfigured", { n: mcps.length }))}</h2>
       ${
         mcps.length
           ? `<div class="plugins-grid">${mcps.map((m) => this.mcpCard(m)).join("")}</div>`
@@ -912,10 +929,10 @@ export class PluginsPageController {
 
   private marketSections(): string {
     let html = `<section class="plugins-section">
-      <h2 class="plugins-section-title">市场源 · ${this.markets.length}</h2>
+      <h2 class="plugins-section-title">${this.cb.esc(tr("plug.marketSources", { n: this.markets.length }))}</h2>
       <div class="plugins-form-row">
-        <input id="market-add-url" class="plugins-input" placeholder="git URL 或 user/repo" />
-        <button type="button" class="plugins-card-btn primary" data-action="market-add-submit">添加源</button>
+        <input id="market-add-url" class="plugins-input" placeholder="${this.cb.esc(tr("plug.marketUrlPh"))}" />
+        <button type="button" class="plugins-card-btn primary" data-action="market-add-submit">${this.cb.esc(tr("plug.addSource"))}</button>
       </div>
       <div class="plugins-grid" style="margin-top:12px">
         ${
@@ -1046,8 +1063,8 @@ export class PluginsPageController {
           </div>
         </div>
         <div class="plugins-card-actions">
-          <button type="button" class="plugins-card-btn" data-action="mcp-doctor" data-name="${this.cb.esc(m.name)}">诊断</button>
-          <button type="button" class="plugins-card-btn" data-action="mcp-remove" data-name="${this.cb.esc(m.name)}">移除</button>
+          <button type="button" class="plugins-card-btn" data-action="mcp-doctor" data-name="${this.cb.esc(m.name)}">${this.cb.esc(tr("plug.diagnose"))}</button>
+          <button type="button" class="plugins-card-btn" data-action="mcp-remove" data-name="${this.cb.esc(m.name)}">${this.cb.esc(tr("plug.remove"))}</button>
         </div>
       </article>`;
   }
@@ -1066,8 +1083,8 @@ export class PluginsPageController {
           </div>
         </div>
         <div class="plugins-card-actions">
-          <button type="button" class="plugins-card-btn" data-action="market-refresh" data-name="${this.cb.esc(m.name)}">更新</button>
-          <button type="button" class="plugins-card-btn" data-action="market-remove" data-url="${this.cb.esc(m.url)}">移除</button>
+          <button type="button" class="plugins-card-btn" data-action="market-refresh" data-name="${this.cb.esc(m.name)}">${this.cb.esc(tr("plug.update"))}</button>
+          <button type="button" class="plugins-card-btn" data-action="market-remove" data-url="${this.cb.esc(m.url)}">${this.cb.esc(tr("plug.remove"))}</button>
         </div>
       </article>`;
   }

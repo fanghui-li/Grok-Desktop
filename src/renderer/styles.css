@@ -458,7 +458,8 @@ svg.proj-remove-x {
   width: 100%;
   padding: 0 4px 0 28px;
   border-radius: 8px;
-  color: var(--text-2);
+  /* 浅色模式：标题用主色，避免 --text-2 过淡难辨 */
+  color: var(--text);
   font-size: 13px;
 }
 .thread-item:hover { background: var(--bg-hover); color: var(--text); }
@@ -497,6 +498,8 @@ svg.proj-remove-x {
 .thread-item .thread-title {
   flex: 1; min-width: 0;
   overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  color: var(--text);
+  font-weight: 450;
 }
 .thread-item .thread-fork-badge {
   flex-shrink: 0;
@@ -567,7 +570,9 @@ svg.proj-remove-x {
   color: var(--text);
 }
 .thread-item.is-archived .thread-title {
-  color: var(--text-3);
+  /* 归档略弱于主标题，仍比 --text-3 清晰 */
+  color: var(--text-2);
+  font-weight: 400;
 }
 /* 超过 5 条时的「展开更多 / 收起」 */
 .project-threads-more {
@@ -694,7 +699,50 @@ svg.archive-chev {
   padding: 4px 10px 8px 28px; color: var(--text-3); font-size: 12px;
 }
 .sidebar-bottom {
-  padding: 8px; border-top: 1px solid var(--border-soft);
+  padding: 8px;
+  border-top: 1px solid var(--border-soft);
+  display: flex;
+  align-items: center;
+  gap: 2px;
+}
+.sidebar-bottom #btn-settings {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+/* 检查更新：设置行最右侧 */
+.sidebar-update-btn {
+  position: relative;
+  width: 32px;
+  height: 32px;
+  min-width: 32px;
+  min-height: 32px;
+  flex-shrink: 0;
+  display: grid;
+  place-items: center;
+  color: var(--text-2);
+  border-radius: 8px;
+  box-sizing: border-box;
+}
+.sidebar-update-btn:hover {
+  color: var(--text);
+  background: var(--bg-hover);
+}
+.sidebar-update-btn.has-update {
+  color: var(--text);
+}
+.sidebar-update-btn .update-dot {
+  position: absolute;
+  top: 4px;
+  right: 4px;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: #22c55e;
+  box-shadow: 0 0 0 2px var(--bg-sidebar, var(--bg, #1a1a1a));
+  pointer-events: none;
+}
+.sidebar-update-btn .update-dot[hidden] {
+  display: none !important;
 }
 
 /* —— Main：贴右/贴底；仅左上、左下圆角（对齐 Codex 主表面） —— */
@@ -839,6 +887,13 @@ svg.archive-chev {
 .top-icon-btn.active {
   color: var(--text);
   background: var(--bg-active);
+}
+.top-icon-update-wrap {
+  position: relative;
+  display: grid;
+  place-items: center;
+  width: 18px;
+  height: 18px;
 }
 .top-icon {
   width: 18px;
@@ -2552,10 +2607,24 @@ html[data-theme="dark"] .send-btn:hover { filter: brightness(0.92); }
 .picker-action:hover { background: var(--bg-hover); }
 .picker-action-ico {
   width: 18px;
+  height: 18px;
   text-align: center;
-  opacity: 0.7;
+  opacity: 0.75;
   flex-shrink: 0;
   font-size: 13px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  line-height: 1;
+}
+.picker-action-ico--svg {
+  opacity: 0.85;
+  color: var(--text-2);
+}
+.picker-action-svg {
+  width: 18px;
+  height: 18px;
+  display: block;
 }
 .picker-action-chev {
   margin-left: auto;
@@ -4288,6 +4357,157 @@ dialog input {
   border: 1px solid var(--border);
   border-radius: 14px;
   overflow: hidden;
+}
+
+/* 关于页 · 应用信息卡（对齐 CCSwitch 风格） */
+.about-hero-card {
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-radius: 18px;
+  padding: 22px 22px 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  min-height: 112px;
+}
+.about-hero-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 20px;
+  flex-wrap: wrap;
+  min-height: 56px;
+}
+.about-hero-brand {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  min-width: 0;
+}
+.about-hero-icon {
+  width: 48px;
+  height: 48px;
+  border-radius: 12px;
+  object-fit: contain;
+  object-position: center;
+  flex-shrink: 0;
+  background: #fff;
+  border: 1px solid var(--border-soft);
+  padding: 6px;
+  box-sizing: border-box;
+  display: block;
+}
+.about-hero-brand-text {
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  gap: 8px;
+  min-width: 0;
+}
+.about-hero-name {
+  font-size: 17px;
+  font-weight: 600;
+  color: var(--text);
+  line-height: 1.25;
+}
+.about-hero-ver-badge {
+  display: inline-flex;
+  align-self: flex-start;
+  align-items: center;
+  padding: 3px 11px;
+  border-radius: 999px;
+  font-size: 12.5px;
+  line-height: 1.3;
+  color: var(--text-2);
+  background: var(--bg-hover);
+  border: 1px solid var(--border-soft);
+}
+.about-hero-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10px;
+  justify-content: flex-end;
+}
+.about-hero-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  height: 34px;
+  padding: 0 14px;
+  border-radius: 8px;
+  font-size: 13px;
+  font-weight: 500;
+  color: var(--text);
+  background: var(--bg);
+  border: 1px solid var(--border);
+  cursor: pointer;
+  white-space: nowrap;
+}
+.about-hero-btn:hover {
+  background: var(--bg-hover);
+}
+.about-hero-btn--primary {
+  color: #fff;
+  background: #2563eb;
+  border-color: #2563eb;
+}
+.about-hero-btn--primary:hover {
+  background: #1d4ed8;
+  border-color: #1d4ed8;
+  filter: none;
+}
+.about-hero-btn--primary:disabled {
+  opacity: 0.65;
+  cursor: default;
+}
+.about-hero-banner {
+  padding: 10px 14px;
+  border-radius: 10px;
+  font-size: 13px;
+  line-height: 1.4;
+  color: #1e40af;
+  background: rgba(37, 99, 235, 0.1);
+  border: 1px solid rgba(37, 99, 235, 0.18);
+}
+.about-hero-banner--ok {
+  color: #166534;
+  background: rgba(34, 197, 94, 0.12);
+  border-color: rgba(34, 197, 94, 0.22);
+}
+.about-hero-banner--warn {
+  color: #92400e;
+  background: rgba(245, 158, 11, 0.12);
+  border-color: rgba(245, 158, 11, 0.22);
+}
+html[data-theme="dark"] .about-hero-banner {
+  color: #93c5fd;
+  background: rgba(37, 99, 235, 0.16);
+  border-color: rgba(37, 99, 235, 0.28);
+}
+html[data-theme="dark"] .about-hero-banner--ok {
+  color: #86efac;
+  background: rgba(34, 197, 94, 0.14);
+  border-color: rgba(34, 197, 94, 0.28);
+}
+html[data-theme="dark"] .about-hero-banner--warn {
+  color: #fcd34d;
+  background: rgba(245, 158, 11, 0.14);
+  border-color: rgba(245, 158, 11, 0.28);
+}
+.about-hero-progress {
+  margin-top: 0;
+  height: 6px;
+  border-radius: 999px;
+  overflow: hidden;
+  background: var(--bg-hover);
+}
+.about-hero-progress .settings-update-progress-bar {
+  height: 100%;
+  background: #2563eb;
+  border-radius: 999px;
+  transition: width 0.2s ease;
 }
 .settings-form-card { padding: 4px 0; }
 .settings-row {

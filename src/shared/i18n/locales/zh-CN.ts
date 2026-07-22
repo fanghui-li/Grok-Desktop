@@ -74,6 +74,8 @@ export const zhCN = {
   "nav.layout": "布局",
   "nav.sidePanel": "右侧栏",
   "nav.sidePanelTitle": "展开 / 收起右侧栏",
+  "nav.updateTitle": "检查更新",
+  "nav.updateAvailableTitle": "有新版本 {version}，点击查看",
 
   // ── welcome / composer ─────────────────────────────────
   "welcome.title": "选择一个项目开始",
@@ -314,6 +316,13 @@ export const zhCN = {
   "settings.updateDownload": "下载更新",
   "settings.updateInstall": "安装并重启",
   "settings.updateOpenReleases": "打开发布页",
+  "settings.updateWebsite": "官方网站",
+  "settings.updateGithub": "GitHub",
+  "settings.updateChangelog": "更新日志",
+  "settings.updateToVersion": "更新到 v{version}",
+  "settings.updateVersionBadge": "版本 v{version}",
+  "settings.updateDetected": "检测到新版本：{version}",
+  "settings.appName": "Grok Desktop",
   "settings.updateDevOnly":
     "开发模式无法应用内更新，请使用打包安装版，或从 GitHub Releases 下载。",
   "settings.updateChecking": "正在检查…",
@@ -785,8 +794,10 @@ export const zhCN = {
   "plug.searchMarket": "搜索可安装插件…",
   "plug.refreshCatalog": "刷新目录",
   "plug.updateAllSources": "更新所有源",
+  "plug.titleMcp": "MCP",
   "plug.searchMcp": "搜索 MCP 服务器…",
   "plug.editMcpConfig": "编辑 MCP 配置",
+  "plug.mcpDoctor": "MCP 诊断",
   "plug.titleSkills": "技能",
   "plug.searchSkills": "搜索技能…",
   "plug.openSkillsDir": "打开 Skills 目录",

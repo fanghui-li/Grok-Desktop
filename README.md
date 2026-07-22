@@ -5,108 +5,108 @@
 </p>
 
 <p align="center">
-  <strong>Grok Build 桌面工作台</strong><br />
-  <b>操作体验对齐 Codex</b> · 官方登录与自定义中转 · 多项目会话
+  <strong>Desktop workbench for Grok Build</strong><br />
+  <b>Codex-aligned UX</b> · Official login & custom relays · Multi-project sessions
 </p>
 
 <p align="center">
-  <a href="./README_EN.md">English</a> ·
-  <a href="https://github.com/fanghui-li/Grok-Desktop/releases">下载安装包</a>
+  <a href="./README_ZH.md">中文</a> ·
+  <a href="https://github.com/fanghui-li/Grok-Desktop/releases">Download installer</a>
 </p>
 
 <p align="center">
-  <img alt="UX" src="https://img.shields.io/badge/UX-对齐%20Codex-8B5CF6.svg" />
-  <img alt="Providers" src="https://img.shields.io/badge/providers-官方%20%2B%20中转-success.svg" />
+  <img alt="UX" src="https://img.shields.io/badge/UX-Codex--aligned-8B5CF6.svg" />
+  <img alt="Providers" src="https://img.shields.io/badge/providers-official%20%2B%20relay-success.svg" />
   <img alt="License" src="https://img.shields.io/badge/license-Apache%202.0-blue.svg" />
   <img alt="Platform" src="https://img.shields.io/badge/Windows-x64-0078D4.svg" />
 </p>
 
 ---
 
-**Grok Desktop** 把 Grok agent 放进图形界面：布局与交互对标 OpenAI Codex 桌面端，智能仍由 Grok 执行。适合用安装包直接上手，无需配置开发环境。
+**Grok Desktop** puts the Grok agent in a GUI: layout and interaction align with OpenAI Codex Desktop; intelligence still runs in Grok. Built for people who install the package — no dev setup required.
 
-## 安装与开始
+## Install & get started
 
-1. 打开 [Releases](https://github.com/fanghui-li/Grok-Desktop/releases)，下载 **`Grok Desktop-*-win-x64.exe`**
-2. 安装并启动
-3. **设置 → 账户与提供商**  
-   - **官方账户**：登录 xAI / Grok 官方  
-   - **自定义提供商**：填写 OpenAI 兼容中转（Base URL、API Key、模型等）
-4. 添加或选择项目，开始对话  
+1. Open [Releases](https://github.com/fanghui-li/Grok-Desktop/releases) and download **`Grok Desktop-*-win-x64.exe`**
+2. Install and launch
+3. **Settings → Account & providers**  
+   - **Official account**: sign in with xAI / Grok  
+   - **Custom provider**: OpenAI-compatible relay (Base URL, API key, model, …)
+4. Add or pick a project and start chatting  
 
-安装包可内置 agent，一般装完即可用。数据目录默认 **`~/.grok-desktop`**，与命令行 CLI 的 `~/.grok` 分开，互不影响。
+Installers can bundle the agent so you can use the app right away. User data lives under **`~/.grok-desktop`**, separate from the CLI’s `~/.grok`.
 
-## 你能做什么
+## What you can do
 
-- **三栏工作台**：项目 / 会话、对话过程、侧栏文件与工具
-- **权限与模型**：完全访问等模式、模型与推理力度 chip
-- **计划 / 目标模式**：在输入区 chip 切换，状态始终可见
-- **多项目 · 多会话**：侧栏切换、搜索、归档
-- **熟悉输入**：`@` 引用文件、附件、`/` 命令、Skills
-- **自定义中转**：多供应商、设默认、连通测试（Ping）、对话中切换模型
+- **Three-column workbench** — projects/sessions, chat, side panel (files & tools)
+- **Permissions & models** — access modes, model / reasoning chips
+- **Plan & Goal modes** — toggle chips near the composer; status always visible
+- **Multi-project · multi-session** — sidebar, search, archive
+- **Familiar input** — `@` files, attachments, `/` commands, skills
+- **Custom relays** — multiple providers, set default, connectivity Ping, switch models in chat
 
-### 自定义供应商（简要）
+### Custom providers (short)
 
 | | |
 |--|--|
-| 配置 | 名称、Base URL、API Key、协议、模型 |
-| 体验 | 拉取模型列表；多供应商；设默认；对话 chip 切换 |
-| 安全 | 与官方 OAuth **隔离**；中转自带 Key；Key **不明文回显** |
+| Fields | Name, Base URL, API key, protocol, model |
+| UX | Fetch models; multiple providers; set default; switch via chat chip |
+| Safety | **Isolated from official OAuth**; relay uses its own key; keys **not shown in clear text** |
 
-## 界面语言
+## Language
 
-**设置 → 常规 → 界面语言**：跟随系统 / 简体中文 / English。  
-仅窗口 UI（导航、设置、按钮等）会切换；Agent 回复与工具日志不翻译。
+**Settings → General → Language**: system / 简体中文 / English.  
+Only the UI chrome (nav, settings, buttons, …) is translated — agent replies and tool logs are not.
 
-## 遇到问题
+## Troubleshooting
 
-- 打不开、登录失败、中转连不上：先看 **设置 → 账户与提供商** 是否配置正确；中转可点 **连通测试** 看延迟  
-- 想反馈体验或缺陷：在 [Issues](https://github.com/fanghui-li/Grok-Desktop/issues) 写清系统版本、安装包版本与复现步骤  
+- Won’t start, sign-in fails, or relay is unreachable: check **Settings → Account & providers**; use **Ping** on custom providers for latency  
+- Feedback or bugs: [Issues](https://github.com/fanghui-li/Grok-Desktop/issues) — include OS, installer version, and steps to reproduce  
 
-## 诚邀一起维护
+## Help us maintain this
 
-项目还在 **0.1**，缺口不少，也欢迎打补丁。  
-我们用 [CLI ↔ Desktop 能力矩阵](./docs/cli-desktop-capability-matrix.md) 对照 Grok CLI：哪些已对齐、哪些半成品、哪些故意做成桌面体验。
+Still **0.1** — rough edges welcome.  
+We track CLI parity in a **[CLI ↔ Desktop capability matrix](./docs/cli-desktop-capability-matrix.md)** (Chinese): what’s done, partial, or Desktop-only.
 
-| 你可以怎么参与 | |
-|----------------|--|
-| 提体验 | [Issue](https://github.com/fanghui-li/Grok-Desktop/issues) 写清复现即可 |
-| 改矩阵 | 发现状态过时 → 直接改表并发 PR |
-| 认领缺口 | 表里 🟡 / ❌ 都是待办线索 |
-| 读约定 | [贡献指南](./CONTRIBUTING.md) · [文档索引](./docs/README.md) |
+| How to help | |
+|-------------|--|
+| File issues | [Issues](https://github.com/fanghui-li/Grok-Desktop/issues) |
+| Update the matrix | Stale rows → PR the table |
+| Pick a gap | 🟡 / ❌ rows are backlog hints |
+| Conventions | [Contributing](./CONTRIBUTING.md) · [Docs index](./docs/README.md) *(mostly Chinese)* |
 
-**不要求一次做完。** 修一小块、改一行状态，都超欢迎。
+Small PRs are great. No need to finish the whole matrix.
 
-## 友情链接
+## UI screenshots
+
+### Welcome
+
+<p align="center">
+  <img src="./docs/images_en/home.png" alt="Welcome" width="720" />
+</p>
+
+### Main workspace
+
+<p align="center">
+  <img src="./docs/images_en/workspace.png" alt="Main workspace" width="900" />
+</p>
+
+### Custom providers
+
+<p align="center">
+  <img src="./docs/images_en/providers.png" alt="Custom providers" width="900" />
+</p>
+
+### Plugins
+
+<p align="center">
+  <img src="./docs/images_en/plugins.png" alt="Custom providers" width="900" />
+</p>
+
+
+## Friendship Link
 
 - [LinuxDo](https://linux.do)
-
-## 软件界面
-
-### 欢迎页
-
-<p align="center">
-  <img src="./docs/images/home.png" alt="欢迎页" width="720" />
-</p>
-
-### 主工作台
-
-<p align="center">
-  <img src="./docs/images/workspace.png" alt="主工作台" width="900" />
-</p>
-
-### 自定义供应商
-
-<p align="center">
-  <img src="./docs/images/providers.png" alt="自定义供应商" width="900" />
-</p>
-
-### 计划模式 · 插件
-
-| 计划模式 | 插件 |
-|:---:|:---:|
-| <img src="./docs/images/plan.png" alt="计划模式" width="440" /> | <img src="./docs/images/plugins.png" alt="插件" width="440" /> |
-
 ---
 
 [Apache-2.0](./LICENSE) · © 2026 [leofanghui](https://github.com/fanghui-li)

@@ -66,16 +66,30 @@
           <div id="chats-list" class="chats-list" role="list"></div>
           <div class="section-label" data-i18n="nav.projects">项目</div>
           <div id="project-list" class="project-list"></div>
-          <button type="button" class="nav-row muted" id="btn-add-project">
-            <span class="nav-ico" data-sidebar-icon="plus" aria-hidden="true"></span>
-            <span data-i18n="nav.addProject">添加项目</span>
-          </button>
         </div>
 
         <div class="sidebar-bottom">
           <button type="button" class="nav-row" id="btn-settings">
             <span class="nav-ico" data-sidebar-icon="settings" aria-hidden="true"></span>
             <span data-i18n="nav.settings">设置</span>
+          </button>
+          <!-- 检查更新：设置行最右侧，有新版本时绿点 -->
+          <button
+            type="button"
+            class="icon-ghost sidebar-update-btn"
+            id="btn-app-update"
+            data-i18n-title="nav.updateTitle"
+            title="检查更新"
+            data-i18n-aria-label="nav.updateTitle"
+            aria-label="检查更新"
+          >
+            <span class="top-icon-update-wrap" aria-hidden="true">
+              <svg class="top-icon" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="none" focusable="false">
+                <path d="M10 3.25a.75.75 0 0 1 .75.75v7.19l2.22-2.22a.75.75 0 1 1 1.06 1.06l-3.5 3.5a.75.75 0 0 1-1.06 0l-3.5-3.5a.75.75 0 0 1 1.06-1.06l2.22 2.22V4a.75.75 0 0 1 .75-.75Z" fill="currentColor"/>
+                <path d="M3.5 13.5a.75.75 0 0 1 .75.75v.5c0 .69.56 1.25 1.25 1.25h9c.69 0 1.25-.56 1.25-1.25v-.5a.75.75 0 0 1 1.5 0v.5A2.75 2.75 0 0 1 14.5 17h-9A2.75 2.75 0 0 1 2.75 14.75v-.5a.75.75 0 0 1 .75-.75Z" fill="currentColor"/>
+              </svg>
+              <span class="update-dot" id="btn-app-update-dot" hidden></span>
+            </span>
           </button>
         </div>
         <!-- 左侧栏右缘拖宽（对齐右侧 split-resizer） -->
@@ -259,12 +273,22 @@
                     <div id="project-picker-list" class="project-picker-list"></div>
                     <div class="project-picker-divider"></div>
                     <button type="button" class="picker-action" id="picker-add-project">
-                      <span class="picker-action-ico">📁+</span>
+                      <span class="picker-action-ico picker-action-ico--svg" aria-hidden="true">
+                        <!-- 加号：避免 📁+ emoji 在 Windows 上叠字/双图标 -->
+                        <svg class="picker-action-svg" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="none" focusable="false">
+                          <path d="M10 3.5a.75.75 0 0 1 .75.75v5h5a.75.75 0 0 1 0 1.5h-5v5a.75.75 0 0 1-1.5 0v-5h-5a.75.75 0 0 1 0-1.5h5v-5A.75.75 0 0 1 10 3.5Z" fill="currentColor"/>
+                        </svg>
+                      </span>
                       <span data-i18n="composer.addNewProject">添加新项目</span>
                       <span class="picker-action-chev">›</span>
                     </button>
                     <button type="button" class="picker-action" id="picker-no-project">
-                      <span class="picker-action-ico">⊘</span>
+                      <span class="picker-action-ico picker-action-ico--svg" aria-hidden="true">
+                        <svg class="picker-action-svg" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="none" focusable="false">
+                          <circle cx="10" cy="10" r="7.25" stroke="currentColor" stroke-width="1.5"/>
+                          <path d="M6.5 10h7" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/>
+                        </svg>
+                      </span>
                       <span data-i18n="composer.noProject">不使用项目</span>
                     </button>
                   </div>

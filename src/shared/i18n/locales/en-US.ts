@@ -76,6 +76,8 @@ export const enUS: MessageDict = {
   "nav.layout": "Layout",
   "nav.sidePanel": "Side panel",
   "nav.sidePanelTitle": "Show / hide side panel",
+  "nav.updateTitle": "Check for updates",
+  "nav.updateAvailableTitle": "Update available ({version}) — click for details",
 
   // ── welcome / composer ─────────────────────────────────
   "welcome.title": "Pick a project to start",
@@ -327,6 +329,13 @@ export const enUS: MessageDict = {
   "settings.updateDownload": "Download update",
   "settings.updateInstall": "Install and restart",
   "settings.updateOpenReleases": "Open releases",
+  "settings.updateWebsite": "Website",
+  "settings.updateGithub": "GitHub",
+  "settings.updateChangelog": "Changelog",
+  "settings.updateToVersion": "Update to v{version}",
+  "settings.updateVersionBadge": "Version v{version}",
+  "settings.updateDetected": "New version detected: {version}",
+  "settings.appName": "Grok Desktop",
   "settings.updateDevOnly":
     "In-app updates require a packaged install. Use GitHub Releases or a built installer.",
   "settings.updateChecking": "Checking…",
@@ -807,8 +816,10 @@ export const enUS: MessageDict = {
   "plug.searchMarket": "Search installable plugins…",
   "plug.refreshCatalog": "Refresh catalog",
   "plug.updateAllSources": "Update all sources",
+  "plug.titleMcp": "MCP",
   "plug.searchMcp": "Search MCP servers…",
   "plug.editMcpConfig": "Edit MCP config",
+  "plug.mcpDoctor": "MCP doctor",
   "plug.titleSkills": "Skills",
   "plug.searchSkills": "Search skills…",
   "plug.openSkillsDir": "Open Skills folder",

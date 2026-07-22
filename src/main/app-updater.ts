@@ -189,6 +189,11 @@ export function initAppUpdater(opts: {
       error: errorMessage(err),
     });
   });
+
+  // 启动后静默检查（顶栏绿点）；失败不打扰，用户仍可点顶栏/关于页
+  setTimeout(() => {
+    void checkForAppUpdate().catch(() => undefined);
+  }, 5_000);
 }
 
 export function getAppUpdateState(): AppUpdateState {

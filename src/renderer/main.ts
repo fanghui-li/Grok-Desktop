@@ -10006,7 +10006,7 @@ function restoreComposerAfterOverlay(): void {
   });
 }
 
-async function showSettingsPage(): Promise<void> {
+async function showSettingsPage(section?: string): Promise<void> {
   if (!settingsPage) {
     settingsPage = new SettingsPageController({
       inv,
@@ -10020,7 +10020,75 @@ async function showSettingsPage(): Promise<void> {
       exportThemeString: () => exportCurrentThemeString(),
     });
   }
-  await settingsPage.show();
+  await settingsPage.show(
+    section as
+      | "general"
+      | "appearance"
+      | "account"
+      | "about"
+      | "memory"
+      | "hooks"
+      | "shortcuts"
+      | undefined,
+  );
+}
+
+/** 顶栏更新按钮：有可用/已下载更新时显示绿点 */
+type AppUpdateUiSnap = {
+  phase?: string;
+  latestVersion?: string;
+  canUpdate?: boolean;
+  error?: string;
+  currentVersion?: string;
+  releasesUrl?: string;
+};
+
+let lastAppUpdateSnap: AppUpdateUiSnap | null = null;
+
+function syncAppUpdateTopButton(snap?: AppUpdateUiSnap | null): void {
+  if (snap) lastAppUpdateSnap = snap;
+  const u = lastAppUpdateSnap;
+  const btn = document.getElementById("btn-app-update") as HTMLButtonElement | null;
+  const dot = document.getElementById("btn-app-update-dot");
+  if (!btn) return;
+  const phase = (u?.phase || "").toLowerCase();
+  const hasUpdate =
+    Boolean(u?.canUpdate) &&
+    (phase === "available" ||
+      phase === "downloaded" ||
+      phase === "downloading" ||
+      (phase === "error" && Boolean(u?.latestVersion)));
+  btn.classList.toggle("has-update", hasUpdate);
+  if (dot) {
+    if (hasUpdate) dot.removeAttribute("hidden");
+    else dot.setAttribute("hidden", "");
+  }
+  const ver = (u?.latestVersion || "").trim();
+  if (hasUpdate && ver) {
+    btn.title = tr("nav.updateAvailableTitle", { version: ver });
+    btn.setAttribute("aria-label", btn.title);
+  } else {
+    btn.title = tr("nav.updateTitle");
+    btn.setAttribute("aria-label", tr("nav.updateTitle"));
+  }
+}
+
+async function onAppUpdateTopClick(): Promise<void> {
+  const u = lastAppUpdateSnap;
+  const canUpdate = Boolean(u?.canUpdate) && u?.error !== "dev-only";
+  // 打包版：无已知更新时先检查；开发版直接进关于页说明
+  if (canUpdate) {
+    const phase = (u?.phase || "").toLowerCase();
+    if (
+      phase !== "available" &&
+      phase !== "downloaded" &&
+      phase !== "downloading" &&
+      phase !== "checking"
+    ) {
+      void inv("app.update.check");
+    }
+  }
+  await showSettingsPage("about");
 }
 
 /** 权限菜单关闭动画收尾定时器 */
@@ -10580,15 +10648,20 @@ function onEvent(raw: unknown): void {
     return;
   }
   if (ev.type === "app.update") {
-    settingsPage?.onAppUpdateEvent({
-      phase: ev.phase,
-      currentVersion: ev.currentVersion,
-      latestVersion: ev.latestVersion,
-      percent: ev.percent,
-      error: ev.error,
-      canUpdate: ev.canUpdate,
-      releasesUrl: ev.releasesUrl,
-    });
+    const upd = {
+      phase: String(ev.phase ?? ""),
+      currentVersion: String(ev.currentVersion ?? ""),
+      latestVersion: ev.latestVersion as string | undefined,
+      percent: ev.percent as number | undefined,
+      error: ev.error as string | undefined,
+      canUpdate: Boolean(ev.canUpdate),
+      releasesUrl: String(
+        (ev as { releasesUrl?: string }).releasesUrl ??
+          "https://github.com/fanghui-li/Grok-Desktop/releases",
+      ),
+    };
+    settingsPage?.onAppUpdateEvent(upd);
+    syncAppUpdateTopButton(upd);
     return;
   }
   if (ev.type === "shell.notice") {
@@ -11197,6 +11270,30 @@ npm start</pre>
   $("btn-plugins").onclick = () => void showPluginsPage();
   $("btn-automations").onclick = () => void showAutomationsModal();
   $("btn-settings").onclick = () => void showSettingsPage();
+  $("btn-app-update").onclick = () => void onAppUpdateTopClick();
+  // 侧栏设置行右侧：检查更新（id 不变）
+  // 初始态 + 启动后拉一次状态（打包版会静默 check 并推送）
+  void inv<{
+    phase?: string;
+    currentVersion?: string;
+    latestVersion?: string;
+    canUpdate?: boolean;
+    error?: string;
+    releasesUrl?: string;
+  }>("app.update.status").then((res) => {
+    if (res.ok && res.data) {
+      syncAppUpdateTopButton({
+        phase: res.data.phase,
+        currentVersion: res.data.currentVersion,
+        latestVersion: res.data.latestVersion,
+        canUpdate: res.data.canUpdate,
+        error: res.data.error,
+        releasesUrl: res.data.releasesUrl,
+      });
+    } else {
+      syncAppUpdateTopButton({ canUpdate: false, phase: "idle" });
+    }
+  });
   $("btn-modal-close").onclick = () => closeModal();
   $("modal").onclick = (e) => {
     if (e.target === $("modal")) closeModal();
@@ -11310,7 +11407,7 @@ npm start</pre>
     });
   }
 
-  $("btn-add-project").onclick = () => void pickAndAddProject();
+  // 侧栏「添加项目」已去掉；欢迎页 / 项目 chip 菜单仍可添加
 
   $("btn-project-chip").onclick = (e) => {
     e.stopPropagation();
@@ -11622,6 +11719,10 @@ npm start</pre>
     );
     void refreshProjectsAndThreads();
     slashPalette?.invalidate?.();
+    // 插件页 chrome / 列表多为运行时 tr()，需显式刷新
+    pluginsPage?.refreshLocale?.();
+    // 设置页若打开则重绘当前分区
+    void settingsPage?.refreshLocale?.();
   });
 
   await refreshProjectsAndThreads();
