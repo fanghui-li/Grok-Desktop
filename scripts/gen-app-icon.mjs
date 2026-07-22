@@ -1,6 +1,8 @@
 /**
  * 用 Electron 将 assets/icon.svg 栅格化为 icon.png / icon-32.png（窗口与托盘）。
  * 用法：npx electron scripts/gen-app-icon.mjs
+ *
+ * SVG 自带白底圆角；捕获使用不透明白底，避免透明 PNG 在深色任务栏/托盘上「看不见」。
  */
 import { app, BrowserWindow } from "electron";
 import fs from "node:fs";
@@ -25,20 +27,22 @@ app.whenReady().then(async () => {
       height: size,
       show: false,
       frame: false,
-      transparent: true,
+      // 不透明：保证输出无 alpha 黑洞
+      transparent: false,
+      backgroundColor: "#ffffff",
       webPreferences: {
         offscreen: true,
         backgroundThrottling: false,
       },
     });
     const html = `<!DOCTYPE html><html><head><style>
-      html,body{margin:0;padding:0;width:${size}px;height:${size}px;background:transparent;display:flex;align-items:center;justify-content:center;overflow:hidden}
-      svg{width:${Math.round(size * 0.88)}px;height:${Math.round(size * 0.88)}px;display:block}
-    </style></head><body>${svg.replace(/fill="#111111"/g, 'fill="#0b0d12"')}</body></html>`;
+      html,body{margin:0;padding:0;width:${size}px;height:${size}px;background:#ffffff;display:flex;align-items:center;justify-content:center;overflow:hidden}
+      svg{width:${size}px;height:${size}px;display:block}
+    </style></head><body>${svg}</body></html>`;
     await win.loadURL(
       `data:text/html;charset=utf-8,${encodeURIComponent(html)}`,
     );
-    await new Promise((r) => setTimeout(r, 120));
+    await new Promise((r) => setTimeout(r, 150));
     const image = await win.webContents.capturePage();
     fs.writeFileSync(out, image.toPNG());
     win.destroy();
