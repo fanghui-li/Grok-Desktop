@@ -14,8 +14,9 @@ const svgPath = path.join(root, "assets", "icon.svg");
 const outPng = path.join(root, "assets", "icon.png");
 const outPng32 = path.join(root, "assets", "icon-32.png");
 
+// macOS electron-builder 要求 icon 至少 512x512；Win/托盘另用 32。
 const sizes = [
-  { size: 256, out: outPng },
+  { size: 512, out: outPng },
   { size: 32, out: outPng32 },
 ];
 
