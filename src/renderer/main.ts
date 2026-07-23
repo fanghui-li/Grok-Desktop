@@ -4398,10 +4398,16 @@ async function enterPlanMode(): Promise<{ ok: boolean; message?: string }> {
   if (activeSessionId || activeThreadId) {
     const r = await syncSessionPolicyLive({ plan: true });
     if (!r.ok) {
+      planPhase = "off";
+      syncPermLabels();
       return {
         ok: false,
         message: r.message ?? tr("plan.markedSyncFail"),
       };
+    }
+    // 已有会话：打开计划侧栏，便于立刻看/写 plan.md
+    if (activeSessionId) {
+      void openPlanPanel({ forceReload: true });
     }
   }
   return {
@@ -4995,16 +5001,16 @@ function notePlanArtifactFromTool(name: string | undefined, raw: unknown): void 
 }
 
 /**
- * 计划模式回合结束：默认不抢右栏。
+ * 计划模式回合结束：
  * - 有 exit_plan 待批 → 已由 handlePlanApproval 打开面板
- * - 否则仅 toast，用户 /view-plan 或点 chip 再开
+ * - 若 session plan.md / 工作区产物有正文 → 自动打开计划侧栏（加深工作流）
+ * - 否则 toast 引导
  */
 async function maybeSurfacePlanAfterTurn(): Promise<void> {
   if (!isPlanOn()) return;
   if (!activeSessionId) return;
   if (pendingPlanApproval) return;
 
-  // 后台确保 session plan 有内容（镜像工作区产物），不打开侧栏
   const res = await inv<{ content?: string } | null>("plans.get", {
     sessionId: activeSessionId,
   });
@@ -5032,12 +5038,19 @@ async function maybeSurfacePlanAfterTurn(): Promise<void> {
     }
   }
   if (content) {
+    // 有计划正文：自动打开侧栏预览，减少「写完了找不到」
+    await openPlanPanel({ forceReload: false });
     showToast(tr("chat.planReady"), "info");
   } else if (lastPlanArtifactPath) {
     showToast(
-      `计划可能在 ${lastPlanArtifactPath.split(/[/\\]/).pop()} · /view-plan 查看`,
+      tr("chat.planArtifact", {
+        name:
+          lastPlanArtifactPath.split(/[/\\]/).pop() ?? lastPlanArtifactPath,
+      }),
       "info",
     );
+  } else {
+    showToast(tr("plan.waitingContent"), "info");
   }
 }
 
@@ -5279,9 +5292,9 @@ async function tryRunComposerSlashLine(raw: string): Promise<boolean> {
       : !staticCmd
         ? null
         : staticCmd;
-  // skill:name 或直接 skill 名走 resolve
+  // skill:name 或直接 skill 名走 resolve（CLI 式 envelope，args 写入属性）
   if (!staticCmd && !name.includes(":")) {
-    // try skill resolve by bare name via Host
+    const skillArgs = (m[2] ?? "").trim();
     const resolved = await inv<{
       mode: string;
       prompt: string;
@@ -5289,17 +5302,21 @@ async function tryRunComposerSlashLine(raw: string): Promise<boolean> {
     }>("skills.resolve", {
       name,
       cwd: activeCwd || selectedProject()?.path,
+      args: skillArgs || undefined,
     });
     if (resolved.ok && resolved.data?.mode === "resolved") {
       const ta = activeComposerInput();
       if (ta) ta.value = "";
       slashPalette?.hide();
-      const args = (m[2] ?? "").trim();
-      const body =
-        resolved.data.prompt + (args ? `\n\nUser request:\n${args}` : "");
-      await dispatchAgentPrompt(body, `/${name}${args ? " " + args : ""}`, {
-        force: false,
-      });
+      // prompt 已含 skill envelope；有用户附加说明时再拼一段
+      const body = skillArgs
+        ? `${resolved.data.prompt}\n\nUser request:\n${skillArgs}`
+        : resolved.data.prompt;
+      await dispatchAgentPrompt(
+        body,
+        `/${name}${skillArgs ? " " + skillArgs : ""}`,
+        { force: false },
+      );
       return true;
     }
   }
@@ -5359,8 +5376,8 @@ async function runSlashCommand(
     case "set-max-turns":
       return promptSetMaxTurns(act.turns);
     case "agent-command": {
-      const name = act.name.replace(/^\//, "");
-      // Skills：Host resolve → 真执行 prompt；否则回退插入文案
+      const name = act.name.replace(/^\//, "").replace(/^skill:/i, "");
+      // Skills：Host resolve → CLI 式 <skill> envelope；否则回退插入文案
       const resolved = await inv<{
         mode: string;
         prompt: string;
@@ -5368,11 +5385,16 @@ async function runSlashCommand(
       }>("skills.resolve", {
         name,
         cwd: activeCwd || selectedProject()?.path,
+        args: args || undefined,
       });
       if (resolved.ok && resolved.data) {
         const body =
-          resolved.data.prompt +
-          (args ? `\n\nUser request:\n${args}` : "");
+          resolved.data.mode === "resolved"
+            ? args
+              ? `${resolved.data.prompt}\n\nUser request:\n${args}`
+              : resolved.data.prompt
+            : resolved.data.prompt +
+              (args ? `\n\nUser request:\n${args}` : "");
         const display =
           resolved.data.mode === "resolved"
             ? `/${name}${args ? " " + args : ""}`
@@ -6435,9 +6457,19 @@ function bindImagePaste(): void {
     void (async () => {
       const paths: string[] = [...pathSet];
       const previewMap: Record<string, string> = {};
+      let tooLarge = 0;
+      let writeFail = 0;
       for (const blob of blobs) {
+        if (blob.size > MAX_PASTE_IMAGE_BYTES_UI) {
+          tooLarge++;
+          continue;
+        }
         try {
           const buf = await blob.arrayBuffer();
+          if (buf.byteLength > MAX_PASTE_IMAGE_BYTES_UI) {
+            tooLarge++;
+            continue;
+          }
           const base64 = arrayBufferToBase64(buf);
           const mime = blob.type || "image/png";
           const res = await inv<{ path: string; name: string }>(
@@ -6450,22 +6482,34 @@ function bindImagePaste(): void {
             }
             previewMap[res.data.path] = `data:${mime};base64,${base64}`;
           } else {
-            showToast(res.error?.message ?? "图片落盘失败", "error");
+            writeFail++;
+            showToast(
+              res.error?.message ?? tr("attach.pasteFail"),
+              "error",
+            );
           }
         } catch (err) {
+          writeFail++;
           showToast(String(err), "error");
         }
       }
+      if (tooLarge > 0) {
+        showToast(tr("attach.imageTooLarge", { max: "20" }), "error");
+      }
       if (!paths.length) {
-        showToast("未能添加粘贴的图片", "error");
+        if (!tooLarge && !writeFail) {
+          showToast(tr("attach.pasteNone"), "error");
+        }
         return;
       }
-      addAttachments(paths, { kind: "image", previewMap });
-      showToast(
-        paths.length === 1
-          ? "已粘贴图片到附件"
-          : `已粘贴 ${paths.length} 张图片到附件`,
-      );
+      const added = addAttachments(paths, { kind: "image", previewMap });
+      if (added > 0) {
+        showToast(
+          added === 1
+            ? tr("attach.pastedOne")
+            : tr("attach.pastedN", { n: String(added) }),
+        );
+      }
     })();
   };
 
@@ -6478,6 +6522,88 @@ function bindImagePaste(): void {
     document
       .getElementById(id)
       ?.addEventListener("paste", onPaste as EventListener, true);
+  }
+}
+
+/** 拖放文件/图片到主输入区 */
+function bindComposerDrop(): void {
+  const hosts = [
+    document.getElementById("welcome"),
+    document.getElementById("chat"),
+  ].filter(Boolean) as HTMLElement[];
+
+  const onDragOver = (e: DragEvent) => {
+    if (!e.dataTransfer?.types?.includes("Files")) return;
+    e.preventDefault();
+    e.dataTransfer.dropEffect = "copy";
+    (e.currentTarget as HTMLElement).classList.add("is-drag-over");
+  };
+  const onDragLeave = (e: DragEvent) => {
+    (e.currentTarget as HTMLElement).classList.remove("is-drag-over");
+  };
+  const onDrop = (e: DragEvent) => {
+    (e.currentTarget as HTMLElement).classList.remove("is-drag-over");
+    const files = e.dataTransfer?.files;
+    if (!files?.length) return;
+    e.preventDefault();
+    e.stopPropagation();
+
+    void (async () => {
+      const paths: string[] = [];
+      const previewMap: Record<string, string> = {};
+      let tooLarge = 0;
+      for (const f of Array.from(files)) {
+        const withPath = f as File & { path?: string };
+        if (withPath.path) {
+          paths.push(withPath.path);
+          continue;
+        }
+        if (!f.type.startsWith("image/") || f.size <= 0) continue;
+        if (f.size > MAX_PASTE_IMAGE_BYTES_UI) {
+          tooLarge++;
+          continue;
+        }
+        try {
+          const buf = await f.arrayBuffer();
+          const base64 = arrayBufferToBase64(buf);
+          const mime = f.type || "image/png";
+          const res = await inv<{ path: string; name: string }>(
+            "files.writePasteImage",
+            { base64, mime },
+          );
+          if (res.ok && res.data?.path) {
+            paths.push(res.data.path);
+            previewMap[res.data.path] = `data:${mime};base64,${base64}`;
+          } else {
+            showToast(
+              res.error?.message ?? tr("attach.pasteFail"),
+              "error",
+            );
+          }
+        } catch (err) {
+          showToast(String(err), "error");
+        }
+      }
+      if (tooLarge > 0) {
+        showToast(tr("attach.imageTooLarge", { max: "20" }), "error");
+      }
+      if (!paths.length) {
+        showToast(tr("attach.dropNone"), "error");
+        return;
+      }
+      const added = addAttachments(paths, {
+        previewMap: Object.keys(previewMap).length ? previewMap : undefined,
+      });
+      if (added > 0) {
+        showToast(tr("attach.addedN", { n: String(added) }));
+      }
+    })();
+  };
+
+  for (const host of hosts) {
+    host.addEventListener("dragover", onDragOver);
+    host.addEventListener("dragleave", onDragLeave);
+    host.addEventListener("drop", onDrop);
   }
 }
 
@@ -6573,6 +6699,10 @@ const IMAGE_EXT = new Set([
   "bmp",
   "svg",
 ]);
+/** 与 Host MAX_COMPOSER_ATTACHMENTS 对齐 */
+const MAX_COMPOSER_ATTACHMENTS = 20;
+/** 粘贴单图客户端预检（Host 再验 20MB） */
+const MAX_PASTE_IMAGE_BYTES_UI = 20 * 1024 * 1024;
 
 function attachmentKind(filePath: string): "file" | "image" | "folder" {
   const base = filePath.split(/[/\\]/).pop() ?? filePath;
@@ -6588,6 +6718,9 @@ function attachIcon(kind: ComposerAttachment["kind"]): string {
   return "📄";
 }
 
+/**
+ * 添加附件；超上限跳过并 toast。返回实际新增个数。
+ */
 function addAttachments(
   paths: string[],
   opts?: {
@@ -6595,11 +6728,19 @@ function addAttachments(
     /** path → data URL，粘贴时直接带预览 */
     previewMap?: Record<string, string>;
   },
-): void {
+): number {
+  let added = 0;
+  let skippedDup = 0;
+  let skippedCap = 0;
   for (const p of paths) {
     if (!p) continue;
     const abs = p.replace(/[/\\]+$/, "") || p;
     if (composerAttachments.some((a) => a.path === abs || a.path === p)) {
+      skippedDup++;
+      continue;
+    }
+    if (composerAttachments.length >= MAX_COMPOSER_ATTACHMENTS) {
+      skippedCap++;
       continue;
     }
     const name = abs.split(/[/\\]/).pop() || abs;
@@ -6609,11 +6750,24 @@ function addAttachments(
       path: pathKey,
       name: kind === "folder" ? `${name}/` : name,
       kind,
-      previewUrl: opts?.previewMap?.[pathKey] ?? opts?.previewMap?.[p] ?? opts?.previewMap?.[abs],
+      previewUrl:
+        opts?.previewMap?.[pathKey] ??
+        opts?.previewMap?.[p] ??
+        opts?.previewMap?.[abs],
     });
+    added++;
+  }
+  if (skippedCap > 0) {
+    showToast(
+      tr("attach.maxReached", { max: String(MAX_COMPOSER_ATTACHMENTS) }),
+      "error",
+    );
+  } else if (skippedDup > 0 && added === 0 && paths.length > 0) {
+    showToast(tr("attach.alreadyAdded"), "info");
   }
   renderAttachmentChips();
   void loadMissingImagePreviews();
+  return added;
 }
 
 function removeAttachment(path: string): void {
@@ -6740,14 +6894,16 @@ async function pickAndAddAttachments(): Promise<void> {
   const res = await inv<{ paths: string[]; canceled?: boolean }>(
     "system.pickFiles",
     {
-      title: "添加文件或图片到上下文",
+      title: tr("attach.pickTitle"),
       defaultPath: p?.path,
       multi: true,
     },
   );
   if (!res.ok || res.data?.canceled || !res.data?.paths?.length) return;
-  addAttachments(res.data.paths);
-  showToast(`已添加 ${res.data.paths.length} 个附件`);
+  const added = addAttachments(res.data.paths);
+  if (added > 0) {
+    showToast(tr("attach.addedN", { n: String(added) }));
+  }
 }
 
 function activeComposerInput(): HTMLTextAreaElement {
@@ -9231,13 +9387,17 @@ function dismissBtwCard(): void {
   document.getElementById("btw-live-card")?.remove();
 }
 
-/** 插话用户块（视觉上区别于普通 user 气泡） */
-function paintInterjectionMessage(text: string): void {
+/** 插话用户块（视觉上区别于普通 user 气泡）；失败时可 rollback */
+function paintInterjectionMessage(
+  text: string,
+  interjectionId?: string,
+): HTMLElement | null {
   const t = text.trim();
-  if (!t) return;
+  if (!t) return null;
   const el = $("transcript");
   const wrap = document.createElement("div");
   wrap.className = "line user interjection";
+  if (interjectionId) wrap.dataset.interjectionId = interjectionId;
   wrap.innerHTML = `
     <div class="bubble interjection-bubble">
       <div class="interjection-tag">${esc(tr("interject.tag"))}</div>
@@ -9245,14 +9405,20 @@ function paintInterjectionMessage(text: string): void {
     </div>`;
   el.appendChild(wrap);
   el.scrollTop = el.scrollHeight;
+  return wrap;
 }
 
 /** 本端已乐观绘制的 interjection id（回声去重） */
 const selfInterjectionIds = new Set<string>();
+/** btw 进行中：防连点 / 与主 turn 并行时的二次发送 */
+let btwInFlight = false;
+/** interject 进行中：防连点风暴 */
+let interjectInFlight = false;
 
 /**
  * 旁路侧问：打开右侧「旁路侧问」栏（对齐 Codex 侧边聊天布局）。
  * 协议仍是 Grok `_x.ai/btw`；无问题正文时只展开面板。
+ * 可与主 turn 并行（CLI 语义：不打断、不进主对话）。
  */
 async function runBtwCommand(
   questionArg?: string,
@@ -9287,6 +9453,10 @@ async function sendBtwFromSidePanel(): Promise<void> {
     "btw-side-input",
   ) as HTMLTextAreaElement | null;
   if (!ta) return;
+  if (btwInFlight) {
+    showToast(tr("btw.inFlight"), "info");
+    return;
+  }
   const question = ta.value.trim();
   if (!question) {
     showToast(tr("btw.empty"), "error");
@@ -9303,34 +9473,56 @@ async function sendBtwQuestion(
 ): Promise<{ ok: boolean; message?: string }> {
   const q = question.trim();
   if (!q) return { ok: false, message: tr("btw.empty") };
+  if (btwInFlight) {
+    return { ok: false, message: tr("btw.inFlight") };
+  }
 
   showWelcome(false);
   ensureBtwSideOpen();
   const exId = paintBtwExchange(q, "loading");
   recordPromptHistory(`/btw ${q}`);
+  btwInFlight = true;
+  setBtwSideBusy(true);
 
-  const threadId = await ensureLiveThread();
-  if (!threadId) {
-    paintBtwExchange(q, "error", tr("chat.connectFail"), exId);
-    return { ok: false, message: tr("chat.connectFail") };
-  }
+  try {
+    const threadId = await ensureLiveThread();
+    if (!threadId) {
+      paintBtwExchange(q, "error", tr("chat.connectFail"), exId);
+      return { ok: false, message: tr("chat.connectFail") };
+    }
 
-  const res = await inv<{ sessionId: string; answer: string }>("threads.btw", {
-    threadId,
-    question: q,
-  });
-  if (!res.ok) {
-    const msg = formatTurnErrorMessage(
-      res.error?.message ?? tr("btw.fail"),
-      res.error && "details" in res.error
-        ? (res.error as { details?: unknown }).details
-        : undefined,
-    );
-    paintBtwExchange(q, "error", msg, exId);
-    return { ok: false, message: msg };
+    // 不 cancel 主 turn；btw 与 busy 可并行
+    const res = await inv<{ sessionId: string; answer: string }>("threads.btw", {
+      threadId,
+      question: q,
+    });
+    if (!res.ok) {
+      const msg = formatTurnErrorMessage(
+        res.error?.message ?? tr("btw.fail"),
+        res.error && "details" in res.error
+          ? (res.error as { details?: unknown }).details
+          : undefined,
+      );
+      paintBtwExchange(q, "error", msg, exId);
+      return { ok: false, message: msg };
+    }
+    paintBtwExchange(q, "done", res.data?.answer ?? "", exId);
+    return { ok: true, message: tr("btw.ok") };
+  } finally {
+    btwInFlight = false;
+    setBtwSideBusy(false);
   }
-  paintBtwExchange(q, "done", res.data?.answer ?? "", exId);
-  return { ok: true, message: tr("btw.ok") };
+}
+
+function setBtwSideBusy(busy: boolean): void {
+  const sendBtn = document.getElementById(
+    "btn-btw-send",
+  ) as HTMLButtonElement | null;
+  if (sendBtn) sendBtn.disabled = busy;
+  const ta = document.getElementById(
+    "btw-side-input",
+  ) as HTMLTextAreaElement | null;
+  if (ta) ta.readOnly = busy;
 }
 
 function bindBtwSidePanel(): void {
@@ -9360,8 +9552,15 @@ function bindBtwSidePanel(): void {
 async function runInterjectCommand(
   textArg?: string,
 ): Promise<{ ok: boolean; message?: string }> {
-  if (!turnActive) {
+  // cancelling 中禁止插话：避免与 cancel 竞态、误导「已插入」
+  if (turnUiPhase === "cancelling") {
+    return { ok: false, message: tr("interject.cancelling") };
+  }
+  if (!turnActive || turnUiPhase !== "working") {
     return { ok: false, message: tr("interject.needTurn") };
+  }
+  if (interjectInFlight) {
+    return { ok: false, message: tr("interject.inFlight") };
   }
   let text = (textArg ?? "").trim();
   let historyAlreadyRecorded = false;
@@ -9377,35 +9576,67 @@ async function runInterjectCommand(
     return { ok: false, message: tr("interject.empty") };
   }
 
-  const threadId =
-    activeThreadId && !activeThreadId.startsWith("disk_")
-      ? activeThreadId
-      : await ensureLiveThread();
-  if (!threadId) {
-    return { ok: false, message: tr("chat.connectFail") };
-  }
-
+  interjectInFlight = true;
   const interjectionId = `ij_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 9)}`;
+  // 乐观绘制前先占位；失败则回滚 DOM
   selfInterjectionIds.add(interjectionId);
-  paintInterjectionMessage(text);
-  showToast(tr("interject.sent"));
+  const painted = paintInterjectionMessage(text, interjectionId);
   if (!historyAlreadyRecorded) recordPromptHistory(text);
 
-  const res = await inv<{
-    sessionId: string;
-    status: string;
-    interjectionId: string;
-  }>("threads.interject", { threadId, text, interjectionId });
+  try {
+    const threadId =
+      activeThreadId && !activeThreadId.startsWith("disk_")
+        ? activeThreadId
+        : await ensureLiveThread();
+    if (!threadId) {
+      rollbackInterjection(interjectionId, painted);
+      return { ok: false, message: tr("chat.connectFail") };
+    }
 
-  if (!res.ok) {
-    selfInterjectionIds.delete(interjectionId);
-    appendLine(res.error?.message ?? tr("interject.fail"), "error");
-    return {
-      ok: false,
-      message: res.error?.message ?? tr("interject.fail"),
-    };
+    // 二次确认：attach 期间 turn 可能已结束 / 进入 cancelling
+    // await 后重新读；用 as 打破入口处的 phase 收窄（TS 跨 await 仍可能锁在 working）
+    const phaseAfter = turnUiPhase as TurnUiPhase;
+    if (!turnActive || phaseAfter !== "working") {
+      rollbackInterjection(interjectionId, painted);
+      return {
+        ok: false,
+        message:
+          phaseAfter === "cancelling"
+            ? tr("interject.cancelling")
+            : tr("interject.needTurn"),
+      };
+    }
+
+    const res = await inv<{
+      sessionId: string;
+      status: string;
+      interjectionId: string;
+    }>("threads.interject", { threadId, text, interjectionId });
+
+    if (!res.ok) {
+      rollbackInterjection(interjectionId, painted);
+      const msg = formatTurnErrorMessage(
+        res.error?.message ?? tr("interject.fail"),
+        res.error && "details" in res.error
+          ? (res.error as { details?: unknown }).details
+          : undefined,
+      );
+      appendLine(msg, "error");
+      return { ok: false, message: msg };
+    }
+    showToast(tr("interject.ok"));
+    return { ok: true, message: tr("interject.ok") };
+  } finally {
+    interjectInFlight = false;
   }
-  return { ok: true, message: tr("interject.ok") };
+}
+
+function rollbackInterjection(
+  interjectionId: string,
+  el: HTMLElement | null,
+): void {
+  selfInterjectionIds.delete(interjectionId);
+  el?.remove();
 }
 
 /** turn 进行中：将当前输入入队（S19 follow-up） */
@@ -11229,6 +11460,7 @@ npm start</pre>
   bindSessionModeChips();
   bindGoalBanner();
   bindImagePaste();
+  bindComposerDrop();
   bindBtwSidePanel();
   renderAttachmentChips();
   renderGoalBanner();

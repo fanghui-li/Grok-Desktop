@@ -8,6 +8,10 @@ import { HostError } from "../shared/errors.js";
 import { desktopDir } from "./paths.js";
 
 const MAX_READ_BYTES = 1_500_000; // ~1.5MB
+/** 粘贴图上限（与 writePasteImage 一致） */
+export const MAX_PASTE_IMAGE_BYTES = 20 * 1024 * 1024;
+/** 单次 composer 附件个数上限（文件 + 图 + 文件夹） */
+export const MAX_COMPOSER_ATTACHMENTS = 20;
 
 export type FileReadResult = {
   path: string;
@@ -242,8 +246,11 @@ export function writePasteImage(opts: {
     throw new HostError("INVALID_ARGUMENT", "empty image buffer");
   }
   // 限制约 20MB，避免误粘巨图撑爆内存
-  if (buf.length > 20 * 1024 * 1024) {
-    throw new HostError("IO_ERROR", "image too large (max 20MB)");
+  if (buf.length > MAX_PASTE_IMAGE_BYTES) {
+    throw new HostError(
+      "IO_ERROR",
+      `image too large (max ${Math.floor(MAX_PASTE_IMAGE_BYTES / (1024 * 1024))}MB)`,
+    );
   }
   const mime = (opts.mime || "image/png").toLowerCase();
   const ext =

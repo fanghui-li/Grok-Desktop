@@ -680,6 +680,8 @@ export const enUS: MessageDict = {
   "plan.reviseStartToast": "Returned; revising plan…",
   "plan.reviseUser": "Request plan changes",
   "plan.opFail": "Plan action failed",
+  "plan.waitingContent":
+    "Plan mode on: send a task so the agent can write plan.md",
 
   // ── slash / session ops ────────────────────────────────
   "slash.fullOn": "Full access on (synced with permission chip)",
@@ -1050,6 +1052,7 @@ export const enUS: MessageDict = {
   "btw.send": "Send side question",
   "btw.clearThread": "Clear side thread",
   "btw.cleared": "Side thread cleared",
+  "btw.inFlight": "Side question in progress…",
   "side.btw": "Side Q&A",
   "btw.promptTitle": "Side question",
   "btw.promptHint":
@@ -1061,6 +1064,8 @@ export const enUS: MessageDict = {
   "interject.sent": "Injected into current turn",
   "interject.ok": "Interjection delivered",
   "interject.fail": "Failed to send interjection",
+  "interject.cancelling": "Turn is stopping; try interject again after it settles",
+  "interject.inFlight": "Interjection in flight…",
 
   // ── S20 tasks panel ───────────────────────────────────
   "tasks.modalTitle": "Background tasks",
@@ -1212,6 +1217,12 @@ export const enUS: MessageDict = {
   "attach.nCount": "({n} attachment(s))",
   "attach.pasteFail": "Failed to save pasted image",
   "attach.pasteNone": "Could not add pasted image(s)",
+  "attach.pastedOne": "Pasted image attached",
+  "attach.pastedN": "Pasted {n} images",
+  "attach.imageTooLarge": "Image too large (max {max}MB)",
+  "attach.maxReached": "Attachment limit reached ({max})",
+  "attach.alreadyAdded": "Already in attachment list",
+  "attach.dropNone": "Could not add dropped files",
   "attach.remove": "Remove",
   "archive.label": "Archive",
   "archive.empty": "No archived sessions",

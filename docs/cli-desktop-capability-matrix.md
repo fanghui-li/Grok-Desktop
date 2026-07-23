@@ -183,8 +183,8 @@ grok agent stdio（agent-bin / 安装包 / PATH）
 | W7 | `_x.ai/compact_conversation` | Shell 管道 | `threads.compact` | ✅ |
 | W8 | `_x.ai/session/info` | SessionInfoData | `threads.sessionInfo` | ✅ |
 | W9 | `_x.ai/rewind/*` | pager | points/preview/execute | ✅ |
-| W10 | `_x.ai/btw` | 旁路侧问 | `threads.btw` + 侧栏卡片 | 🟡 | 组合路径/失败回落 |
-| W11 | `_x.ai/interject` | mid-turn | `threads.interject` | 🟡 | |
+| W10 | `_x.ai/btw` | 旁路侧问 | `threads.btw` + 侧栏 | ✅ | 2026-07-23：busy 并行、inFlight、失败态；fake agent 契约 |
+| W11 | `_x.ai/interject` | mid-turn | `threads.interject` | ✅ | 2026-07-23：cancelling 拒、失败 rollback、inFlight |
 | W12 | `_x.ai/task/kill` | pager tasks | `threads.killTask` | ✅ |
 | W13 | `_x.ai/memory/flush` · rewrite | shell | flush/dream 路径 | ✅ |
 | W14 | `x.ai/recap` · share 类 | pager | 未接 | ❌ |
@@ -242,8 +242,8 @@ grok agent stdio（agent-bin / 安装包 / PATH）
 | Q2 | 队列编辑 | 删/改/重排 | UI 全量编辑 | ✅ | |
 | Q3 | interrupt pause | 中断后 pause | `pausedByInterrupt` | ✅ | N7 / T8 已验 |
 | Q4 | QueueChanged 多端 | wire 广播 | 未作多端主路径 | 🟡 | Mode B 单 Host 够用 |
-| Q5 | `/btw` | `x.ai/btw` 旁路 | 侧栏侧问 + slash | 🟡 | |
-| Q6 | mid-turn interject | `x.ai/interject` | slash + IPC | 🟡 | |
+| Q5 | `/btw` | `x.ai/btw` 旁路 | 侧栏侧问 + slash | ✅ | 与主 turn 并行；不误 cancel |
+| Q6 | mid-turn interject | `x.ai/interject` | slash + IPC | ✅ | working only；失败回滚气泡 |
 | Q7 | `/tasks` | 列 bg + subagent + scheduled | 四类聚合 + kill | ✅ | scheduled 绑 session |
 | Q8 | `/loop` | PROMPT_COMMANDS → scheduler | 无同名；Automations 部分替代 | 🟡 | **勿假装语义等同** |
 
@@ -254,7 +254,7 @@ grok agent stdio（agent-bin / 安装包 / PATH）
 | # | 能力 | CLI | Desktop | 状态 | 备注 |
 |---|------|-----|---------|------|------|
 | G1 | always-approve / yolo | `/always-approve` | chip + slash + meta | ✅ | |
-| G2 | plan 模式 | `/plan` | chip + slash + 面板 + set_mode | 🟡 | 工作流深度可加强 |
+| G2 | plan 模式 | `/plan` | chip + slash + 面板 + set_mode | ✅ | 2026-07-23：进 plan 开侧栏；回合结束自动 surface |
 | G3 | exit plan 审批 | reverse request | 同 | ✅ | |
 | G4 | goal set/status/clear/pause/resume | Shell `/goal` + `--budget` | slash + banner + budget 弹窗 | ✅ | |
 | G5 | model / effort 热切换 | set_model | chip + `/model` `/effort` | ✅ | 不兼容 harness → 新会话 |
@@ -269,7 +269,7 @@ grok agent stdio（agent-bin / 安装包 / PATH）
 |---|------|-----|---------|------|------|
 | X1 | Memory 目录 | `GROK_HOME/memory` | Desktop home 下同源布局 + `GROK_MEMORY` | ✅ | |
 | X2 | `/remember` `/flush` `/dream` | shell/pager | slash + 设置浏览 | ✅ | reattach 后 agent 吃开关 |
-| X3 | Skills 解析 | shell `resolve()` 真解析 | 读 SKILL.md 或插提示 | 🟡 | 非 shell 子进程同源 |
+| X3 | Skills 解析 | shell `resolve()` 真解析 | Host `skillsResolve` → CLI `<skill>` envelope | ✅ | 2026-07-23：对齐 build_skill_message + skill_information |
 | X4 | availableCommands 合并 | agent 广告 | Host 缓存 + slash 合并 | ✅ | |
 | X5 | Plugins / 市场 | `/plugins` | 插件页 | ✅ | |
 | X6 | MCP | `/mcps` 等 | 设置 + session 透传 | ✅ | |
@@ -286,7 +286,7 @@ grok agent stdio（agent-bin / 安装包 / PATH）
 | P3 | Worktree | 🟡 | Host git；非 agent 池 |
 | P4 | 无项目「对话」区 | ✅ | 与项目同级 section |
 | I1 | `@` 文件 | ✅ | |
-| I2 | 附件 / 粘贴图 | 🟡 | 可用，体验可贴 |
+| I2 | 附件 / 粘贴图 | ✅ | 2026-07-23：上限 20、巨图拒绝、拖放、i18n 错误态 |
 | I3 | 停止钮 / 多行发送 | ✅ | |
 | D1 | Codex 壳 / 三栏 / 自定义供应商 | D+ | |
 | D2 | Automations / Inbox | 🟡 | ≠ `/loop` |
@@ -321,14 +321,14 @@ grok agent stdio（agent-bin / 安装包 / PATH）
 P0  多会话 + turn 真源 + 负例 N1–N11  ——— ✅ 2026-07-22 已验收
     · 回归：改 cancel / openThread / history / 投影时重跑 N1–N11
 
-P1  队列 / 插话 wire 边角（Q4–Q6 · btw/interject 深度）
-    · QueueChanged L2 仍可选；L1 主路径已齐
+P1  队列 / 插话 wire 边角 ——— Q5/Q6 btw·interject ✅ 2026-07-23
+    · QueueChanged L2 仍可选（Q4）；L1 主路径已齐
 
 P2  Agent 扩展完整度（按产品选型）
     · autoMode / fs write（若需要）
     · recap/share 可后置
 
-P3  Plan 工作流深度 · Skills 真解析 · Hooks 全量
+P3  Plan / Skills ——— G2·X3 ✅ 2026-07-23；Hooks 全量仍 🟡
     · 体验债，非串台根因
 
 明确不做

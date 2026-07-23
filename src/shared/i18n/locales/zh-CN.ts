@@ -661,6 +661,7 @@ export const zhCN = {
   "plan.reviseStartToast": "已退回，正在修订计划…",
   "plan.reviseUser": "要求修改计划",
   "plan.opFail": "计划操作失败",
+  "plan.waitingContent": "计划模式已开启：发送任务后 agent 会写入 plan.md",
 
   // ── slash / session ops ────────────────────────────────
   "slash.fullOn": "已开启完全访问（与权限 chip 同步）",
@@ -1016,6 +1017,7 @@ export const zhCN = {
   "btw.send": "发送侧问",
   "btw.clearThread": "清空侧问记录",
   "btw.cleared": "已清空侧问",
+  "btw.inFlight": "侧问进行中，请稍候…",
   "side.btw": "旁路侧问",
   "btw.promptTitle": "旁路侧问",
   "btw.promptHint": "不打断当前回合；答案显示在右侧旁路侧问栏。",
@@ -1026,6 +1028,8 @@ export const zhCN = {
   "interject.sent": "已插入当前回合",
   "interject.ok": "插话已送达",
   "interject.fail": "插话发送失败",
+  "interject.cancelling": "正在停止当前回合，请稍后再插话",
+  "interject.inFlight": "插话发送中，请稍候…",
 
   // ── S20 tasks panel ───────────────────────────────────
   "tasks.modalTitle": "后台任务",
@@ -1168,6 +1172,12 @@ export const zhCN = {
   "attach.nCount": "（{n} 个附件）",
   "attach.pasteFail": "图片保存失败",
   "attach.pasteNone": "未能添加粘贴的图片",
+  "attach.pastedOne": "已粘贴图片到附件",
+  "attach.pastedN": "已粘贴 {n} 张图片到附件",
+  "attach.imageTooLarge": "图片过大（上限 {max}MB）",
+  "attach.maxReached": "附件已达上限（{max} 个）",
+  "attach.alreadyAdded": "附件已在列表中",
+  "attach.dropNone": "未能添加拖入的文件",
   "attach.remove": "移除",
   "archive.label": "归档",
   "archive.empty": "暂无归档",

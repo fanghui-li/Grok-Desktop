@@ -3485,37 +3485,63 @@ export class DesktopHost {
     return { ok: true, hooks: list.hooks };
   }
 
-  // ── Skills resolve (P3-A) ────────────────────────────────
+  // ── Skills resolve (P3-A · 对齐 CLI build_skill_message) ──
 
-  skillsResolve(name: string, cwd?: string): {
+  skillsResolve(
+    name: string,
+    cwd?: string,
+    opts?: { args?: string },
+  ): {
     name: string;
     mode: "resolved" | "prompt_fallback";
     prompt: string;
     path?: string;
+    description?: string;
   } {
-    const n = name.trim().replace(/^\//, "");
+    const n = name.trim().replace(/^\//, "").replace(/^skill:/i, "");
     if (!n) {
       throw new HostError("INVALID_ARGUMENT", "skill name required");
     }
-    // Search GROK_HOME/skills and project .grok/skills for SKILL.md
-    const roots = [
-      path.join(grokHomeDir(this.home), "skills", n),
-      path.join(grokHomeDir(this.home), "skills", n.replace(/:/g, path.sep)),
-    ];
+    const args = (opts?.args ?? "").trim();
+    // 与 listSkills / CLI 发现顺序一致：项目 > Desktop home > ~/.grok
+    const nameVariants = [n, n.replace(/:/g, path.sep)];
+    const rootBases: string[] = [];
     if (cwd) {
-      roots.unshift(path.join(cwd, ".grok", "skills", n));
+      rootBases.push(path.join(cwd, ".grok", "skills"));
     }
-    for (const dir of roots) {
-      const skillMd = path.join(dir, "SKILL.md");
-      if (fs.existsSync(skillMd)) {
+    rootBases.push(path.join(grokHomeDir(this.home), "skills"));
+    // 兼容用户在 CLI home 放的 skills（只读发现，不混 session 数据）
+    const userHome = this.home ?? process.env.USERPROFILE ?? process.env.HOME;
+    if (userHome) {
+      rootBases.push(path.join(userHome, ".grok", "skills"));
+    }
+
+    for (const base of rootBases) {
+      for (const variant of nameVariants) {
+        const dir = path.join(base, variant);
+        const skillMd = path.join(dir, "SKILL.md");
+        if (!fs.existsSync(skillMd)) continue;
         try {
-          const body = fs.readFileSync(skillMd, "utf8");
-          // Full runner path: send skill invocation prompt (shell resolve equivalent for Desktop)
+          const raw = fs.readFileSync(skillMd, "utf8");
+          const { description, body } = parseSkillMd(raw);
+          const content = body.slice(0, 12000);
+          // CLI 同源 envelope：`<skill name description path>` + body
+          const descAttr = xmlAttr(description || n);
+          const pathAttr = xmlAttr(skillMd);
+          const nameAttr = xmlAttr(n);
+          const argsAttr = args ? ` args="${xmlAttr(args)}"` : "";
+          const envelope =
+            `<skill name="${nameAttr}" description="${descAttr}" path="${pathAttr}"${argsAttr}>\n` +
+            `${content}\n` +
+            `</skill>`;
+          // 用户 slash → 直接注入 prompt（对齐 CLI skill_information 零往返路径）
+          const prompt = buildSkillInformationPrompt(n, skillMd, envelope);
           return {
             name: n,
             mode: "resolved",
             path: skillMd,
-            prompt: `Use the skill "${n}" defined at ${skillMd}. Follow SKILL.md instructions.\n\n---\n${body.slice(0, 12000)}`,
+            description: description || undefined,
+            prompt,
           };
         } catch {
           /* continue */
@@ -3765,4 +3791,49 @@ function legacyModeToPatch(mode: SessionMode): {
   if (mode === "plan") return { alwaysApprove: false, plan: true };
   if (mode === "always_approve") return { alwaysApprove: true, plan: false };
   return { alwaysApprove: false, plan: false };
+}
+
+/** SKILL.md frontmatter + body（对齐 CLI skill 加载） */
+function parseSkillMd(raw: string): { description: string; body: string } {
+  const text = raw.replace(/^\uFEFF/, "");
+  const fm = /^---\r?\n([\s\S]*?)\r?\n---\r?\n?([\s\S]*)$/.exec(text);
+  if (!fm) {
+    return { description: "", body: text.trim() };
+  }
+  const head = fm[1] ?? "";
+  const body = (fm[2] ?? "").trim();
+  const d = /^description:\s*(.+)$/m.exec(head);
+  let description = d?.[1]?.trim().replace(/^["']|["']$/g, "") ?? "";
+  if (!description) {
+    const n = /^name:\s*(.+)$/m.exec(head);
+    description = n?.[1]?.trim().replace(/^["']|["']$/g, "") ?? "";
+  }
+  return { description, body };
+}
+
+function xmlAttr(s: string): string {
+  return s
+    .replace(/&/g, "&amp;")
+    .replace(/"/g, "&quot;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;");
+}
+
+/**
+ * 用户 slash 带参数时：CLI 式 skill_information 索引 + envelope。
+ * 无参数时仅发 `<skill>` 块即可（agent skill tool 同源）。
+ */
+function buildSkillInformationPrompt(
+  name: string,
+  skillPath: string,
+  skillEnvelope: string,
+): string {
+  return (
+    `<skill_information>\n` +
+    `<skills_referenced>\n` +
+    `- name="${xmlAttr(name)}" path="${xmlAttr(skillPath)}"\n` +
+    `</skills_referenced>\n` +
+    `${skillEnvelope}\n` +
+    `</skill_information>`
+  );
 }

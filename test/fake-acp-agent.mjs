@@ -275,6 +275,36 @@ rl.on("line", async (line) => {
     return;
   }
 
+  // /btw side question (CLI: x.ai/btw · Desktop wire: _x.ai/btw)
+  if (method === "_x.ai/btw" || method === "x.ai/btw") {
+    const q = String(params?.question ?? "").trim();
+    write({
+      jsonrpc: "2.0",
+      id,
+      result: {
+        answer: q ? `btw-echo: ${q}` : "No response",
+      },
+    });
+    return;
+  }
+
+  // mid-turn interject (does not cancel turn)
+  if (method === "_x.ai/interject" || method === "x.ai/interject") {
+    const interjectionId =
+      params?.interjectionId ??
+      params?.interjection_id ??
+      `ij_fake_${randomUUID()}`;
+    write({
+      jsonrpc: "2.0",
+      id,
+      result: {
+        status: hungPromptId ? "queued" : "accepted",
+        interjectionId,
+      },
+    });
+    return;
+  }
+
   if (id != null) {
     write({
       jsonrpc: "2.0",

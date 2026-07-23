@@ -567,6 +567,14 @@ async function handleHostIpc(
         host.skillsResolve(
           String(p.name ?? ""),
           p.cwd as string | undefined,
+          {
+            args:
+              typeof p.args === "string"
+                ? p.args
+                : typeof p.arguments === "string"
+                  ? p.arguments
+                  : undefined,
+          },
         ),
       );
     case "threads.pin":

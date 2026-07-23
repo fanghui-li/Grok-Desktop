@@ -470,15 +470,46 @@ describe("P3 skills resolve + hooks", () => {
     fs.mkdirSync(skillDir, { recursive: true });
     fs.writeFileSync(
       path.join(skillDir, "SKILL.md"),
-      "# Demo\n\nDo the thing.\n",
+      "---\nname: demo-skill\ndescription: Demo skill\n---\n\n# Demo\n\nDo the thing.\n",
       "utf8",
     );
     const host = trackHost(new DesktopHost({ home }));
     const r = host.skillsResolve("demo-skill");
     expect(r.mode).toBe("resolved");
     expect(r.prompt).toContain("Do the thing");
+    // CLI-aligned envelope
+    expect(r.prompt).toContain('<skill name="demo-skill"');
+    expect(r.prompt).toContain("<skill_information>");
+    expect(r.prompt).toContain("description=\"Demo skill\"");
+    const withArgs = host.skillsResolve("demo-skill", undefined, {
+      args: "fix typo",
+    });
+    expect(withArgs.mode).toBe("resolved");
+    expect(withArgs.prompt).toContain('args="fix typo"');
     const fb = host.skillsResolve("missing-skill-xyz");
     expect(fb.mode).toBe("prompt_fallback");
+  });
+
+  it("threads.btw and threads.interject via fake agent", async () => {
+    const home = tempHome();
+    const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "grok-btw-"));
+    homes.push(cwd);
+    const host = trackHost(
+      new DesktopHost({
+        home,
+        grokPath: process.execPath,
+        agentArgs: [fakeAgent],
+      }),
+    );
+    const created = await host.threadsCreate({ cwd, title: "btw" });
+    const answer = await host.threadsBtw(created.threadId, "what is x?");
+    expect(answer.answer).toContain("btw-echo");
+    // interject without in-flight turn still accepted by fake (agent may queue)
+    const ij = await host.threadsInterject(created.threadId, "steer left", {
+      interjectionId: "ij_test_1",
+    });
+    expect(ij.interjectionId).toBe("ij_test_1");
+    expect(ij.status).toBeTruthy();
   });
 
   it("hooksList reads hooks-trust.json (default untrusted until trust)", () => {

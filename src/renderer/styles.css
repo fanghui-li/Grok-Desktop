@@ -1603,6 +1603,13 @@ html[data-theme="dark"] .btn-dark:hover { filter: brightness(0.92); }
   /* 底边留足空间，避免 overflow+圆角裁切权限 chip 文字下半截 */
   padding: 12px 12px 10px;
 }
+/* 拖放附件高亮（welcome / chat 区） */
+#welcome.is-drag-over .composer-card,
+#chat.is-drag-over .composer-card {
+  border-color: var(--accent, #6b8afd);
+  box-shadow: 0 0 0 2px color-mix(in srgb, var(--accent, #6b8afd) 35%, transparent);
+}
+
 .composer-card.compact { border-radius: 16px; }
 .composer-card textarea {
   width: 100%; border: 0; outline: none; resize: none;
