@@ -101,19 +101,35 @@ export type NormalizedEvent =
       message: string;
       code?: string;
     }
-  /** 与 grok agent 运行时 goal 同源（sessionUpdate: goal_updated） */
+  /**
+   * 与 grok agent 运行时 goal 同源（sessionUpdate: goal_updated）。
+   * 唯一创建/更新 SessionGoalProjection 的事件源；update_goal tool 不得再合成。
+   */
   | {
       type: "goal.updated";
       threadId: string;
       sessionId: string;
       goalId?: string;
       objective: string;
-      /** agent: active | user_paused | complete | … */
+      /** wire: active | user_paused | back_off_paused | … | complete | cleared */
       status: string;
       phase?: string;
+      tokenBudget?: number | null;
+      tokensUsed?: number;
       elapsedMs?: number;
       lastEvent?: string;
+      lastEventDetail?: string;
+      /** pause_message / blocked 原因 */
       message?: string;
+      verifyingCompletion?: boolean;
+      planning?: boolean;
+      classifierRunsAttempted?: number;
+      classifierMaxRuns?: number;
+      lastClassifierVerdict?: string;
+      lastClassifierDetailsPath?: string;
+      tokenBaseline?: number;
+      finishedSubagentTokens?: number;
+      liveSubagentTokens?: number;
       raw?: unknown;
     }
   /** agent auto-compact / 手动 compact 完成（x.ai/session_notification） */

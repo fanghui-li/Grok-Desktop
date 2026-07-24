@@ -80,19 +80,24 @@ import {
 import { COMPAT_DISABLED_ENV } from "./compat.js";
 import { loadBtwHistory } from "./btw-history.js";
 import {
-  applyAgentGoalProjection,
   clearGoal,
-  loadGoal,
   loadPlan,
   loadSubagentTree,
   mapSubagentStatus,
+  projectionToLegacyState,
   setGoalStatus,
   setPlanStatus,
   syncGoalFromAgentLog,
   upsertSubagentNode,
   writeGoal,
   writePlan,
+  writeProjectionCache,
 } from "./goals.js";
+import {
+  applyGoalUpdated,
+  getSessionGoal,
+  markGoalClearedLocal,
+} from "./session-goal-store.js";
 import { InboxStore } from "./inbox.js";
 import { HostLogger } from "./logger.js";
 import {
@@ -2608,23 +2613,41 @@ export class DesktopHost {
 
   // ── Goals / Plans / Subagents ────────────────────────────
 
+  /**
+   * 返回当前 session goal 投影（优先内存 store，否则 null）。
+   * 兼容旧 GoalState 形状；完整字段在 projection。
+   */
   goalsGet(sessionId: string): GoalState | null {
-    return loadGoal(sessionId, this.home);
+    const proj = getSessionGoal(sessionId);
+    if (proj) return projectionToLegacyState(proj);
+    // 不读脏 goal.json 作权威；冷启动请 goals.sync
+    return null;
   }
 
+  /**
+   * @deprecated 本地写非权威。控制面应发 `/goal` slash。
+   * 保留 IPC 兼容：仅写草稿缓存，不抬 harness 投影。
+   */
   goalsSet(sessionId: string, title: string, status?: GoalState["status"]): GoalState {
     return writeGoal(sessionId, title, this.home, status ?? "active");
   }
 
+  /**
+   * @deprecated 本地 setStatus 非权威；pause/resume 应 `/goal pause|resume`。
+   */
   goalsSetStatus(sessionId: string, status: GoalState["status"]): GoalState | null {
     return setGoalStatus(sessionId, status, this.home);
   }
 
   goalsClear(sessionId: string): { cleared: boolean } {
+    markGoalClearedLocal(sessionId);
     return { cleared: clearGoal(sessionId, this.home) };
   }
 
-  /** 从 agent updates.jsonl 回读最新 goal_updated 并投影（完成态兜底） */
+  /**
+   * 从 agent updates.jsonl bootstrap 投影（冷启动 / ACP 丢事件兜底）。
+   * 仅当 jsonl 有 goal_updated 时建立投影。
+   */
   goalsSync(sessionId: string) {
     return syncGoalFromAgentLog(sessionId, this.home);
   }
@@ -4208,24 +4231,67 @@ export class DesktopHost {
         projectId: live.thread.projectId,
       });
     }
-    // agent 运行时 goal 同源：首启也落盘 goal.json（不要求用户先 /goal）
+    // agent goal_updated → session-goal-store（唯一投影真源；不对 tool 合成）
     if (ev.type === "goal.updated") {
       try {
-        applyAgentGoalProjection(
-          ev.sessionId,
-          ev.objective || "Goal",
-          ev.status,
-          this.home,
-        );
+        const result = applyGoalUpdated({
+          sessionId: ev.sessionId,
+          goalId: ev.goalId,
+          objective: ev.objective,
+          status: ev.status,
+          phase: ev.phase,
+          tokenBudget: ev.tokenBudget,
+          tokensUsed: ev.tokensUsed,
+          elapsedMs: ev.elapsedMs,
+          lastEvent: ev.lastEvent,
+          lastEventDetail: ev.lastEventDetail,
+          message: ev.message,
+          verifyingCompletion: ev.verifyingCompletion,
+          planning: ev.planning,
+          classifierRunsAttempted: ev.classifierRunsAttempted,
+          classifierMaxRuns: ev.classifierMaxRuns,
+          lastClassifierVerdict: ev.lastClassifierVerdict,
+          lastClassifierDetailsPath: ev.lastClassifierDetailsPath,
+          tokenBaseline: ev.tokenBaseline,
+          finishedSubagentTokens: ev.finishedSubagentTokens,
+          liveSubagentTokens: ev.liveSubagentTokens,
+        });
+        if (!result.dropped) {
+          writeProjectionCache(ev.sessionId, result.projection, this.home);
+          this.logger.debug("goal.apply", {
+            sessionId: ev.sessionId,
+            goalId: ev.goalId,
+            status: ev.status,
+            cleared: result.cleared,
+          });
+        } else {
+          this.logger.debug("goal.drop_stale", {
+            sessionId: ev.sessionId,
+            goalId: ev.goalId,
+            status: ev.status,
+          });
+        }
       } catch (err) {
         this.logger.warn("goal.project_failed", { err: String(err) });
       }
-      const st = ev.status.toLowerCase();
-      if (st === "blocked" && live) {
+      const st = String(ev.status ?? "").toLowerCase();
+      if (
+        (st === "blocked" || st === "budget_limited" || st === "infra_paused") &&
+        live
+      ) {
         this.inbox.add({
           type: "goal_blocked",
-          title: "Goal blocked",
-          body: ev.message || ev.objective || "Goal is blocked",
+          title:
+            st === "budget_limited"
+              ? "Goal budget limited"
+              : st === "infra_paused"
+                ? "Goal paused (rate limit / service)"
+                : "Goal blocked",
+          body:
+            ev.message ||
+            (st === "infra_paused"
+              ? "Not marked complete — resume when ready"
+              : ev.objective || "Goal needs attention"),
           sessionId: ev.sessionId,
           threadId,
           projectId: live.thread.projectId,

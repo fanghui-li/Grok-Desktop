@@ -37,6 +37,19 @@ npm run dev
 | `npm run dist:mac` | 仅在 macOS：arm64 dmg+zip（未签名；CI 见 `release-mac`） |
 | `npm run fetch:agent` | 从官方 CDN 拉 grok 到 `agent-bin/` |
 
+## 功能测试
+
+- 优先补/跑 **可复现** 的 Vitest（Host + `test/fake-acp-agent.mjs` 等），例如：
+
+```bash
+npx vitest run test/<相关>.test.ts
+```
+
+- 样板：`test/goal-e2e-host.test.ts`、`test/session-goal-store.test.ts`、`test/host-acp.test.ts`。
+- 默认**不含** Electron UI 自动化、不默认真 grok 长测。
+- 大改 Host/会话语义时请在 PR 说明跑过哪些测试；真窗口冒烟由维护者按风险点验。
+- 维护者本机可选工作流（**gitignore，不入库**）：`.grok/skills/desktop-test/`、`docs/test-archive/`。
+
 ## 分支（方案 A / GitHub Flow）
 
 - **`main`**：唯一长期分支与发版线，保持可发布。  

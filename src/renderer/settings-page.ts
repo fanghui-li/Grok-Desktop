@@ -146,6 +146,13 @@ function settingsSections(): Array<{
 }> {
   return [
     {
+      id: "account",
+      group: tr("settings.group.personal"),
+      label: tr("settings.section.account"),
+      icon: "👤",
+      keywords: tr("settings.kw.account"),
+    },
+    {
       id: "general",
       group: tr("settings.group.personal"),
       label: tr("settings.section.general"),
@@ -158,13 +165,6 @@ function settingsSections(): Array<{
       label: tr("settings.section.appearance"),
       icon: "◐",
       keywords: tr("settings.kw.appearance"),
-    },
-    {
-      id: "account",
-      group: tr("settings.group.personal"),
-      label: tr("settings.section.account"),
-      icon: "👤",
-      keywords: tr("settings.kw.account"),
     },
     {
       id: "about",
@@ -199,7 +199,7 @@ function settingsSections(): Array<{
 
 export class SettingsPageController {
   private open = false;
-  private section: SectionId = "general";
+  private section: SectionId = "account";
   private filter = "";
   private cfg: DesktopConfigData = {};
   private accountTab: AccountTab = "official";
@@ -1763,12 +1763,98 @@ export class SettingsPageController {
       method,
     });
     if (!res.ok) {
-      window.alert(res.error?.message ?? tr("prov.loginFail"));
+      this.showAuthNoticeDialog({
+        kind: "error",
+        title: tr("prov.loginDlgFailTitle"),
+        body: res.error?.message ?? tr("prov.loginFail"),
+      });
       return;
     }
-    window.alert(res.data?.message ?? tr("prov.loginStarted"));
+    const isDevice = method === "device-auth";
+    this.showAuthNoticeDialog({
+      kind: "info",
+      title: isDevice ? tr("prov.loginDlgTitleDevice") : tr("prov.loginDlgTitle"),
+      body: isDevice ? tr("prov.loginDlgBodyDevice") : tr("prov.loginDlgBody"),
+      tip: tr("prov.loginDlgTip"),
+    });
     this.cb.onAuthChanged?.();
     await this.renderContent();
+  }
+
+  /**
+   * 设置页内嵌提示弹窗（替代 window.alert），样式对齐 settings-modal。
+   */
+  private showAuthNoticeDialog(opts: {
+    kind: "info" | "error";
+    title: string;
+    body: string;
+    tip?: string;
+  }): void {
+    const host = document.getElementById("settings-page");
+    if (!host) {
+      window.alert(
+        [opts.title, opts.body, opts.tip].filter(Boolean).join("\n\n"),
+      );
+      return;
+    }
+    host.querySelector("#auth-notice-backdrop")?.remove();
+
+    const esc = this.cb.esc;
+    const tipHtml = opts.tip
+      ? `<div class="settings-notice-tip" role="note">
+          <span class="settings-notice-tip-ico" aria-hidden="true">💡</span>
+          <p class="settings-notice-tip-text">${esc(opts.tip)}</p>
+        </div>`
+      : "";
+    const backdrop = document.createElement("div");
+    backdrop.id = "auth-notice-backdrop";
+    backdrop.className = "settings-modal-backdrop settings-notice-backdrop";
+    backdrop.setAttribute("role", "presentation");
+    backdrop.innerHTML = `
+      <div class="settings-modal settings-notice-modal" role="dialog" aria-modal="true" aria-labelledby="auth-notice-title">
+        <div class="settings-modal-head">
+          <h2 class="settings-modal-title" id="auth-notice-title">${esc(opts.title)}</h2>
+          <button type="button" class="settings-modal-close" data-auth-notice-close aria-label="${esc(tr("common.close"))}">×</button>
+        </div>
+        <div class="settings-modal-body settings-notice-body">
+          <p class="settings-notice-body-text settings-notice-body-text--${opts.kind}">${esc(opts.body)}</p>
+          ${tipHtml}
+        </div>
+        <div class="settings-modal-footer settings-notice-footer">
+          <button type="button" class="btn-dark settings-mini-btn" data-auth-notice-close>${esc(tr("common.ok"))}</button>
+        </div>
+      </div>`;
+    host.appendChild(backdrop);
+
+    const close = () => {
+      backdrop.remove();
+      document.removeEventListener("keydown", onKey);
+    };
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") {
+        e.preventDefault();
+        close();
+      }
+    };
+    document.addEventListener("keydown", onKey);
+    backdrop.addEventListener("click", (e) => {
+      if (e.target === backdrop) close();
+    });
+    for (const el of Array.from(
+      backdrop.querySelectorAll("[data-auth-notice-close]"),
+    )) {
+      (el as HTMLElement).onclick = (e) => {
+        e.preventDefault();
+        close();
+      };
+    }
+    requestAnimationFrame(() => {
+      (
+        backdrop.querySelector(
+          ".settings-notice-footer [data-auth-notice-close]",
+        ) as HTMLElement | null
+      )?.focus();
+    });
   }
 
   private async runAuthLogout(): Promise<void> {

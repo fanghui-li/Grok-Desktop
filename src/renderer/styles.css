@@ -2271,11 +2271,22 @@ html[data-theme="dark"] .btn-dark:hover { filter: brightness(0.92); }
 .goal-banner.is-paused .goal-banner-kicker {
   color: #b45309;
 }
+/* 完成态：浅绿底 + 深绿字（浅色）；深色见下方覆盖，避免浅字叠浅底 */
 .goal-banner.is-completed {
   background: #f0fdf4;
   border-color: #bbf7d0;
 }
 .goal-banner.is-completed .goal-banner-kicker {
+  color: #15803d;
+}
+.goal-banner.is-completed .goal-banner-title {
+  color: #14532d;
+}
+.goal-banner.is-completed .goal-banner-elapsed {
+  color: #166534;
+  opacity: 0.85;
+}
+.goal-banner.is-completed .goal-banner-ico {
   color: #15803d;
 }
 .goal-banner-btn.hidden { display: none !important; }
@@ -2305,6 +2316,27 @@ html[data-theme="dark"] .btn-dark:hover { filter: brightness(0.92); }
   font-weight: 500;
   word-break: break-word;
 }
+.goal-banner-phase {
+  display: block;
+  font-size: 11px;
+  color: var(--text-2);
+  margin-top: 2px;
+  min-height: 0;
+}
+.goal-banner-phase:empty {
+  display: none;
+}
+.goal-banner-hint {
+  display: block;
+  font-size: 11.5px;
+  line-height: 1.4;
+  color: #92400e;
+  margin-top: 4px;
+  word-break: break-word;
+}
+.goal-banner-hint:empty {
+  display: none;
+}
 .goal-banner-elapsed {
   color: var(--text-3);
   margin-left: 6px;
@@ -2327,8 +2359,60 @@ html[data-theme="dark"] .btn-dark:hover { filter: brightness(0.92); }
   font-size: 13px;
 }
 .goal-banner-btn:hover {
-  background: #f4f4f4;
+  background: var(--bg-hover);
   color: var(--text);
+}
+.goal-banner-btn.is-primary {
+  color: #0f766e;
+  background: rgba(15, 118, 110, 0.1);
+  font-weight: 600;
+}
+.goal-banner-btn.is-primary:hover {
+  background: rgba(15, 118, 110, 0.18);
+  color: #0f766e;
+}
+
+/* 深色：完成/暂停条不用浅色硬编码，保证字与底对比度 */
+html[data-theme="dark"] .goal-banner.is-completed {
+  background: color-mix(in srgb, #22c55e 14%, var(--bg-elevated));
+  border-color: color-mix(in srgb, #22c55e 32%, var(--border));
+}
+html[data-theme="dark"] .goal-banner.is-completed .goal-banner-kicker {
+  color: #86efac;
+}
+html[data-theme="dark"] .goal-banner.is-completed .goal-banner-title {
+  color: #dcfce7;
+}
+html[data-theme="dark"] .goal-banner.is-completed .goal-banner-elapsed {
+  color: #86efac;
+  opacity: 0.9;
+}
+html[data-theme="dark"] .goal-banner.is-completed .goal-banner-ico {
+  color: #4ade80;
+}
+html[data-theme="dark"] .goal-banner.is-completed .goal-banner-btn {
+  color: #86efac;
+}
+html[data-theme="dark"] .goal-banner.is-completed .goal-banner-btn:hover {
+  background: color-mix(in srgb, #22c55e 18%, transparent);
+  color: #dcfce7;
+}
+html[data-theme="dark"] .goal-banner.is-paused .goal-banner-kicker {
+  color: #fbbf24;
+}
+html[data-theme="dark"] .goal-banner-hint {
+  color: #fcd34d;
+}
+html[data-theme="dark"] .goal-banner-ico {
+  color: #2dd4bf;
+}
+html[data-theme="dark"] .goal-banner-btn.is-primary {
+  color: #5eead4;
+  background: rgba(45, 212, 191, 0.12);
+}
+html[data-theme="dark"] .goal-banner-btn.is-primary:hover {
+  background: rgba(45, 212, 191, 0.22);
+  color: #99f6e4;
 }
 .composer-card.goal-compose-active {
   box-shadow: 0 0 0 2px rgba(15, 118, 110, 0.18);
@@ -2349,6 +2433,13 @@ html[data-theme="dark"] .btn-dark:hover { filter: brightness(0.92); }
   font-size: 13.5px;
   outline: none;
   margin-bottom: 14px;
+}
+.prompt-dlg-textarea {
+  min-height: 96px;
+  resize: vertical;
+  font-family: inherit;
+  line-height: 1.45;
+  box-sizing: border-box;
 }
 .prompt-dlg-input:focus {
   border-color: #bdbdbd;
@@ -3191,6 +3282,14 @@ html[data-theme="dark"] .send-btn:hover { filter: brightness(0.92); }
 }
 .turn-phase.is-working .turn-phase-label {
   color: var(--text-2);
+}
+/* 目标已停、回合收尾：弱于「工作中」自驱态 */
+.turn-phase.is-working.is-draining .turn-phase-label {
+  color: var(--text-3);
+  font-weight: 400;
+}
+.turn-phase.is-working.is-draining .turn-phase-dots i {
+  opacity: 0.55;
 }
 .turn-phase.is-done .turn-phase-label {
   color: var(--text-2);
@@ -5325,6 +5424,57 @@ html[data-theme="dark"] .about-hero-banner--warn {
 }
 .settings-modal-footer .settings-save-hint {
   margin-left: auto;
+}
+
+/* 设置页提示弹窗（OAuth 登录等，替代系统 alert） */
+.settings-notice-backdrop {
+  z-index: 90;
+}
+.settings-notice-modal {
+  width: min(420px, 100%);
+  max-height: min(80vh, 480px);
+}
+.settings-notice-body {
+  padding: 16px 18px 8px;
+  overflow: auto;
+}
+.settings-notice-body-text {
+  margin: 0;
+  font-size: 13.5px;
+  line-height: 1.55;
+  color: var(--text-2);
+}
+.settings-notice-body-text--error {
+  color: var(--text);
+}
+.settings-notice-tip {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  margin-top: 14px;
+  padding: 12px 12px 12px 14px;
+  border-radius: 12px;
+  background: color-mix(in srgb, var(--accent, #3b82f6) 12%, transparent);
+  border: 1px solid color-mix(in srgb, var(--accent, #3b82f6) 28%, transparent);
+}
+.settings-notice-tip-ico {
+  flex-shrink: 0;
+  font-size: 15px;
+  line-height: 1.4;
+  margin-top: 1px;
+}
+.settings-notice-tip-text {
+  margin: 0;
+  font-size: 12.5px;
+  line-height: 1.55;
+  color: var(--text);
+}
+.settings-notice-footer {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  position: static;
+  margin-top: 0;
 }
 /* 双列字段：左右标签/输入顶对齐、同高 */
 .settings-field-row {

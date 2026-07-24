@@ -13,6 +13,15 @@ const askPermission = process.env.FAKE_ACP_ASK_PERMISSION === "1";
 /** When set, session/prompt hangs until session/cancel (mid-turn cancel tests). */
 let hungPromptId = null;
 
+/**
+ * Minimal goal harness for Host E2E (maps checklist P/L/N/M).
+ * Only responds to user `/goal …` slash — never invents goal on plain prompts.
+ * Env FAKE_ACP_GOAL=0 disables.
+ */
+const goalHarnessEnabled = process.env.FAKE_ACP_GOAL !== "0";
+/** @type {{ goalId: string, objective: string, status: string, tokenBudget: number|null, elapsedMs: number } | null} */
+let goalState = null;
+
 function write(msg) {
   process.stdout.write(JSON.stringify(msg) + "\n");
 }
@@ -156,6 +165,157 @@ rl.on("line", async (line) => {
       params?.prompt?.find?.((p) => p.type === "text")?.text ??
       "";
 
+    // ── Goal harness (CLI-aligned: only /goal slash starts goal) ──
+    if (goalHarnessEnabled) {
+      const trimmed = String(text || "").trim();
+      const goalMatch = trimmed.match(/^\/goal(?:\s+([\s\S]*))?$/i);
+      if (goalMatch) {
+        const args = (goalMatch[1] ?? "").trim();
+        const lower = args.toLowerCase();
+        if (!args || lower === "status") {
+          notifyUpdate({
+            sessionUpdate: "agent_message_chunk",
+            content: {
+              type: "text",
+              text: goalState
+                ? `goal status: ${goalState.status} — ${goalState.objective}`
+                : "No goal is currently set",
+            },
+          });
+          write({
+            jsonrpc: "2.0",
+            id,
+            result: { stopReason: "end_turn" },
+          });
+          return;
+        }
+        if (lower === "pause") {
+          if (goalState && goalState.status === "active") {
+            goalState = { ...goalState, status: "user_paused" };
+            emitGoalUpdated(goalState);
+          }
+          notifyUpdate({
+            sessionUpdate: "agent_message_chunk",
+            content: { type: "text", text: "goal paused" },
+          });
+          write({
+            jsonrpc: "2.0",
+            id,
+            result: { stopReason: "end_turn" },
+          });
+          return;
+        }
+        if (lower === "resume") {
+          if (goalState && goalState.status !== "cleared") {
+            goalState = { ...goalState, status: "active" };
+            emitGoalUpdated(goalState);
+          }
+          notifyUpdate({
+            sessionUpdate: "agent_message_chunk",
+            content: { type: "text", text: "goal resumed" },
+          });
+          write({
+            jsonrpc: "2.0",
+            id,
+            result: { stopReason: "end_turn" },
+          });
+          return;
+        }
+        if (lower === "clear") {
+          const prevId = goalState?.goalId ?? "";
+          goalState = null;
+          notifyUpdate({
+            sessionUpdate: "goal_updated",
+            goal_id: prevId,
+            objective: "",
+            status: "cleared",
+            phase: "idle",
+            elapsed_ms: 0,
+            tokens_used: 0,
+          });
+          notifyUpdate({
+            sessionUpdate: "agent_message_chunk",
+            content: { type: "text", text: "goal cleared" },
+          });
+          write({
+            jsonrpc: "2.0",
+            id,
+            result: { stopReason: "end_turn" },
+          });
+          return;
+        }
+        // Test-only: complete path (checklist C1) — real CLI uses classifier
+        if (lower === "complete" || lower === "done") {
+          if (goalState) {
+            goalState = {
+              ...goalState,
+              status: "complete",
+              elapsedMs: Math.max(goalState.elapsedMs, 1200),
+            };
+            emitGoalUpdated(goalState, {
+              phase: "done",
+              last_event: "goal_completed",
+              verifying_completion: false,
+            });
+          }
+          notifyUpdate({
+            sessionUpdate: "agent_message_chunk",
+            content: { type: "text", text: "goal complete" },
+          });
+          write({
+            jsonrpc: "2.0",
+            id,
+            result: { stopReason: "end_turn" },
+          });
+          return;
+        }
+        // GoalSet: parse trailing --budget N
+        let objective = args;
+        let tokenBudget = null;
+        const budgetM = args.match(/^(.*?)\s+--budget\s+(\d+)\s*$/i);
+        if (budgetM) {
+          objective = budgetM[1].trim();
+          tokenBudget = Number(budgetM[2]);
+        }
+        if (objective) {
+          goalState = {
+            goalId: `g_fake_${randomUUID().slice(0, 8)}`,
+            objective,
+            status: "active",
+            tokenBudget:
+              tokenBudget != null && tokenBudget > 0 ? tokenBudget : null,
+            elapsedMs: 0,
+          };
+          emitGoalUpdated(goalState, {
+            phase: "planning",
+            planning: true,
+            last_event: "goal_created",
+          });
+          // second tick: executing
+          goalState = { ...goalState, elapsedMs: 500 };
+          emitGoalUpdated(goalState, {
+            phase: "executing",
+            planning: false,
+            last_event: "worker_started",
+          });
+          notifyUpdate({
+            sessionUpdate: "agent_message_chunk",
+            content: {
+              type: "text",
+              text: `Working on goal: ${objective}`,
+            },
+          });
+          write({
+            jsonrpc: "2.0",
+            id,
+            result: { stopReason: "end_turn", text: "goal started" },
+          });
+          return;
+        }
+      }
+    }
+
+    // Plain prompt: must NOT emit goal_updated (checklist N1–N2)
     notifyUpdate({
       sessionUpdate: "agent_thought_chunk",
       content: { type: "text", text: "thinking..." },
@@ -170,6 +330,26 @@ rl.on("line", async (line) => {
       tool: "echo",
       title: "echo",
     });
+
+    // Optional: noisy update_goal tool without harness (must not create goal UI alone)
+    if (process.env.FAKE_ACP_NOISE_UPDATE_GOAL === "1") {
+      notifyUpdate({
+        sessionUpdate: "tool_call",
+        toolCallId: "tc_goal_noise",
+        tool: "update_goal",
+        title: "update_goal",
+        _meta: { "x.ai/tool": { name: "update_goal" } },
+        rawInput: { message: "should not create goal", completed: false },
+      });
+      notifyUpdate({
+        sessionUpdate: "tool_call_update",
+        toolCallId: "tc_goal_noise",
+        status: "completed",
+        title: "update_goal",
+        _meta: { "x.ai/tool": { name: "update_goal" } },
+        rawOutput: { type: "UpdateGoal", success: true, summary: "ok" },
+      });
+    }
 
     if (askPermission) {
       try {
@@ -200,6 +380,24 @@ rl.on("line", async (line) => {
       result: { stopReason: "end_turn", text: "pong" },
     });
     return;
+  }
+
+  function emitGoalUpdated(g, extra = {}) {
+    notifyUpdate({
+      sessionUpdate: "goal_updated",
+      goal_id: g.goalId,
+      objective: g.objective,
+      status: g.status,
+      phase: extra.phase ?? "executing",
+      token_budget: g.tokenBudget,
+      tokens_used: extra.tokens_used ?? 100,
+      elapsed_ms: g.elapsedMs,
+      last_event: extra.last_event,
+      pause_message: extra.pause_message,
+      planning: extra.planning === true ? true : undefined,
+      verifying_completion:
+        extra.verifying_completion === true ? true : undefined,
+    });
   }
 
   // Desktop PR-A/C: true compact + session/info

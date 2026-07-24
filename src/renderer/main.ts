@@ -34,6 +34,11 @@ import {
   type SessionTurnProjection,
 } from "./session-turn-store.js";
 import {
+  deriveSessionActivity,
+  sessionActivityIsDraining,
+  type SessionActivity,
+} from "./session-activity.js";
+import {
   clearSessionPlan,
   getSessionPlan,
   patchSessionPlan,
@@ -389,31 +394,57 @@ type ComposerAttachment = {
   previewUrl?: string;
 };
 let composerAttachments: ComposerAttachment[] = [];
-/** 尚无 session 时缓存的 goal 标题，建会话后写入 */
+/**
+ * Goal UI 真源：agent goal_updated 投影（对齐 CLI AgentView.goal_state）。
+ * compose 草稿仅本地，未 setup 前不算有目标。
+ */
+type GoalUiStatus =
+  | "active"
+  | "user_paused"
+  | "back_off_paused"
+  | "no_progress_paused"
+  | "infra_paused"
+  | "blocked"
+  | "budget_limited"
+  | "complete";
+
+type GoalUiProjection = {
+  goalId: string;
+  objective: string;
+  status: GoalUiStatus;
+  phase: "idle" | "planning" | "executing";
+  tokenBudget: number | null;
+  tokensUsed: number;
+  elapsedMs: number;
+  elapsedFloorMs: number;
+  pauseMessage?: string;
+  lastEvent?: string;
+  verifyingCompletion: boolean;
+  planning: boolean;
+};
+
+/** 当前会话投影（null = 无目标 UI） */
+let goalProjection: GoalUiProjection | null = null;
+/** 尚无 session / 发送中暂存的标题（optimistic，等 wire） */
 let pendingGoalTitle: string | null = null;
-/** 当前展示用的目标标题（含已写入 session 的） */
-let activeGoalTitle: string | null = null;
 /** 下一次发送将文本设为 goal（/goal 或 +目标 后，直接在输入框写） */
 let goalComposeActive = false;
 /**
- * 用户是否主动开启过目标模式（/goal、+目标、磁盘已有 goal.json）。
- * agent 自发的 goal_updated / update_goal 在未 opt-in 时不得拉起目标条。
+ * 输入栏 plan/goal chip 互斥焦点：最后一次被激活的一侧占 chip 位。
+ * plan 与 goal 状态可同时存在于会话，但 UI **只显示一个** chip。
  */
-let userOptedInGoal = false;
-/** 目标是否暂停 */
-let goalPaused = false;
-/** agent 已标记完成（展示完成后收起） */
-let goalCompleted = false;
-/** 目标开始时间（用于「· 6s」计时） */
-let goalStartedAt: number | null = null;
-/** 已累计运行毫秒（暂停时冻结） */
-let goalElapsedFrozenMs = 0;
+type SessionModeChipFocus = "plan" | "goal" | null;
+let sessionModeChipFocus: SessionModeChipFocus = null;
+/** wall-clock：live active 时从 received 起外推 */
+let goalElapsedAnchorAt: number | null = null;
 let goalElapsedTimer: ReturnType<typeof setInterval> | null = null;
 let goalCompleteHideTimer: ReturnType<typeof setTimeout> | null = null;
 /** 进行中 goal 时轮询 agent 日志，防止 ACP 丢 complete 事件 */
 let goalSyncTimer: ReturnType<typeof setInterval> | null = null;
-/** 目标 token 预算（CLI `/goal … --budget N`） */
+/** 目标 token 预算（CLI `/goal … --budget N`）；发送时拼进 /goal */
 let goalTokenBudget: number | null = null;
+/** clear 后本地记 id，防迟到事件复活（与 Host store 双保险） */
+const goalLocalClearedIds = new Set<string>();
 /** 本会话 / 默认 max-turns（写入 create meta；0=不限） */
 let maxTurnsLimit: number | null = null;
 /** agent available_commands_update 缓存（按 session） */
@@ -684,7 +715,115 @@ function formatTurnElapsed(ms: number): string {
 }
 
 function formatTurnWorking(ms: number): string {
+  // 目标已停、回合仍 busy：勿用「工作中」装成自驱
+  if (sessionActivityIsDraining(currentSessionActivity(true))) {
+    return tr("goal.drainingFor", { time: formatElapsedCompact(ms) });
+  }
   return tr("turn.workingFor", { time: formatElapsedCompact(ms) });
+}
+
+/**
+ * 当前会话合成态（goal × turn）。
+ * turnBusy 可显式传入（rehydrate 时用 willBusy，避免读到尚未 apply 的 turnActive）。
+ */
+function currentSessionActivity(turnBusy?: boolean): SessionActivity {
+  const busy = turnBusy ?? turnActive;
+  return deriveSessionActivity(
+    {
+      hasGoal: Boolean(goalProjection || pendingGoalTitle),
+      goalActive:
+        Boolean(goalProjection) &&
+        goalProjection!.status === "active" &&
+        !goalPaused() &&
+        !goalCompleted(),
+      goalPaused: goalPaused(),
+      goalCompleted: goalCompleted(),
+    },
+    busy,
+  );
+}
+
+/**
+ * 历史回放 / 进会话后：收口仍标 running 的 tool 行（无 in-flight 时勿假忙）。
+ */
+function settleStaleRunningTools(opts?: { asFailed?: boolean }): void {
+  const root = $("transcript");
+  if (!root) return;
+  const rows = Array.from(
+    root.querySelectorAll(".line.tool.running"),
+  ) as HTMLElement[];
+  for (const row of rows) {
+    const id = row.dataset.toolId;
+    const nameEl = row.querySelector(".tool-name");
+    const name = nameEl?.textContent?.trim() || undefined;
+    markToolIncomplete(id, name, opts?.asFailed ?? true);
+  }
+}
+
+/** goal/turn 变化后：刷新 Working 条文案（draining vs 自驱） */
+function refreshTurnPhaseActivityLabel(): void {
+  if (!turnActive || !turnPhaseEl?.isConnected) return;
+  if (!turnPhaseEl.classList.contains("is-working")) return;
+  const ms = turnStartedAt > 0 ? Date.now() - turnStartedAt : 0;
+  const lab = turnPhaseEl.querySelector(".turn-phase-label");
+  const text = formatTurnWorking(ms);
+  if (lab) lab.textContent = text;
+  turnPhaseEl.setAttribute("aria-label", text);
+  turnPhaseEl.classList.toggle(
+    "is-draining",
+    sessionActivityIsDraining(currentSessionActivity(true)),
+  );
+}
+
+/**
+ * goal 已 pause/complete 且 UI 仍 busy 时：用 Host promptInFlight 对账。
+ * CLI：InfraPaused 在 turn 以基础设施错误结束后写入；若 wire 已 pause 而
+ * Desktop 仍 spinner/停止钮，多为 turn.completed 丢失或 tool 未收口。
+ * 仅在 Host 确认无 in-flight 时 endTurn——不乐观冒充已停。
+ */
+let goalTurnReconcileGen = 0;
+async function reconcileTurnAfterGoalStopped(): Promise<void> {
+  if (!turnActive || !activeSessionId) return;
+  if (!goalPaused() && !goalCompleted()) return;
+  const gen = ++goalTurnReconcileGen;
+  const sid = activeSessionId;
+  const st = await inv<{
+    promptInFlight?: boolean;
+    threadStatus?: string;
+  }>("threads.attachState", {
+    threadId:
+      activeThreadId && !activeThreadId.startsWith("disk_")
+        ? activeThreadId
+        : undefined,
+    sessionId: sid,
+  });
+  if (gen !== goalTurnReconcileGen) return;
+  if (activeSessionId !== sid || !turnActive) return;
+  if (!goalPaused() && !goalCompleted()) return;
+  // 未 live / 查失败：勿强行 idle（可能仍在附着）
+  if (!st.ok) return;
+  const inFlight = st.data?.promptInFlight === true;
+  if (inFlight) {
+    // 真还在跑：只刷新 draining 文案，用户可点停止
+    refreshTurnPhaseActivityLabel();
+    return;
+  }
+  // Host 已无 prompt：结算 UI（工具按失败收口，勿绿勾冒充成功）
+  settleStaleRunningTools({ asFailed: true });
+  endTurn({ outcome: "worked", skipQueueDrain: false });
+  refreshTurnPhaseActivityLabel();
+}
+
+/** goal → paused/complete 后调度对账（短延迟吃掉同帧 turn.completed） */
+function scheduleReconcileTurnAfterGoalStopped(): void {
+  // 350ms：让同帧/紧随的 turn.completed 先 endTurn
+  window.setTimeout(() => {
+    void reconcileTurnAfterGoalStopped();
+  }, 350);
+  // 二次：429/子代理失败后 agent 可能晚清 in-flight
+  window.setTimeout(() => {
+    void reconcileTurnAfterGoalStopped();
+  }, 2000);
 }
 
 function formatTurnStopped(ms: number): string {
@@ -728,6 +867,7 @@ function ensureTurnPhaseWorking(): void {
       root.appendChild(turnPhaseEl);
     }
   }
+  let drainTick = 0;
   const tick = () => {
     if (!turnActive || !turnPhaseEl?.isConnected) return;
     const ms = turnStartedAt > 0 ? Date.now() - turnStartedAt : 0;
@@ -735,6 +875,17 @@ function ensureTurnPhaseWorking(): void {
     const text = formatTurnWorking(ms);
     if (lab) lab.textContent = text;
     turnPhaseEl.setAttribute("aria-label", text);
+    const draining = sessionActivityIsDraining(currentSessionActivity(true));
+    turnPhaseEl.classList.toggle("is-draining", draining);
+    // draining 时每 ~3s 再对账 Host（子代理 429 后 goal 先 pause、turn 晚清）
+    if (draining) {
+      drainTick += 1;
+      if (drainTick % 3 === 0) {
+        void reconcileTurnAfterGoalStopped();
+      }
+    } else {
+      drainTick = 0;
+    }
     // 每秒顺带把条钉回底部（tool/assistant 插入后）
     const rootEl = $("transcript");
     if (
@@ -747,6 +898,7 @@ function ensureTurnPhaseWorking(): void {
   tick();
   stopTurnPhaseTimer();
   turnPhaseTimer = setInterval(tick, 1000);
+  refreshTurnPhaseActivityLabel();
   // 仅创建 Working 条时可能贴底；之后每秒钉位置不改 scroll
   scrollTranscriptIfSticky();
 }
@@ -2393,6 +2545,8 @@ function rehydrateSessionTurnProjection(
     setComposerBusy(false);
     removeTurnStatus();
     stopTurnPhaseTimer();
+    // P0：无 in-flight 时收口假 running tool
+    settleStaleRunningTools({ asFailed: true });
     if (turnPhaseEl?.isConnected && turnPhaseEl.classList.contains("is-working")) {
       // 历史已画完回复时，去掉卡住的「工作中」条
       turnPhaseEl.remove();
@@ -2420,6 +2574,8 @@ function rehydrateSessionTurnProjection(
   if (activeSessionId) markSessionWorking(activeSessionId, true);
   ensureTurnStatus(tr("turn.thinking"));
   ensureTurnPhaseWorking();
+  // P1：目标已暂停时 Working 条显示「收尾中」
+  refreshTurnPhaseActivityLabel();
   // 切走期间积压的助手增量（history 可能尚未落盘）
   const pending = (proj?.pendingAssistantText || "").trim();
   if (pending) {
@@ -2749,10 +2905,19 @@ function endTurn(opts?: {
   }
 
   turnStartedAt = 0;
-  // 未完成的 tool 行标为结束
+  // 未完成的 tool 行：停止/错误/目标已停 → 失败收口；正常完成才绿勾
+  const toolAsFailed =
+    outcome === "stopped" || goalPaused() || goalCompleted();
   Array.from(
     $("transcript").querySelectorAll(".line.tool.running"),
   ).forEach((row) => {
+    const id = (row as HTMLElement).dataset.toolId;
+    const nameEl = row.querySelector(".tool-name");
+    const name = nameEl?.textContent?.trim() || undefined;
+    if (toolAsFailed) {
+      markToolIncomplete(id, name, true);
+      return;
+    }
     row.classList.remove("running");
     row.classList.add("done");
     const spin = row.querySelector(".tool-spin");
@@ -2847,7 +3012,7 @@ async function cancelTurn(opts?: {
         ? activeThreadId
         : null;
     const shouldPauseGoal = Boolean(
-      currentGoalTitle() && !goalPaused && !goalCompleted,
+      currentGoalTitle() && !goalPaused() && !goalCompleted(),
     );
     // interrupt：保留队列 + 暂停 drain；send_now / clearQueue 另议
     if (opts?.clearQueue) {
@@ -4652,30 +4817,157 @@ function showModelMenu(anchor: HTMLElement): void {
 }
 
 function currentGoalTitle(): string | null {
-  return activeGoalTitle || pendingGoalTitle;
+  return goalProjection?.objective || pendingGoalTitle;
 }
 
-/** 输入栏红框区域：计划 / 目标状态 chip（对齐 Codex） */
+function goalPaused(): boolean {
+  if (!goalProjection) return false;
+  const s = goalProjection.status;
+  return (
+    s === "user_paused" ||
+    s === "back_off_paused" ||
+    s === "no_progress_paused" ||
+    s === "infra_paused" ||
+    s === "blocked" ||
+    s === "budget_limited"
+  );
+}
+
+function goalCompleted(): boolean {
+  return goalProjection?.status === "complete";
+}
+
+function parseGoalUiStatus(raw: string): GoalUiStatus | "cleared" {
+  const s = String(raw ?? "")
+    .toLowerCase()
+    .trim();
+  switch (s) {
+    case "active":
+      return "active";
+    case "user_paused":
+    case "paused":
+      return "user_paused";
+    case "back_off_paused":
+      return "back_off_paused";
+    case "no_progress_paused":
+      return "no_progress_paused";
+    case "infra_paused":
+      return "infra_paused";
+    case "blocked":
+      return "blocked";
+    case "budget_limited":
+      return "budget_limited";
+    case "complete":
+    case "completed":
+      return "complete";
+    case "cleared":
+    case "cancelled":
+    case "canceled":
+      return "cleared";
+    default:
+      return s ? "user_paused" : "user_paused";
+  }
+}
+
+function goalStatusKicker(st: GoalUiStatus): string {
+  switch (st) {
+    case "complete":
+      return tr("goal.kickerDone");
+    case "user_paused":
+      return tr("goal.kickerPaused");
+    case "back_off_paused":
+      return tr("goal.kickerBackOff");
+    case "no_progress_paused":
+      return tr("goal.kickerNoProgress");
+    case "infra_paused":
+      return tr("goal.kickerInfra");
+    case "blocked":
+      return tr("goal.kickerBlocked");
+    case "budget_limited":
+      return tr("goal.kickerBudget");
+    case "active":
+    default: {
+      if (goalProjection?.verifyingCompletion) return tr("goal.kickerVerifying");
+      if (goalProjection?.planning || goalProjection?.phase === "planning") {
+        return tr("goal.kickerPlanning");
+      }
+      return tr("goal.kicker");
+    }
+  }
+}
+
+/**
+ * paused 状态的短提示（仅 i18n，不展示 agent pauseMessage / 错误全文）。
+ * 目标条不挂错误文案；详细原因走 toast / resume 按钮 title。
+ */
+function goalPauseHintText(st: GoalUiStatus): string {
+  switch (st) {
+    case "user_paused":
+      return tr("goal.hintUserPaused");
+    case "back_off_paused":
+      return tr("goal.hintBackOff");
+    case "no_progress_paused":
+      return tr("goal.hintNoProgress");
+    case "infra_paused":
+      return tr("goal.hintInfra");
+    case "blocked":
+      return tr("goal.hintBlocked");
+    case "budget_limited":
+      return tr("goal.hintBudget");
+    default:
+      return "";
+  }
+}
+
+/**
+ * 声明输入栏 chip 互斥焦点（后激活优先），并刷新 chip。
+ * 开 plan → focus plan（隐藏 goal chip）；开 goal → focus goal（隐藏 plan chip）。
+ */
+function setSessionModeChipFocus(focus: SessionModeChipFocus): void {
+  sessionModeChipFocus = focus;
+  syncSessionModeChips();
+}
+
+/** 输入栏：计划 / 目标 chip **互斥**（只显示 focus 一侧） */
 function syncSessionModeChips(): void {
   const planOn = isPlanOn();
   const goalTitle = currentGoalTitle();
-  // /goal 进入编写态即显示 chip，发送后仍显示
+  // /goal 进入编写态即算 goal 侧可见
   const goalOn = Boolean(goalTitle) || goalComposeActive;
+
+  // 焦点与真实状态对齐：关掉的一侧不能继续占 focus
+  if (sessionModeChipFocus === "goal" && !goalOn) {
+    sessionModeChipFocus = planOn ? "plan" : null;
+  } else if (sessionModeChipFocus === "plan" && !planOn) {
+    sessionModeChipFocus = goalOn ? "goal" : null;
+  } else if (sessionModeChipFocus == null) {
+    // 冷加载 / 切会话：有哪侧亮就显示哪侧；两侧都亮时默认 goal
+    if (goalOn && planOn) sessionModeChipFocus = "goal";
+    else if (goalOn) sessionModeChipFocus = "goal";
+    else if (planOn) sessionModeChipFocus = "plan";
+  }
+
+  // 严格互斥：两侧都 on 时只显示 focus
+  const showGoal = goalOn && sessionModeChipFocus === "goal";
+  const showPlan = planOn && sessionModeChipFocus === "plan";
 
   for (const id of ["chip-plan", "chip-plan-2"] as const) {
     const el = document.getElementById(id);
     if (!el) continue;
-    el.classList.toggle("hidden", !planOn);
+    el.classList.toggle("hidden", !showPlan);
     el.title = planOn ? tr("plan.modeChipOpen") : tr("plan.modeChip");
   }
   syncPlanPanelChrome();
   for (const id of ["chip-goal", "chip-goal-2"] as const) {
     const el = document.getElementById(id);
     if (!el) continue;
-    el.classList.toggle("hidden", !goalOn);
+    el.classList.toggle("hidden", !showGoal);
     el.classList.toggle("is-draft", goalComposeActive && !goalTitle);
     if (goalTitle) {
-      el.title = `${tr("composer.goal")}: ${goalTitle}`;
+      const prefix = goalCompleted()
+        ? tr("goal.kickerDone")
+        : tr("composer.goal");
+      el.title = `${prefix}: ${goalTitle}`;
     } else if (goalComposeActive) {
       el.title = tr("goal.bannerActive");
     }
@@ -4747,6 +5039,11 @@ function exitPlanMode(): void {
     });
   }
   // 退出 plan 不碰 accessMode（Build：yolo 标记在 plan 退出后重新露出）
+  // chip 互斥：plan 关后若仍有 goal，焦点回到 goal
+  if (sessionModeChipFocus === "plan") {
+    sessionModeChipFocus =
+      Boolean(currentGoalTitle()) || goalComposeActive ? "goal" : null;
+  }
   syncPermLabels();
   void syncSessionPolicyLive({ plan: false }).then((r) => {
     if (!r.ok) {
@@ -4762,6 +5059,8 @@ async function enterPlanMode(): Promise<{ ok: boolean; message?: string }> {
   if (activeSessionId) {
     patchSessionPlan(activeSessionId, { planPhase: "pending" });
   }
+  // UI 互斥：点 plan / /plan 时只显示 plan chip（goal 状态可仍在 banner）
+  sessionModeChipFocus = "plan";
   syncPermLabels();
   if (activeSessionId || activeThreadId) {
     const r = await syncSessionPolicyLive({ plan: true });
@@ -4770,6 +5069,8 @@ async function enterPlanMode(): Promise<{ ok: boolean; message?: string }> {
       if (activeSessionId) {
         patchSessionPlan(activeSessionId, { planPhase: "off" });
       }
+      sessionModeChipFocus =
+        Boolean(currentGoalTitle()) || goalComposeActive ? "goal" : null;
       syncPermLabels();
       return {
         ok: false,
@@ -5714,9 +6015,43 @@ function bindSessionModeChips(): void {
     }
     const goalChip = t.closest("#chip-goal, #chip-goal-2");
     if (goalChip && !t.closest("[data-chip-close]")) {
-      void runGoalCommand("status");
+      onGoalChipClick();
     }
   });
+}
+
+/**
+ * 目标 chip 点击（对齐 Codex：进 goal 模式时保留输入框正文）。
+ * - 已在 compose：聚焦输入框
+ * - 输入框有字：进入 compose，正文保留 → 发送即 /goal
+ * - 无字但有 live/sticky goal：status
+ * - 无字无 goal：进入空 compose
+ */
+function onGoalChipClick(): void {
+  const ta = activeComposerInput();
+  const draft = (ta?.value ?? "").trim();
+
+  if (goalComposeActive) {
+    ta?.focus();
+    if (!draft) showToast(tr("slash.goalDesc"));
+    else showToast(tr("goal.composeArmed"));
+    return;
+  }
+
+  if (draft) {
+    // 保留正文，不 prefill 覆盖
+    beginGoalCompose(undefined, { toastKey: "goal.composeArmed" });
+    return;
+  }
+
+  if (currentGoalTitle()) {
+    void runGoalCommand("status").then((r) => {
+      if (r.message) showToast(r.message, r.ok ? "info" : "error");
+    });
+    return;
+  }
+
+  beginGoalCompose();
 }
 
 /**
@@ -7526,10 +7861,17 @@ function setComposerPlaceholders(goalMode: boolean): void {
   c.closest(".composer-card")?.classList.toggle("goal-compose-active", goalMode);
 }
 
-/** /goal 或 +目标：不弹窗；立刻显示目标 chip，输入框写目标，发送后落条 */
-function beginGoalCompose(prefill?: string): void {
+/**
+ * /goal 或 +目标 / 点目标 chip：进入 compose。
+ * prefill 有值才写入；undefined 保留输入框已有正文（Codex open goal editor 同款）。
+ */
+function beginGoalCompose(
+  prefill?: string,
+  opts?: { toastKey?: "slash.goalDesc" | "goal.composeArmed" | null },
+): void {
   goalComposeActive = true;
-  userOptedInGoal = true;
+  // UI 互斥：开 goal 时只显示 goal chip（plan 状态可仍在 session）
+  sessionModeChipFocus = "goal";
   setComposerPlaceholders(true);
   syncSessionModeChips();
   const ta = activeComposerInput();
@@ -7539,7 +7881,76 @@ function beginGoalCompose(prefill?: string): void {
     const n = ta.value.length;
     ta.setSelectionRange(n, n);
   });
-  showToast(tr("slash.goalDesc"));
+  const toastKey = opts?.toastKey === null ? null : (opts?.toastKey ?? "slash.goalDesc");
+  if (toastKey) showToast(tr(toastKey));
+}
+
+/**
+ * 编辑目标：弹窗改写 objective（不占用主输入框）。
+ * 确认后 optimistic 更新 banner；若已有未完成 goal 则立刻 `/goal …` 重设（对齐 CLI 再设目标）。
+ */
+function promptEditGoal(): Promise<void> {
+  const prefill = currentGoalTitle() ?? "";
+  return new Promise((resolve) => {
+    openModal(
+      tr("goal.edit"),
+      `<p class="prompt-dlg-hint">${esc(tr("goal.editHint"))}</p>
+       <textarea id="goal-edit-input" class="prompt-dlg-input prompt-dlg-textarea" rows="4"
+         placeholder="${esc(tr("goal.editPlaceholder"))}">${esc(prefill)}</textarea>
+       <div class="prompt-dlg-actions">
+         <button type="button" class="btn-ghost" id="prompt-dlg-cancel">${esc(tr("common.cancel"))}</button>
+         <button type="button" class="btn-dark" id="prompt-dlg-ok">${esc(tr("common.ok"))}</button>
+       </div>`,
+    );
+    const input = $("goal-edit-input") as HTMLTextAreaElement;
+    const finish = (v: string | null) => {
+      closeModal();
+      if (v == null) {
+        resolve();
+        return;
+      }
+      void (async () => {
+        const hadLive =
+          Boolean(goalProjection) && !goalCompleted();
+        const r = await applyGoalTitle(v);
+        if (!r.ok) {
+          if (r.message) showToast(r.message, "error");
+          resolve();
+          return;
+        }
+        // 已有 agent 侧目标：立刻重设；仅 pending/草稿则等下次发送拼 /goal
+        if (hadLive && pendingGoalTitle) {
+          const line = agentContentForSend("", pendingGoalTitle);
+          const ok = await sendAgentGoalSlash(line);
+          showToast(
+            ok ? tr("goal.editedToast") : tr("goal.setFail"),
+            ok ? "info" : "error",
+          );
+        } else {
+          showToast(tr("goal.editedToast"));
+        }
+        resolve();
+      })();
+    };
+    $("prompt-dlg-cancel").onclick = () => finish(null);
+    $("prompt-dlg-ok").onclick = () => finish(input.value);
+    input.onkeydown = (ev) => {
+      if (ev.key === "Escape") {
+        ev.preventDefault();
+        finish(null);
+      }
+      // Ctrl/Cmd+Enter 确认；单独 Enter 换行
+      if (ev.key === "Enter" && (ev.ctrlKey || ev.metaKey)) {
+        ev.preventDefault();
+        finish(input.value);
+      }
+    };
+    requestAnimationFrame(() => {
+      input.focus();
+      const n = input.value.length;
+      input.setSelectionRange(n, n);
+    });
+  });
 }
 
 function formatGoalElapsed(ms: number): string {
@@ -7553,10 +7964,16 @@ function formatGoalElapsed(ms: number): string {
   return `· ${h}h${rm ? ` ${rm}m` : ""}`;
 }
 
+/** live elapsed：floor 与 wire 基线 + active 时 wall 外推（对齐 pager） */
 function goalElapsedMsNow(): number {
-  if (goalPaused) return goalElapsedFrozenMs;
-  if (!goalStartedAt) return goalElapsedFrozenMs;
-  return goalElapsedFrozenMs + (Date.now() - goalStartedAt);
+  if (!goalProjection) return 0;
+  const base = Math.max(
+    goalProjection.elapsedFloorMs,
+    goalProjection.elapsedMs,
+  );
+  if (goalPaused() || goalCompleted()) return base;
+  if (goalElapsedAnchorAt == null) return base;
+  return base + (Date.now() - goalElapsedAnchorAt);
 }
 
 function stopGoalElapsedTimer(): void {
@@ -7568,10 +7985,12 @@ function stopGoalElapsedTimer(): void {
 
 function startGoalElapsedTimer(): void {
   stopGoalElapsedTimer();
-  if (!currentGoalTitle() || goalPaused || goalCompleted) return;
+  if (!goalProjection || goalPaused() || goalCompleted()) return;
   const tick = () => {
     const el = formatGoalElapsed(goalElapsedMsNow());
-    for (const node of Array.from(document.querySelectorAll("[data-goal-elapsed]"))) {
+    for (const node of Array.from(
+      document.querySelectorAll("[data-goal-elapsed]"),
+    )) {
       node.textContent = el;
     }
   };
@@ -7588,9 +8007,9 @@ function stopGoalSyncTimer(): void {
 
 function ensureGoalSyncTimer(): void {
   if (goalSyncTimer) return;
-  if (!currentGoalTitle() || goalCompleted) return;
+  if (!goalProjection || goalCompleted()) return;
   goalSyncTimer = setInterval(() => {
-    if (!currentGoalTitle() || goalCompleted) {
+    if (!goalProjection || goalCompleted()) {
       stopGoalSyncTimer();
       return;
     }
@@ -7598,18 +8017,24 @@ function ensureGoalSyncTimer(): void {
   }, 1500);
 }
 
-/** 从 agent updates.jsonl 回读 goal_updated（仅用户已开启目标模式时） */
+/** 从 agent updates.jsonl bootstrap / 校准投影 */
 async function syncGoalFromAgent(): Promise<void> {
   if (!activeSessionId) return;
-  
   const res = await inv<{
-    state?: { title?: string; status?: string } | null;
+    projection?: GoalUiProjection | null;
     agent?: {
       objective?: string;
       status?: string;
       lastEvent?: string;
+      lastEventDetail?: string;
       elapsedMs?: number;
       goalId?: string;
+      phase?: string;
+      tokenBudget?: number | null;
+      tokensUsed?: number;
+      message?: string;
+      verifyingCompletion?: boolean;
+      planning?: boolean;
     } | null;
   }>("goals.sync", { sessionId: activeSessionId });
   if (!res.ok) return;
@@ -7617,32 +8042,35 @@ async function syncGoalFromAgent(): Promise<void> {
   if (agent?.status) {
     applyAgentGoalEvent({
       sessionId: activeSessionId,
+      goalId: agent.goalId,
       objective: agent.objective,
       status: agent.status,
+      phase: agent.phase,
+      tokenBudget: agent.tokenBudget,
+      tokensUsed: agent.tokensUsed,
       lastEvent: agent.lastEvent,
+      lastEventDetail: agent.lastEventDetail,
       elapsedMs: agent.elapsedMs,
+      message: agent.message,
+      verifyingCompletion: agent.verifyingCompletion,
+      planning: agent.planning,
     });
-    return;
   }
-  const st = res.data?.state;
-  if (st?.status === "completed" && userOptedInGoal) {
-    markGoalCompletedUi(st.title || currentGoalTitle() || "目标已完成");
-  }
+  // jsonl 无条目时不清除 live 投影（防 ACP 尾读漏扫误清）
 }
 
 /**
  * 清掉目标 UI 内存态（不弹 toast）。
- * 用于：磁盘 cancelled/cleared、换会话、用户 clear。
+ * 用于：cleared、换会话、用户 clear。
  */
 function resetGoalUiState(): void {
   pendingGoalTitle = null;
-  activeGoalTitle = null;
-  userOptedInGoal = false;
-  goalPaused = false;
-  goalStartedAt = null;
-  goalElapsedFrozenMs = 0;
-  goalCompleted = false;
+  goalProjection = null;
+  goalElapsedAnchorAt = null;
   goalComposeActive = false;
+  if (sessionModeChipFocus === "goal") {
+    sessionModeChipFocus = isPlanOn() ? "plan" : null;
+  }
   if (goalCompleteHideTimer) {
     clearTimeout(goalCompleteHideTimer);
     goalCompleteHideTimer = null;
@@ -7654,42 +8082,77 @@ function resetGoalUiState(): void {
 
 function renderGoalBanner(): void {
   const title = currentGoalTitle();
-  const on = Boolean(title);
+  const on = Boolean(title) || goalComposeActive;
+  const paused = goalPaused();
+  const done = goalCompleted();
   for (const id of ["goal-banner-welcome", "goal-banner-chat"] as const) {
     const el = document.getElementById(id);
     if (!el) continue;
-    el.classList.toggle("hidden", !on);
-    el.classList.toggle("is-paused", goalPaused && !goalCompleted);
-    el.classList.toggle("is-completed", goalCompleted);
+    // compose 草稿：chip 已显，banner 仅有投影时显
+    el.classList.toggle("hidden", !goalProjection && !pendingGoalTitle);
+    el.classList.toggle("is-paused", paused && !done);
+    el.classList.toggle("is-completed", done);
     const t = el.querySelector("[data-goal-title]");
     if (t) t.textContent = title ?? "";
     const kicker = el.querySelector(".goal-banner-kicker");
     if (kicker) {
-      kicker.textContent = goalCompleted
-        ? tr("goal.kickerDone")
-        : goalPaused
-          ? tr("goal.kickerPaused")
+      kicker.textContent = goalProjection
+        ? goalStatusKicker(goalProjection.status)
+        : pendingGoalTitle
+          ? tr("goal.kicker")
           : tr("goal.kicker");
     }
-    const pauseBtn = el.querySelector("[data-goal-pause]") as HTMLElement | null;
-    const resumeBtn = el.querySelector("[data-goal-resume]") as HTMLElement | null;
-    pauseBtn?.classList.toggle("hidden", goalPaused || goalCompleted);
-    resumeBtn?.classList.toggle("hidden", !goalPaused || goalCompleted);
+    // 目标条只保留 kicker + 标题 + 耗时；phase/hint 与 kicker 重复且撑爆单行
+    const phaseEl = el.querySelector("[data-goal-phase]");
+    if (phaseEl) phaseEl.textContent = "";
+    const hintEl = el.querySelector("[data-goal-hint]");
+    if (hintEl) hintEl.textContent = "";
+    const pauseBtn = el.querySelector(
+      "[data-goal-pause]",
+    ) as HTMLElement | null;
+    const resumeBtn = el.querySelector(
+      "[data-goal-resume]",
+    ) as HTMLElement | null;
+    const editBtn = el.querySelector(
+      '[data-goal-act="edit"]',
+    ) as HTMLElement | null;
+    pauseBtn?.classList.toggle("hidden", paused || done || !goalProjection);
+    resumeBtn?.classList.toggle("hidden", !paused || done);
+    resumeBtn?.classList.toggle("is-primary", Boolean(paused && !done));
+    // complete：保留 banner 看 objective；暂停/恢复无意义，编辑仍可开新目标文案
+    if (resumeBtn) {
+      if (paused && !done && goalProjection) {
+        // hover 给短状态提示；不把 agent 错误贴进 title 全文
+        resumeBtn.title =
+          goalPauseHintText(goalProjection.status) || tr("goal.resumeHint");
+      } else {
+        resumeBtn.title = tr("goal.resume");
+      }
+    }
+    if (editBtn && done) {
+      editBtn.title = tr("goal.edit");
+    }
   }
-  // 冷加载 active：无 goalStartedAt 时只显示冻结耗时，不假装从 updatedAt 狂跳
-  const canTick = on && !goalPaused && !goalCompleted && goalStartedAt != null;
+  const canTick =
+    Boolean(goalProjection) &&
+    !paused &&
+    !done &&
+    goalElapsedAnchorAt != null;
   if (canTick) {
     startGoalElapsedTimer();
     ensureGoalSyncTimer();
   } else {
     stopGoalElapsedTimer();
-    if (on && !goalCompleted) ensureGoalSyncTimer();
-    else if (!on || goalCompleted) stopGoalSyncTimer();
+    if (goalProjection && !done) ensureGoalSyncTimer();
+    else stopGoalSyncTimer();
+    const base = goalProjection
+      ? Math.max(goalProjection.elapsedFloorMs, goalProjection.elapsedMs)
+      : 0;
     const el = formatGoalElapsed(goalElapsedMsNow());
-    for (const node of Array.from(document.querySelectorAll("[data-goal-elapsed]"))) {
-      // 无起点且冻结为 0：不显示 · 0s，避免「假运行」
-      node.textContent =
-        on && (goalStartedAt != null || goalElapsedFrozenMs > 0) ? el : "";
+    for (const node of Array.from(
+      document.querySelectorAll("[data-goal-elapsed]"),
+    )) {
+      node.textContent = goalProjection && base > 0 ? el : "";
     }
   }
   syncSessionModeChips();
@@ -7852,15 +8315,26 @@ function handleTaskUpdated(ev: {
   }
 }
 
+/**
+ * 应用 agent goal_updated（唯一抬起/更新目标 UI 的路径）。
+ * 无 opt-in 锁：有 wire 投影就显示（对齐 CLI pager）。
+ * 迟到同 goalId after clear → 丢弃。
+ */
 function applyAgentGoalEvent(ev: {
   sessionId?: string;
+  goalId?: string;
   objective?: string;
   status: string;
+  phase?: string;
+  tokenBudget?: number | null;
+  tokensUsed?: number;
   elapsedMs?: number;
   message?: string;
   lastEvent?: string;
+  lastEventDetail?: string;
+  verifyingCompletion?: boolean;
+  planning?: boolean;
 }): void {
-  // session 尚未绑定时也接受（刚 create）；仅在「两边都有且不一致」时丢弃
   if (
     activeSessionId &&
     ev.sessionId &&
@@ -7868,167 +8342,282 @@ function applyAgentGoalEvent(ev: {
   ) {
     return;
   }
-  const st = String(ev.status ?? "").toLowerCase().trim();
-  const last = String(ev.lastEvent ?? "").toLowerCase();
-  const isComplete =
-    st === "complete" ||
-    st === "completed" ||
-    last === "goal_completed" ||
-    last.includes("completed");
-  // CLI：cleared / cancelled / canceled 均为无目标终态
-  const isCleared =
-    st === "cancelled" ||
-    st === "canceled" ||
-    st === "cleared" ||
-    last === "goal_cleared" ||
-    last === "goal_cancelled";
 
-  // 终态 cleared：先于 opt-in / title 写入，避免空 objective 被当成 "Goal" 进行中
-  if (isCleared) {
-    const had = Boolean(currentGoalTitle() || userOptedInGoal);
+  const st = parseGoalUiStatus(ev.status);
+  const goalId = String(ev.goalId ?? "").trim();
+  const last = String(ev.lastEvent ?? "").toLowerCase();
+
+  if (st === "cleared" || last === "goal_cleared" || last === "goal_cancelled") {
+    const had = Boolean(goalProjection || pendingGoalTitle);
+    if (goalId) goalLocalClearedIds.add(goalId);
+    if (goalProjection?.goalId) goalLocalClearedIds.add(goalProjection.goalId);
     resetGoalUiState();
     renderGoalBanner();
-    // 磁盘同步清理，防止下次 open 再误显
+    // goal 轴变了：Working 条可能从 draining 回到「工作中」
+    refreshTurnPhaseActivityLabel();
     if (activeSessionId) {
       void inv("goals.clear", { sessionId: activeSessionId });
     }
-    // 仅用户可见的取消才 toast；冷加载 sync 的 cleared 静默
-    if (had && (st === "cancelled" || st === "canceled") && last) {
+    if (had && (String(ev.status).toLowerCase() === "cancelled" ||
+      String(ev.status).toLowerCase() === "canceled") && last) {
       showToast(tr("goal.cancelledToast"));
     }
     return;
   }
 
-  // agent 首启 goal：自动 opt-in（与 Host goal.json 投影对齐）
-  if (!userOptedInGoal) {
-    const meaningful =
-      Boolean((ev.objective ?? "").trim()) ||
-      isComplete ||
-      st === "active" ||
-      st === "user_paused" ||
-      st === "paused" ||
-      st === "blocked" ||
-      last.startsWith("goal_");
-    if (!meaningful && !currentGoalTitle() && !goalComposeActive) {
-      return;
-    }
-    userOptedInGoal = true;
+  // clear 后同 id 迟到 → 丢弃
+  if (goalId && goalLocalClearedIds.has(goalId)) {
+    return;
   }
 
-  const title = (ev.objective ?? "").trim() || currentGoalTitle();
-  if (title) {
-    activeGoalTitle = title;
-    pendingGoalTitle = null;
+  const sameGoal =
+    Boolean(
+      goalProjection &&
+        ((goalId && goalProjection.goalId === goalId) ||
+          (!goalId && goalProjection.goalId)),
+    );
+  const newGoal =
+    Boolean(goalId && goalProjection && goalProjection.goalId !== goalId);
+
+  // 对齐 CLI GoalTracker：complete 后 pause 为 no-op。
+  // 已 complete / budget_limited 时拒绝同 goal 被 active/paused 等降级
+  //（rate-limit 迟到 goal_updated 会把「已完成」打成「已暂停(错误)」）。
+  // cleared 已在上方 early-return，此处 st 仅为 GoalUiStatus。
+  if (
+    sameGoal &&
+    goalProjection &&
+    ((goalProjection.status === "complete" && st !== "complete") ||
+      (goalProjection.status === "budget_limited" &&
+        st !== "complete" &&
+        st !== "budget_limited"))
+  ) {
+    return;
   }
+
+  // 已 complete 时忽略滞后 active（classifier 前）— 上块已覆盖；保留 goal_created 特判
+  if (
+    goalProjection?.status === "complete" &&
+    (st === "active" || last === "goal_created")
+  ) {
+    return;
+  }
+
+  const wireElapsed =
+    typeof ev.elapsedMs === "number" && ev.elapsedMs >= 0
+      ? Math.floor(ev.elapsedMs)
+      : (goalProjection?.elapsedMs ?? 0);
+
+  let elapsedFloorMs = wireElapsed;
+  if (sameGoal && goalProjection) {
+    elapsedFloorMs = Math.max(
+      goalProjection.elapsedFloorMs,
+      goalProjection.elapsedMs,
+      wireElapsed,
+    );
+  } else if (newGoal) {
+    elapsedFloorMs = wireElapsed;
+    goalElapsedAnchorAt = null;
+  }
+
+  const objective =
+    (ev.objective ?? "").trim() ||
+    goalProjection?.objective ||
+    pendingGoalTitle ||
+    "Goal";
+
+  const prevStatus = goalProjection?.status;
+  goalProjection = {
+    goalId: goalId || goalProjection?.goalId || `anon-${Date.now()}`,
+    objective,
+    status: st,
+    phase:
+      ev.phase === "planning" || ev.phase === "executing" || ev.phase === "idle"
+        ? ev.phase
+        : (goalProjection?.phase ?? "idle"),
+    tokenBudget:
+      ev.tokenBudget !== undefined
+        ? ev.tokenBudget
+        : (goalProjection?.tokenBudget ?? goalTokenBudget),
+    tokensUsed:
+      typeof ev.tokensUsed === "number"
+        ? ev.tokensUsed
+        : (goalProjection?.tokensUsed ?? 0),
+    elapsedMs: wireElapsed,
+    elapsedFloorMs,
+    pauseMessage: ev.message ?? goalProjection?.pauseMessage,
+    lastEvent: ev.lastEvent ?? goalProjection?.lastEvent,
+    verifyingCompletion: Boolean(
+      ev.verifyingCompletion ?? goalProjection?.verifyingCompletion,
+    ),
+    planning: Boolean(ev.planning ?? goalProjection?.planning),
+  };
+
+  if (goalId) goalLocalClearedIds.delete(goalId);
+  pendingGoalTitle = null;
   goalComposeActive = false;
   setComposerPlaceholders(false);
 
-  if (typeof ev.elapsedMs === "number" && ev.elapsedMs >= 0) {
-    goalElapsedFrozenMs = ev.elapsedMs;
+  if (goalProjection.tokenBudget != null && goalProjection.tokenBudget > 0) {
+    goalTokenBudget = goalProjection.tokenBudget;
   }
 
-  if (isComplete) {
-    markGoalCompletedUi(ev.message?.trim() || title || tr("goal.completedToast"));
+  if (st === "complete") {
+    goalElapsedAnchorAt = null;
+    // 保留投影 + banner，直到用户 clear / 新 goal；不自动 8s 清空
+    //（否则重进已完成会话看不到「之前的目标是什么」）
+    // toast 仅 live 从非 complete → complete；冷加载 / 重复 complete 不弹
+    markGoalCompletedUi(objective || tr("composer.goal"), {
+      // 冷加载 prevStatus 为 null：不 toast；live 首次 complete：toast
+      toast: prevStatus != null && prevStatus !== "complete",
+    });
+    // complete 后 turn 仍 busy → 过程条「收尾中」；并对账 Host 是否真仍 in-flight
+    refreshTurnPhaseActivityLabel();
+    if (prevStatus !== "complete") {
+      scheduleReconcileTurnAfterGoalStopped();
+    }
     return;
   }
 
-  // 已展示完成态时，忽略滞后的 active 事件
-  if (goalCompleted && (st === "active" || st === "" || last === "goal_created")) {
-    return;
-  }
-
-  goalCompleted = false;
   if (goalCompleteHideTimer) {
     clearTimeout(goalCompleteHideTimer);
     goalCompleteHideTimer = null;
   }
 
-  if (st === "user_paused" || st === "paused") {
-    if (!goalPaused) {
-      if (goalStartedAt) {
-        goalElapsedFrozenMs = goalElapsedMsNow();
-      }
-      goalStartedAt = null;
+  const becamePaused =
+    st === "user_paused" ||
+    st === "back_off_paused" ||
+    st === "no_progress_paused" ||
+    st === "infra_paused" ||
+    st === "blocked" ||
+    st === "budget_limited";
+
+  if (becamePaused) {
+    goalElapsedAnchorAt = null;
+    if (st === "blocked" && prevStatus !== "blocked") {
+      showToast(ev.message?.trim() || tr("goal.blocked"), "error");
+    } else if (
+      st === "budget_limited" &&
+      prevStatus !== "budget_limited"
+    ) {
+      showToast(tr("goal.budgetLimitedToast"), "error");
+    } else if (st === "infra_paused" && prevStatus !== "infra_paused") {
+      // 不冒充 complete：toast 写明「尚未标记完成」+ 可恢复
+      const msg = (ev.message ?? "").trim();
+      showToast(
+        msg
+          ? msg.length > 160
+            ? `${msg.slice(0, 160)}…`
+            : msg
+          : tr("goal.infraPausedToast"),
+        "error",
+      );
     }
-    goalPaused = true;
-  } else if (st === "blocked") {
-    goalPaused = true;
-    goalStartedAt = null;
-    showToast(ev.message?.trim() || tr("goal.blocked"), "error");
-  } else {
-    // active 等 — 仅 live 事件启动 wall-clock；有 elapsed_ms 时先冻结再续跑
-    if (goalPaused) {
-      goalStartedAt = Date.now();
-    } else if (!goalStartedAt) {
-      // 有 agent 耗时：从「现在」续跑，冻结部分已记入 goalElapsedFrozenMs
-      goalStartedAt = Date.now();
+  } else if (st === "active") {
+    // live active：从现在外推；冷加载无 anchor 时只显示 wire base
+    if (goalElapsedAnchorAt == null && prevStatus != null) {
+      goalElapsedAnchorAt = Date.now();
+    } else if (prevStatus && prevStatus !== "active") {
+      goalElapsedAnchorAt = Date.now();
+    } else if (prevStatus === "active" && goalElapsedAnchorAt == null) {
+      // live 更新：开始外推
+      goalElapsedAnchorAt = Date.now();
     }
-    goalPaused = false;
   }
+
   renderGoalBanner();
+  // P1：pause/active 切换时刷新过程条（paused+busy → 收尾中）
+  refreshTurnPhaseActivityLabel();
+  // 进入 pause 族：与 Host 对账，避免「目标已停 + 假工作中/假 tool」
+  if (becamePaused && prevStatus !== st) {
+    scheduleReconcileTurnAfterGoalStopped();
+  }
 }
 
-function markGoalCompletedUi(message: string): void {
-  if (goalCompleted) {
-    // 幂等：已展示完成条则只刷新文案
-    renderGoalBanner();
-    return;
+/**
+ * 进入 complete UI：banner 持续展示 objective（kicker=已完成），
+ * 不自动清投影。toast 仅在状态从非 complete → complete 时弹出。
+ */
+function markGoalCompletedUi(
+  message: string,
+  opts?: { toast?: boolean },
+): void {
+  if (goalCompleteHideTimer) {
+    clearTimeout(goalCompleteHideTimer);
+    goalCompleteHideTimer = null;
   }
-  if (!activeGoalTitle && !pendingGoalTitle) {
-    activeGoalTitle = message || tr("composer.goal");
+  if (!goalProjection) {
+    goalProjection = {
+      goalId: "complete",
+      objective: message || tr("composer.goal"),
+      status: "complete",
+      phase: "idle",
+      tokenBudget: goalTokenBudget,
+      tokensUsed: 0,
+      elapsedMs: 0,
+      elapsedFloorMs: 0,
+      verifyingCompletion: false,
+      planning: false,
+    };
+  } else {
+    goalProjection = {
+      ...goalProjection,
+      status: "complete",
+      // 保留 objective；不要用 toast 文案盖掉目标标题
+      objective:
+        goalProjection.objective?.trim() ||
+        message ||
+        tr("composer.goal"),
+    };
   }
-  goalCompleted = true;
-  goalPaused = false;
-  goalStartedAt = null;
+  goalElapsedAnchorAt = null;
   goalComposeActive = false;
   stopGoalSyncTimer();
   setComposerPlaceholders(false);
+  sessionModeChipFocus = "goal";
   renderGoalBanner();
-  showToast(message || tr("goal.completedToast"));
-  if (goalCompleteHideTimer) clearTimeout(goalCompleteHideTimer);
-  goalCompleteHideTimer = setTimeout(() => {
-    resetGoalUiState();
-    renderGoalBanner();
-  }, 8000);
+  if (opts?.toast) {
+    showToast(tr("goal.completedToast"));
+  }
 }
 
 async function pauseGoal(opts?: { fromStop?: boolean }): Promise<void> {
-  if (!currentGoalTitle() || goalPaused || goalCompleted) return;
-  // Desktop 磁盘态为权威；冷会话 agent tracker 可能为 None
-  goalElapsedFrozenMs = goalElapsedMsNow();
-  goalStartedAt = null;
-  goalPaused = true;
-  if (activeSessionId) {
-    await inv("goals.setStatus", {
-      sessionId: activeSessionId,
-      status: "paused",
-    });
+  if (!currentGoalTitle() || goalPaused() || goalCompleted()) return;
+  // 乐观：本地标 pause；真源以 wire 为准
+  if (goalProjection) {
+    goalProjection = {
+      ...goalProjection,
+      status: "user_paused",
+      elapsedMs: goalElapsedMsNow(),
+      elapsedFloorMs: Math.max(
+        goalProjection.elapsedFloorMs,
+        goalElapsedMsNow(),
+      ),
+    };
   }
+  goalElapsedAnchorAt = null;
   renderGoalBanner();
   showToast(
     opts?.fromStop ? tr("goal.pausedStop") : tr("goal.pausedToast"),
   );
-  // 已 attach 时尽量通知 agent；失败不回滚 UI（避免 No goal is currently set 误伤）
+  // 仅 slash，不写本地 setStatus
   if (activeThreadId && !activeThreadId.startsWith("disk_")) {
+    const ok = await sendAgentGoalSlash("/goal pause");
+    if (!ok) showToast(tr("goal.pauseFail"), "error");
+  } else {
     void sendAgentGoalSlash("/goal pause");
   }
 }
 
 async function resumeGoal(): Promise<void> {
-  if (!currentGoalTitle() || !goalPaused) return;
-  goalPaused = false;
-  goalCompleted = false;
-  goalStartedAt = Date.now();
-  if (activeSessionId) {
-    await inv("goals.setStatus", {
-      sessionId: activeSessionId,
-      status: "active",
-    });
+  if (!currentGoalTitle() || !goalPaused()) return;
+  if (goalProjection) {
+    goalProjection = { ...goalProjection, status: "active" };
   }
+  goalElapsedAnchorAt = Date.now();
   renderGoalBanner();
   showToast(tr("goal.resumedToast"));
-  // resume 需要 agent 真恢复编排：尽量 attach 后发送
-  void sendAgentGoalSlash("/goal resume");
+  const ok = await sendAgentGoalSlash("/goal resume");
+  if (!ok) showToast(tr("goal.resumeFail"), "error");
 }
 
 function bindGoalBanner(): void {
@@ -8037,7 +8626,7 @@ function bindGoalBanner(): void {
     if (!btn) return;
     const act = btn.dataset.goalAct;
     if (act === "edit") {
-      beginGoalCompose(currentGoalTitle() ?? "");
+      void promptEditGoal();
     }
     if (act === "pause") {
       void pauseGoal();
@@ -8055,10 +8644,15 @@ function bindGoalBanner(): void {
 
 /**
  * 解析输入中的 goal：
- * - goalComposeActive 时整段文本为目标
+ * - forceGoal / goalComposeActive 时整段文本为目标（只走 /goal，不当普通消息）
  * - `/goal 内容` 或单独 `/goal`
+ *
+ * forceGoal：发送路径在 await 前快照 compose 标志，避免确认框等异步后标志被清掉。
  */
-function parseGoalInput(raw: string): {
+function parseGoalInput(
+  raw: string,
+  opts?: { forceGoal?: boolean },
+): {
   /** 纯 `/goal` 无正文 → 进入 compose，不发送 */
   enterComposeOnly: boolean;
   /** 解析出的目标标题 */
@@ -8079,7 +8673,8 @@ function parseGoalInput(raw: string): {
       message: parsed.objective,
     };
   }
-  if (goalComposeActive && text) {
+  // 目标模式：正文 = objective，绝不回落成普通消息
+  if ((opts?.forceGoal || goalComposeActive) && text) {
     const parsed = parseGoalBudget(text);
     if (parsed.budget != null) goalTokenBudget = parsed.budget;
     return {
@@ -8091,41 +8686,62 @@ function parseGoalInput(raw: string): {
   return { enterComposeOnly: false, goalTitle: null, message: text };
 }
 
+/**
+ * 已有不同 objective 的 goal 投影时，替换前确认（对齐 Codex Replace current goal?）。
+ * complete 粘性条 / paused / active 均适用。
+ */
+async function confirmGoalReplaceIfNeeded(
+  newTitle: string,
+): Promise<boolean> {
+  const prev = goalProjection?.objective?.trim();
+  const next = newTitle.trim();
+  if (!prev || !next || prev === next) return true;
+  return confirmText({
+    title: tr("goal.replaceTitle"),
+    message: tr("goal.replaceBody", { prev, next }),
+    okLabel: tr("goal.replaceConfirm"),
+  });
+}
+
+/** 当前输入若作为新目标，是否会触发替换确认（同步探测，供入队路径） */
+function composerNeedsGoalReplaceConfirm(raw?: string): boolean {
+  const text = (raw ?? activeComposerInput()?.value ?? "").trim();
+  if (!text) return false;
+  const g = parseGoalInput(text, { forceGoal: goalComposeActive });
+  if (!g.goalTitle) return false;
+  const prev = goalProjection?.objective?.trim();
+  const next = g.goalTitle.trim();
+  return Boolean(prev && next && prev !== next);
+}
+
+/**
+ * 用户确认目标标题：仅 optimistic pending + 发送时拼 /goal。
+ * 不写 goals.set 权威；投影等 agent goal_updated。
+ */
 async function applyGoalTitle(title: string): Promise<{ ok: boolean; message?: string }> {
   const parsed = parseGoalBudget(title.trim());
   const t = parsed.objective;
   if (parsed.budget != null) goalTokenBudget = parsed.budget;
   if (!t) return { ok: false, message: tr("goal.emptyTitle") };
   goalComposeActive = false;
-  userOptedInGoal = true;
   setComposerPlaceholders(false);
   pendingGoalTitle = t;
-  activeGoalTitle = t;
-  goalPaused = false;
-  goalCompleted = false;
-  goalElapsedFrozenMs = 0;
-  goalStartedAt = Date.now();
+  // 设置/编辑目标：chip 焦点到 goal（与 plan chip 互斥）
+  sessionModeChipFocus = "goal";
+  // optimistic banner：pending 标题，status 未从 wire 确认前不算 harness active
   if (goalCompleteHideTimer) {
     clearTimeout(goalCompleteHideTimer);
     goalCompleteHideTimer = null;
-  }
-  if (activeSessionId) {
-    const r = await inv("goals.set", {
-      sessionId: activeSessionId,
-      title: t,
-      status: "active",
-    });
-    if (!r.ok) {
-      renderGoalBanner();
-      return { ok: false, message: r.error?.message ?? tr("goal.writeFail") };
-    }
-    pendingGoalTitle = null;
   }
   renderGoalBanner();
   return { ok: true };
 }
 
-/** 发给 agent 的正文：新建目标用 CLI 同源 `/goal …`，避免仅 prompt 备注导致 Goal is not Active */
+/**
+ * 发给 agent 的正文：新建/重设目标用 CLI 同源 `/goal …`。
+ * 只要明确 goalJustSet，即走 /goal（含 paused/complete 后重设），
+ * 不再用 goalPaused() 短路成普通消息。
+ */
 function agentContentForSend(
   userContent: string,
   goalJustSet: string | null,
@@ -8209,14 +8825,14 @@ async function runGoalCommand(
     const t = currentGoalTitle();
     if (!t) return { ok: true, message: tr("goal.noneActive") };
     const budget =
-      goalTokenBudget != null
-        ? tr("goal.budgetLine", { n: String(goalTokenBudget) })
+      (goalProjection?.tokenBudget ?? goalTokenBudget) != null
+        ? tr("goal.budgetLine", {
+            n: String(goalProjection?.tokenBudget ?? goalTokenBudget),
+          })
         : "";
-    const st = goalPaused
-      ? tr("goal.kickerPaused")
-      : goalCompleted
-        ? tr("goal.kickerDone")
-        : tr("goal.kicker");
+    const st = goalProjection
+      ? goalStatusKicker(goalProjection.status)
+      : tr("goal.kicker");
     return {
       ok: true,
       message: `${st}：${t}${budget ? ` · ${budget}` : ""}`,
@@ -8234,16 +8850,17 @@ async function runGoalCommand(
     return promptGoalBudget();
   }
   if (sub === "clear") {
+    if (goalProjection?.goalId) {
+      goalLocalClearedIds.add(goalProjection.goalId);
+    }
     goalTokenBudget = null;
     resetGoalUiState();
     if (activeSessionId) {
       await inv("goals.clear", { sessionId: activeSessionId });
     }
     renderGoalBanner();
-    // 同源：通知 agent 清除（已 attach 时）
-    if (activeThreadId && !activeThreadId.startsWith("disk_")) {
-      void sendAgentGoalSlash("/goal clear");
-    }
+    // 先 optimistic hide，再 slash（对齐 CLI clear 世代）
+    void sendAgentGoalSlash("/goal clear");
     return { ok: true, message: tr("goal.cleared") };
   }
   // set：不弹窗，聚焦输入框写目标
@@ -8291,7 +8908,7 @@ async function promptGoalBudget(): Promise<{ ok: boolean; message?: string }> {
       closeModal();
       // 已有进行中目标时，通过 /goal 再设一遍带 budget（agent 侧）
       const t = currentGoalTitle();
-      if (t && !goalCompleted) {
+      if (t && !goalCompleted()) {
         void sendAgentGoalSlash(`/goal ${t} --budget ${goalTokenBudget}`);
       }
       resolve({
@@ -8305,89 +8922,72 @@ async function promptGoalBudget(): Promise<{ ok: boolean; message?: string }> {
   });
 }
 
+/**
+ * 建会话后不再 goals.set。
+ * pending 标题在 agentContentForSend → /goal 时生效。
+ */
 async function persistPendingGoal(): Promise<void> {
-  if (!pendingGoalTitle || !activeSessionId) return;
-  const r = await inv("goals.set", {
-    sessionId: activeSessionId,
-    title: pendingGoalTitle,
-  });
-  if (r.ok) {
-    userOptedInGoal = true;
-    activeGoalTitle = pendingGoalTitle;
-    pendingGoalTitle = null;
-    if (!goalStartedAt) goalStartedAt = Date.now();
-    renderGoalBanner();
-  }
+  // no-op：保留调用点兼容；真源是 /goal slash + goal_updated
+  if (pendingGoalTitle) renderGoalBanner();
 }
 
+/** 打开会话：bootstrap 自 Host 投影 / jsonl，不信孤立 goal.json */
 async function refreshGoalChipFromSession(): Promise<void> {
   if (!activeSessionId) {
-    if (!pendingGoalTitle && !goalCompleted && !goalComposeActive) {
+    if (!pendingGoalTitle && !goalComposeActive) {
       resetGoalUiState();
     }
     renderGoalBanner();
     return;
   }
+  // 先清本地投影，再 sync（避免跨会话残留）
+  if (!goalComposeActive) {
+    goalProjection = null;
+    goalElapsedAnchorAt = null;
+  }
   const g = await inv<{
     title?: string;
     status?: string;
-    updatedAt?: string;
+    projection?: GoalUiProjection;
   } | null>("goals.get", {
     sessionId: activeSessionId,
   });
-  if (g.ok && g.data?.title) {
-    const st = String(g.data.status ?? "active").toLowerCase();
-    // cancelled / cleared：终态，不展示目标栏（修复旧会话假「进行中」）
-    if (st === "cancelled" || st === "canceled" || st === "cleared") {
-      resetGoalUiState();
-      // 顺带清脏 goal.json，避免反复误显
-      void inv("goals.clear", { sessionId: activeSessionId });
-      renderGoalBanner();
-      // 仍扫一次 agent log，兜底其它状态
-      void syncGoalFromAgent();
-      return;
-    }
-    // 磁盘已有目标 = 用户曾主动设置（或历史会话）
-    userOptedInGoal = true;
-    // 已展示完成态时，不要被滞后的 active 磁盘状态打回
-    if (goalCompleted && st !== "completed") {
-      renderGoalBanner();
-      return;
-    }
-    activeGoalTitle = g.data.title;
-    if (st === "completed") {
-      markGoalCompletedUi(g.data.title);
-      return;
-    }
-    goalPaused = st === "paused" || st === "blocked";
-    goalCompleted = false;
-    if (goalPaused) {
-      goalStartedAt = null;
-      // 冷加载暂停：不伪造 wall-clock
-    } else {
-      // 冷加载 active：不要用 updatedAt 当起点（否则显示「已跑 N 天」）
-      // 等 live goal_updated / 用户 resume 再启动计时
-      goalStartedAt = null;
-      goalElapsedFrozenMs = 0;
-    }
-  } else if (!pendingGoalTitle && !goalCompleted && !goalComposeActive) {
+  if (g.ok && g.data?.projection) {
+    const p = g.data.projection;
+    applyAgentGoalEvent({
+      sessionId: activeSessionId,
+      goalId: p.goalId,
+      objective: p.objective,
+      status: p.status,
+      phase: p.phase,
+      tokenBudget: p.tokenBudget,
+      tokensUsed: p.tokensUsed,
+      elapsedMs: p.elapsedMs,
+      message: p.pauseMessage,
+      lastEvent: p.lastEvent,
+      verifyingCompletion: p.verifyingCompletion,
+      planning: p.planning,
+    });
+  } else if (g.ok && g.data?.title) {
+    // 旧 GoalState 无 projection：不自动 opt-in，走 jsonl
+  } else if (!pendingGoalTitle && !goalComposeActive) {
     resetGoalUiState();
   }
   renderGoalBanner();
-  // 打开会话后从 updates.jsonl 校准（cleared 会清 UI）
   void syncGoalFromAgent();
 }
 
-/** 从 tool.completed raw 兜底识别 update_goal 完成 */
+/**
+ * update_goal tool 仅作 UI 提示，不创建/完成目标投影。
+ * 完成态等 goal_updated status=complete。
+ */
 function maybeGoalFromToolRaw(name?: string, raw?: unknown): void {
-  // 未开启目标模式时忽略 agent 的 update_goal 工具
-  if (!userOptedInGoal && !currentGoalTitle()) return;
+  if (!goalProjection) return;
   if (!raw || typeof raw !== "object") return;
   const u = raw as Record<string, unknown>;
   const title = String(u.title ?? name ?? "");
   const meta = u._meta as { "x.ai/tool"?: { name?: string } } | undefined;
   const toolName = meta?.["x.ai/tool"]?.name ?? title;
-  const rawIn = (u.rawInput ?? {}) as Record<string, unknown>;
   const rawOut = (u.rawOutput ?? {}) as Record<string, unknown>;
   const isGoal =
     toolName === "update_goal" ||
@@ -8396,7 +8996,6 @@ function maybeGoalFromToolRaw(name?: string, raw?: unknown): void {
     rawOut.type === "UpdateGoal";
   if (!isGoal) return;
 
-  // 终态 success 且非 classifier 排队 → 完成；排队则等 goal_updated
   if (rawOut.type === "UpdateGoal" && rawOut.success === true) {
     const summary = String(rawOut.summary ?? "").toLowerCase();
     if (
@@ -8404,23 +9003,9 @@ function maybeGoalFromToolRaw(name?: string, raw?: unknown): void {
       summary.includes("pending") ||
       summary.includes("classifier")
     ) {
-      showToast("目标完成确认中…");
-      // 加速轮询 classifier 写入的 goal_updated complete
+      showToast(tr("goal.confirming"));
       ensureGoalSyncTimer();
       void syncGoalFromAgent();
-      return;
-    }
-  }
-  if (
-    (rawIn.completed === true ||
-      title.toLowerCase().includes("marking complete")) &&
-    u.status === "completed"
-  ) {
-    // 若仍无 goal_updated complete，先乐观完成；随后 complete 事件幂等
-    if (!goalCompleted) {
-      markGoalCompletedUi(
-        typeof rawIn.message === "string" ? rawIn.message : "目标已完成",
-      );
     }
   }
 }
@@ -8722,12 +9307,8 @@ async function leaveCurrentSessionToWelcome(opts?: {
 
   if (!goalComposeActive) {
     pendingGoalTitle = null;
-    activeGoalTitle = null;
-    userOptedInGoal = false;
-    goalStartedAt = null;
-    goalElapsedFrozenMs = 0;
-    goalPaused = false;
-    goalCompleted = false;
+    goalProjection = null;
+    goalElapsedAnchorAt = null;
   }
 
   clearTranscript();
@@ -9338,6 +9919,8 @@ async function openThread(t: ThreadRow): Promise<void> {
     goalTokenBudget = null;
     // 换会话先清上一会话 goal UI，再由 refresh 按磁盘恢复
     resetGoalUiState();
+    // chip 互斥焦点按会话重算（见下方 plan 恢复 + refreshGoal）
+    sessionModeChipFocus = null;
   }
   activeThreadId = t.id;
   activeSessionId = t.sessionId;
@@ -9407,9 +9990,16 @@ async function openThread(t: ThreadRow): Promise<void> {
   }
   showWelcome(false);
   clearTranscript();
-  void refreshGoalChipFromSession();
 
   try {
+    // P0：先等 attach（promptInFlight）+ goal 投影，再 history
+    // 避免「目标已暂停」与假「工作中 / 工具 running」叠出矛盾态
+    const [attachStEarly, _goal] = await Promise.all([
+      attachStateP.catch(() => null),
+      refreshGoalChipFromSession(),
+    ]);
+    if (viewGen !== sessionViewGen) return;
+
     const hist = await inv<{
       entries: Array<{
         role: string;
@@ -9431,6 +10021,15 @@ async function openThread(t: ThreadRow): Promise<void> {
         "info",
       );
     }
+    const promptInFlightEarly = attachStEarly?.data?.promptInFlight;
+    const hostStatusEarly = attachStEarly?.data?.threadStatus ?? t.status;
+    const willBusyEarly = shouldRehydrateBusy({
+      projection: getSessionTurn(t.sessionId),
+      sidebarWorking: workingSessions.has(t.sessionId),
+      threadStatus: hostStatusEarly,
+      promptInFlight: promptInFlightEarly,
+    });
+
     const userTexts: string[] = [];
     // S15：连贯回放 — user / thought / tool / assistant 同一时间线
     for (const e of hist.data?.entries ?? []) {
@@ -9445,7 +10044,17 @@ async function openThread(t: ThreadRow): Promise<void> {
           if (parsed.text.trim()) userTexts.push(parsed.text.trim());
         }
       } else if (role === "tool") {
-        replayHistoryTool(e);
+        // 无 in-flight：incomplete/running 历史 tool 一律当失败收口，勿画 spinner
+        if (
+          !willBusyEarly &&
+          (e.toolStatus === "incomplete" ||
+            e.toolStatus === "running" ||
+            !e.toolStatus)
+        ) {
+          replayHistoryTool({ ...e, toolStatus: "failed" });
+        } else {
+          replayHistoryTool(e);
+        }
       } else if (
         role === "thought" ||
         role === "thinking" ||
@@ -9474,18 +10083,13 @@ async function openThread(t: ThreadRow): Promise<void> {
       if (caret) caret.textContent = "▸";
       updateProcessHeader();
     }
+    // 双保险：回放后仍 running 的 tool 在 idle 时收口
+    if (!willBusyEarly) {
+      settleStaleRunningTools({ asFailed: true });
+    }
     // P0-A：已加载历史（若将 rehydrate busy，不画「已加载 · 空闲」以免与 Working 矛盾）
     const n = hist.data?.entries?.length ?? 0;
-    const attachSt = await attachStateP;
-    const promptInFlight = attachSt?.data?.promptInFlight;
-    const hostStatus = attachSt?.data?.threadStatus ?? t.status;
-    const willBusy = shouldRehydrateBusy({
-      projection: getSessionTurn(t.sessionId),
-      sidebarWorking: workingSessions.has(t.sessionId),
-      threadStatus: hostStatus,
-      promptInFlight,
-    });
-    if (!willBusy) {
+    if (!willBusyEarly) {
       paintHistoryReplayDone(n);
     }
     await refreshProjectsAndThreads();
@@ -9500,6 +10104,9 @@ async function openThread(t: ThreadRow): Promise<void> {
       });
       // 阶段一：恢复 plan / 未决 exit_plan（有 pending 则开侧栏）
       void rehydrateSessionPlan(t.sessionId, { viewGen });
+      // P1：合成态刷新目标条（draining 不改 kicker，仅过程条）
+      renderGoalBanner();
+      refreshTurnPhaseActivityLabel();
     }
   }
 }
@@ -9800,20 +10407,25 @@ async function startNewChat(prompt?: string): Promise<void> {
     stashSessionId: activeSessionId,
     abandonPending: false,
   });
+  // 目标模式快照：await 前锁定，避免确认框期间 compose 被清掉后当普通消息
+  const forceGoal = goalComposeActive;
   const raw =
     prompt ??
     ($("composer-input") as HTMLTextAreaElement).value.trim() ??
     ($("chat-input") as HTMLTextAreaElement).value.trim();
   // 欢迎页手输 /always-approve 等：本地执行，不建空会话
-  if (!prompt && (await tryRunComposerSlashLine(raw))) return;
-  const goalParse = parseGoalInput(raw);
+  // 目标模式下正文不是 slash，勿拦截
+  if (!prompt && !forceGoal && (await tryRunComposerSlashLine(raw))) return;
+  const goalParse = parseGoalInput(raw, { forceGoal });
   if (goalParse.enterComposeOnly) {
     ($("composer-input") as HTMLTextAreaElement).value = "";
     ($("chat-input") as HTMLTextAreaElement).value = "";
     beginGoalCompose();
     return;
   }
+  // 替换确认在清空输入框之前；取消则保留草稿
   if (goalParse.goalTitle) {
+    if (!(await confirmGoalReplaceIfNeeded(goalParse.goalTitle))) return;
     const gr = await applyGoalTitle(goalParse.goalTitle);
     if (!gr.ok) {
       showToast(gr.message ?? "设置目标失败", "error");
@@ -9900,11 +10512,12 @@ async function startNewChat(prompt?: string): Promise<void> {
   const goalHint = pendingGoalTitle;
   await persistPendingGoal();
 
-  const goalJustSet = goalParse.goalTitle || goalHint;
-  const agentContent = agentContentForSend(
-    content,
-    goalJustSet && !goalPaused ? goalJustSet : null,
-  );
+  // 目标模式 / 显式 /goal：只发 `/goal …`，绝不当普通消息再发一遍
+  const goalJustSet =
+    goalParse.goalTitle ||
+    goalHint ||
+    (forceGoal ? parseGoalBudget(content).objective || null : null);
+  const agentContent = agentContentForSend(content, goalJustSet);
 
   // Pending → Active：下一条消息进入计划 Active
   if (planPhase === "pending") {
@@ -9940,18 +10553,19 @@ async function startNewChat(prompt?: string): Promise<void> {
 /**
  * 从当前可见输入框读取并清空，构建 display/content。
  * 无内容返回 null。turn 进行中用于入队；空闲时用于直接发送。
+ *
+ * forceGoal：调用方在 await 前快照的 compose 态；目标模式必须只产出 goalTitle。
  */
-function takeComposerPrompt(): {
+function takeComposerPrompt(opts?: { forceGoal?: boolean }): {
   display: string;
   content: string;
   attachSnap: ComposerAttachment[];
   goalTitle: string | null;
 } | null {
-  const input = $("chat").classList.contains("hidden")
-    ? ($("composer-input") as HTMLTextAreaElement)
-    : ($("chat-input") as HTMLTextAreaElement);
+  const forceGoal = Boolean(opts?.forceGoal || goalComposeActive);
+  const input = activeComposerInput();
   const raw = input.value.trim();
-  const goalParse = parseGoalInput(raw);
+  const goalParse = parseGoalInput(raw, { forceGoal });
   if (goalParse.enterComposeOnly) {
     input.value = "";
     beginGoalCompose();
@@ -9966,11 +10580,15 @@ function takeComposerPrompt(): {
   setComposerPlaceholders(false);
   // S17：记录用户可见文案（不含附件块噪音时用 display）
   recordPromptHistory(display || content);
+  // 目标模式硬保证：有正文则 goalTitle 必填，禁止只当普通消息
+  const goalTitle =
+    goalParse.goalTitle ??
+    (forceGoal ? parseGoalBudget(display || content).objective || null : null);
   return {
     display,
     content,
     attachSnap,
-    goalTitle: goalParse.goalTitle ?? null,
+    goalTitle,
   };
 }
 
@@ -10518,11 +11136,32 @@ function tryEnqueueFromComposer(): boolean {
     if (ta) ta.value = "";
     return true;
   }
-  const taken = takeComposerPrompt();
+  // 目标模式快照（入队同步路径，仍先锁标志）
+  const forceGoal = goalComposeActive;
+  // 纯 `/goal`：进 compose，不算 follow-up
+  const goalPeek = parseGoalInput(raw, { forceGoal });
+  if (goalPeek.enterComposeOnly) {
+    const ta = activeComposerInput();
+    if (ta) ta.value = "";
+    beginGoalCompose();
+    return true;
+  }
+  // 需替换确认：不能同步入队（无 modal）；调用方应改走 send 路径
+  if (composerNeedsGoalReplaceConfirm(raw)) return false;
+
+  const taken = takeComposerPrompt({ forceGoal });
   if (!taken) return false;
+  // compose / /goal 入队时 content 即 agent 侧 `/goal …`，避免 drain 时当普通消息
+  const agentContent = agentContentForSend(
+    taken.content,
+    taken.goalTitle ?? pendingGoalTitle ?? null,
+  );
+  if (taken.goalTitle) {
+    void applyGoalTitle(taken.goalTitle);
+  }
   const qid = enqueuePrompt({
     display: taken.display,
-    content: taken.content,
+    content: agentContent,
     attachments: taken.attachSnap,
   });
   // 时间线提示（不画用户气泡）；插话/移出/清空时按 queue id 清除
@@ -10535,8 +11174,10 @@ async function sendContinue(): Promise<void> {
     await startNewChat();
     return;
   }
-  // 空闲时也可 /btw；/interject 需 turn
-  {
+  // 目标模式快照：后续任何 await 都不得让 compose 丢标志后回落普通消息
+  const forceGoal = goalComposeActive;
+  // 空闲时也可 /btw；/interject 需 turn（目标模式不走 slash/旁路）
+  if (!forceGoal) {
     const raw = activeComposerInput()?.value.trim() ?? "";
     if (await tryRunComposerSlashLine(raw)) return;
     const inline = parseInlineBtwOrInterject(raw);
@@ -10570,10 +11211,18 @@ async function sendContinue(): Promise<void> {
     return;
   }
   if (busyAction === "enqueue") {
-    if (tryEnqueueFromComposer()) return;
-    if (cancelTurnInFlight) await cancelTurnInFlight;
-    else if (turnActive) await cancelTurn({ trigger: "stop" });
-    return;
+    // 替换目标需确认：不能静默入队失败；提升为 send_now（先停再发）
+    if (composerNeedsGoalReplaceConfirm()) {
+      if (turnActive || cancelTurnInFlight) {
+        await cancelTurn({ trigger: "send_now", pauseQueue: false });
+      }
+      // fall through 发送路径
+    } else {
+      if (tryEnqueueFromComposer()) return;
+      if (cancelTurnInFlight) await cancelTurnInFlight;
+      else if (turnActive) await cancelTurn({ trigger: "stop" });
+      return;
+    }
   }
   if (busyAction === "wait_then_send") {
     // send_now：等 cancel 完成再发（或先发起 cancel）
@@ -10583,7 +11232,20 @@ async function sendContinue(): Promise<void> {
     // fall through 发送路径
   }
   // send_idle 或 send_now 后：继续下方
-  const taken = takeComposerPrompt();
+  // 先 peek goal：替换确认失败时保留输入框草稿（take 会清空）
+  const peekInput = activeComposerInput();
+  const peekRaw = (peekInput?.value ?? "").trim();
+  const peekGoal = parseGoalInput(peekRaw, { forceGoal });
+  if (peekGoal.enterComposeOnly) {
+    if (peekInput) peekInput.value = "";
+    beginGoalCompose();
+    return;
+  }
+  if (peekGoal.goalTitle) {
+    if (!(await confirmGoalReplaceIfNeeded(peekGoal.goalTitle))) return;
+  }
+
+  const taken = takeComposerPrompt({ forceGoal });
   if (!taken) return;
 
   if (taken.goalTitle) {
@@ -10608,10 +11270,14 @@ async function sendContinue(): Promise<void> {
   }
   if (activeSessionId) markSessionWorking(activeSessionId, true);
   await persistPendingGoal();
-  const baseContent = agentContentForSend(
-    taken.content,
-    taken.goalTitle && !goalPaused ? taken.goalTitle : null,
-  );
+  // 目标模式：只发 `/goal …` 一条路径（CLI GoalSet）；禁止普通消息
+  const goalJustSet =
+    taken.goalTitle ??
+    pendingGoalTitle ??
+    (forceGoal
+      ? parseGoalBudget(taken.content).objective || null
+      : null);
+  const baseContent = agentContentForSend(taken.content, goalJustSet);
   // Pending → Active：下一条消息进入计划 Active
   if (planPhase === "pending") {
     planPhase = "active";
@@ -11368,6 +12034,10 @@ async function cycleSessionMode(): Promise<void> {
       });
     }
     accessMode = "always_approve";
+    if (sessionModeChipFocus === "plan") {
+      sessionModeChipFocus =
+        Boolean(currentGoalTitle()) || goalComposeActive ? "goal" : null;
+    }
     syncPermLabels();
     const r = await syncSessionPolicyLive({ plan: false, alwaysApprove: true });
     if (!r.ok) {
@@ -11382,6 +12052,10 @@ async function cycleSessionMode(): Promise<void> {
   planPhase = "off";
   if (activeSessionId) {
     patchSessionPlan(activeSessionId, { planPhase: "off" });
+  }
+  if (sessionModeChipFocus === "plan") {
+    sessionModeChipFocus =
+      Boolean(currentGoalTitle()) || goalComposeActive ? "goal" : null;
   }
   syncPermLabels();
   void syncSessionPolicyLive({ plan: false, alwaysApprove: false });

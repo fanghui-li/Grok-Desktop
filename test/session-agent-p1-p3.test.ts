@@ -513,12 +513,46 @@ describe("P3 skills resolve + hooks", () => {
     const created = await host.threadsCreate({ cwd, title: "btw" });
     const answer = await host.threadsBtw(created.threadId, "what is x?");
     expect(answer.answer).toContain("btw-echo");
-    // interject without in-flight turn still accepted by fake (agent may queue)
+    // idle interject: fake returns accepted (no hung prompt)
     const ij = await host.threadsInterject(created.threadId, "steer left", {
       interjectionId: "ij_test_1",
     });
     expect(ij.interjectionId).toBe("ij_test_1");
-    expect(ij.status).toBeTruthy();
+    expect(ij.status).toBe("accepted");
+    expect(ij.sessionId).toBe(created.sessionId);
+
+    await expect(
+      host.threadsInterject(created.threadId, "   "),
+    ).rejects.toMatchObject({ code: "INVALID_ARGUMENT" });
+  });
+
+  it("threads.interject mid-turn returns queued and does not cancel (fake slow)", async () => {
+    const home = tempHome();
+    const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "grok-ij-mid-"));
+    homes.push(cwd);
+    const host = trackHost(
+      new DesktopHost({
+        home,
+        grokPath: process.execPath,
+        agentArgs: [fakeAgent],
+        env: { ...process.env, FAKE_ACP_SLOW_PROMPT: "1" },
+      }),
+    );
+    // no initial prompt — slow would hang create
+    const created = await host.threadsCreate({ cwd, title: "ij-mid" });
+    const promptP = host.turnsPrompt(created.threadId, "hang for interject");
+    await new Promise((r) => setTimeout(r, 80));
+
+    const ij = await host.threadsInterject(created.threadId, "steer mid-turn", {
+      interjectionId: "ij_mid_1",
+    });
+    expect(ij.interjectionId).toBe("ij_mid_1");
+    // fake: hungPromptId set → status queued (wire accepted while turn in flight)
+    expect(ij.status).toBe("queued");
+
+    // still in-flight until cancel — interject must not complete the hung prompt alone
+    await host.turnsCancel(created.threadId, { trigger: "stop" });
+    await promptP.catch(() => undefined);
   });
 
   it("hooksList reads hooks-trust.json (default untrusted until trust)", () => {

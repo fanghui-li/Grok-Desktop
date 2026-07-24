@@ -1,57 +1,172 @@
 import fs from "node:fs";
 import path from "node:path";
-import type { GoalState, PlanState, SubagentNode } from "../shared/types.js";
+import type {
+  GoalState,
+  PlanState,
+  SessionGoalProjection,
+  SubagentNode,
+} from "../shared/types.js";
 import { findSessionDir } from "./paths.js";
+import {
+  applyGoalUpdated,
+  getSessionGoal,
+  markGoalClearedLocal,
+  parseGoalWireStatus,
+  shouldDropGoalStatusDowngrade,
+  wireStatusToLegacy,
+  type GoalUpdatedInput,
+} from "./session-goal-store.js";
 
-/** Best-effort FS projection for Goal / Plan / Subagent (capability-degraded). */
-export function loadGoal(sessionId: string, home?: string): GoalState | null {
+/** 可选磁盘缓存：非权威，仅加速冷启动；权威在 session-goal-store */
+function goalCachePath(sessionId: string, home?: string): string | null {
   const dir = findSessionDir(sessionId, home);
   if (!dir) return null;
-  const goalPath = path.join(dir, "goal.json");
-  if (fs.existsSync(goalPath)) {
+  return path.join(dir, "goal-projection.json");
+}
+
+/** @deprecated 旧 goal.json 路径，仅迁移读取 */
+function legacyGoalPath(sessionId: string, home?: string): string | null {
+  const dir = findSessionDir(sessionId, home);
+  if (!dir) return null;
+  return path.join(dir, "goal.json");
+}
+
+export function writeProjectionCache(
+  sessionId: string,
+  projection: SessionGoalProjection | null,
+  home?: string,
+): void {
+  const p = goalCachePath(sessionId, home);
+  if (!p) return;
+  try {
+    if (!projection) {
+      if (fs.existsSync(p)) fs.unlinkSync(p);
+      // 顺带清旧 goal.json，避免假「进行中」
+      const legacy = legacyGoalPath(sessionId, home);
+      if (legacy && fs.existsSync(legacy)) fs.unlinkSync(legacy);
+      return;
+    }
+    fs.writeFileSync(p, JSON.stringify(projection, null, 2), "utf8");
+    // 兼容旧读取：写瘦身 goal.json
+    const legacy = legacyGoalPath(sessionId, home);
+    if (legacy) {
+      const state = projectionToLegacyState(projection);
+      fs.writeFileSync(legacy, JSON.stringify(state, null, 2), "utf8");
+    }
+  } catch {
+    /* best-effort */
+  }
+}
+
+export function projectionToLegacyState(
+  p: SessionGoalProjection,
+): GoalState {
+  const status = wireStatusToLegacy(p.status);
+  return {
+    sessionId: p.sessionId,
+    title: p.objective,
+    status,
+    tree: [
+      {
+        id: p.goalId || "root",
+        title: p.objective,
+        status,
+      },
+    ],
+    updatedAt: p.updatedAt,
+    projection: p,
+  };
+}
+
+/** 读取缓存投影（不写 store） */
+export function loadProjectionCache(
+  sessionId: string,
+  home?: string,
+): SessionGoalProjection | null {
+  const p = goalCachePath(sessionId, home);
+  if (p && fs.existsSync(p)) {
     try {
-      return JSON.parse(fs.readFileSync(goalPath, "utf8")) as GoalState;
+      const j = JSON.parse(fs.readFileSync(p, "utf8")) as SessionGoalProjection;
+      if (j && j.objective && j.status && j.status !== "cleared") return j;
     } catch {
       /* fall through */
     }
   }
-  // 勿因 goal/ 目录占位就伪造「进行中」目标，否则会话会无端进入目标模式
+  // 旧 goal.json：仅当 status 有效时作弱缓存（不自动 opt-in 权威）
+  const legacy = legacyGoalPath(sessionId, home);
+  if (legacy && fs.existsSync(legacy)) {
+    try {
+      const g = JSON.parse(fs.readFileSync(legacy, "utf8")) as GoalState;
+      if (!g?.title) return null;
+      const st = String(g.status ?? "").toLowerCase();
+      if (
+        st === "cancelled" ||
+        st === "canceled" ||
+        st === "cleared" ||
+        st === "completed"
+      ) {
+        return null;
+      }
+      // 无 goal_id 的旧缓存：不当权威 active，返回 null 等 jsonl bootstrap
+      // （避免未 /goal 会话仅因脏 goal.json 显示目标）
+      return null;
+    } catch {
+      return null;
+    }
+  }
   return null;
 }
 
-/** Desktop /goal：写入会话目录 goal.json（对齐 CLI 目标语义） */
+/**
+ * @deprecated 旧 API：读磁盘 goal.json。
+ * 新代码用 getSessionGoal / goalsGetProjection。
+ */
+export function loadGoal(sessionId: string, home?: string): GoalState | null {
+  const proj = getSessionGoal(sessionId) ?? loadProjectionCache(sessionId, home);
+  if (!proj) return null;
+  return projectionToLegacyState(proj);
+}
+
+/**
+ * @deprecated 禁止作为权威写路径；仅兼容旧 IPC。
+ * 新控制面：renderer 发 /goal slash，等 goal_updated。
+ */
 export function writeGoal(
   sessionId: string,
   title: string,
   home?: string,
   status: GoalState["status"] = "active",
 ): GoalState {
-  const dir = findSessionDir(sessionId, home);
-  if (!dir) {
-    throw new Error(`Session dir not found for ${sessionId}`);
-  }
-  const prev = loadGoal(sessionId, home);
+  // 不再伪造 active harness；仅写弱缓存草稿（status 强制不抬 harness）
   const state: GoalState = {
     sessionId,
-    title: title.trim() || prev?.title || "Goal",
+    title: title.trim() || "Goal",
     status,
     tree: [
       {
         id: "root",
-        title: title.trim() || prev?.title || "Goal",
+        title: title.trim() || "Goal",
         status,
       },
     ],
     updatedAt: new Date().toISOString(),
   };
-  fs.writeFileSync(
-    path.join(dir, "goal.json"),
-    JSON.stringify(state, null, 2),
-    "utf8",
-  );
+  const dir = findSessionDir(sessionId, home);
+  if (dir) {
+    try {
+      fs.writeFileSync(
+        path.join(dir, "goal.json"),
+        JSON.stringify(state, null, 2),
+        "utf8",
+      );
+    } catch {
+      /* ignore */
+    }
+  }
   return state;
 }
 
+/** @deprecated 本地 setStatus 非权威 */
 export function setGoalStatus(
   sessionId: string,
   status: GoalState["status"],
@@ -62,41 +177,177 @@ export function setGoalStatus(
   return writeGoal(sessionId, prev.title, home, status);
 }
 
-/** 将 agent goal_updated.status 映射为 Desktop GoalStatus */
+/** @deprecated 用 parseGoalWireStatus + wireStatusToLegacy */
 export function mapAgentGoalStatus(agentStatus: string): GoalState["status"] {
-  const s = agentStatus.toLowerCase();
-  if (s === "complete" || s === "completed") return "completed";
-  if (s === "user_paused" || s === "paused") return "paused";
-  if (s === "blocked") return "blocked";
-  if (s === "cancelled" || s === "canceled" || s === "cleared") return "cancelled";
-  return "active";
+  return wireStatusToLegacy(parseGoalWireStatus(agentStatus));
 }
 
-/** 用 agent 事件投影覆盖本地 goal.json（同源落盘） */
+/** @deprecated 用 applyGoalUpdated + writeProjectionCache */
 export function applyAgentGoalProjection(
   sessionId: string,
   objective: string,
   agentStatus: string,
   home?: string,
 ): GoalState {
-  const status = mapAgentGoalStatus(agentStatus);
-  const title = objective.trim() || loadGoal(sessionId, home)?.title || "Goal";
-  return writeGoal(sessionId, title, home, status);
+  const result = applyGoalUpdated({
+    sessionId,
+    objective,
+    status: agentStatus,
+  });
+  if (result.projection) {
+    writeProjectionCache(sessionId, result.projection, home);
+    return projectionToLegacyState(result.projection);
+  }
+  writeProjectionCache(sessionId, null, home);
+  return {
+    sessionId,
+    title: objective || "Goal",
+    status: "cancelled",
+    tree: [],
+    updatedAt: new Date().toISOString(),
+  };
 }
 
-/** agent updates.jsonl 中最近一次 goal_updated */
 export interface AgentGoalSnapshot {
   objective: string;
-  /** agent 原始 status：active | user_paused | complete | … */
   status: string;
   lastEvent?: string;
+  lastEventDetail?: string;
   elapsedMs?: number;
   goalId?: string;
+  phase?: string;
+  tokenBudget?: number | null;
+  tokensUsed?: number;
+  message?: string;
+  verifyingCompletion?: boolean;
+  planning?: boolean;
+  classifierRunsAttempted?: number;
+  classifierMaxRuns?: number;
+  lastClassifierVerdict?: string;
+  lastClassifierDetailsPath?: string;
+  tokenBaseline?: number;
+  finishedSubagentTokens?: number;
+  liveSubagentTokens?: number;
+}
+
+function parseGoalUpdatedLine(line: string): AgentGoalSnapshot | null {
+  if (!line.trim().startsWith("{")) return null;
+  try {
+    const j = JSON.parse(line) as {
+      params?: { update?: Record<string, unknown> };
+    };
+    const u = j.params?.update;
+    if (!u || u.sessionUpdate !== "goal_updated") return null;
+    return snapshotFromUpdateRecord(u);
+  } catch {
+    return null;
+  }
+}
+
+export function snapshotFromUpdateRecord(
+  u: Record<string, unknown>,
+): AgentGoalSnapshot {
+  return {
+    objective: String(u.objective ?? ""),
+    status: String(u.status ?? "active"),
+    lastEvent:
+      typeof u.last_event === "string"
+        ? u.last_event
+        : typeof u.lastEvent === "string"
+          ? u.lastEvent
+          : undefined,
+    lastEventDetail:
+      typeof u.last_event_detail === "string"
+        ? u.last_event_detail
+        : typeof u.lastEventDetail === "string"
+          ? u.lastEventDetail
+          : undefined,
+    elapsedMs:
+      typeof u.elapsed_ms === "number"
+        ? u.elapsed_ms
+        : typeof u.elapsedMs === "number"
+          ? u.elapsedMs
+          : undefined,
+    goalId:
+      typeof u.goal_id === "string"
+        ? u.goal_id
+        : typeof u.goalId === "string"
+          ? u.goalId
+          : undefined,
+    phase: typeof u.phase === "string" ? u.phase : undefined,
+    tokenBudget:
+      typeof u.token_budget === "number"
+        ? u.token_budget
+        : typeof u.tokenBudget === "number"
+          ? u.tokenBudget
+          : u.token_budget === null || u.tokenBudget === null
+            ? null
+            : undefined,
+    tokensUsed:
+      typeof u.tokens_used === "number"
+        ? u.tokens_used
+        : typeof u.tokensUsed === "number"
+          ? u.tokensUsed
+          : undefined,
+    message:
+      typeof u.pause_message === "string"
+        ? u.pause_message
+        : typeof u.message === "string"
+          ? u.message
+          : typeof u.pauseMessage === "string"
+            ? u.pauseMessage
+            : undefined,
+    verifyingCompletion: Boolean(
+      u.verifying_completion ?? u.verifyingCompletion,
+    ),
+    planning: Boolean(u.planning),
+    classifierRunsAttempted:
+      typeof u.classifier_runs_attempted === "number"
+        ? u.classifier_runs_attempted
+        : typeof u.classifierRunsAttempted === "number"
+          ? u.classifierRunsAttempted
+          : undefined,
+    classifierMaxRuns:
+      typeof u.classifier_max_runs === "number"
+        ? u.classifier_max_runs
+        : typeof u.classifierMaxRuns === "number"
+          ? u.classifierMaxRuns
+          : undefined,
+    lastClassifierVerdict:
+      typeof u.last_classifier_verdict === "string"
+        ? u.last_classifier_verdict
+        : typeof u.lastClassifierVerdict === "string"
+          ? u.lastClassifierVerdict
+          : undefined,
+    lastClassifierDetailsPath:
+      typeof u.last_classifier_details_path === "string"
+        ? u.last_classifier_details_path
+        : typeof u.lastClassifierDetailsPath === "string"
+          ? u.lastClassifierDetailsPath
+          : undefined,
+    tokenBaseline:
+      typeof u.token_baseline === "number"
+        ? u.token_baseline
+        : typeof u.tokenBaseline === "number"
+          ? u.tokenBaseline
+          : undefined,
+    finishedSubagentTokens:
+      typeof u.finished_subagent_tokens === "number"
+        ? u.finished_subagent_tokens
+        : typeof u.finishedSubagentTokens === "number"
+          ? u.finishedSubagentTokens
+          : undefined,
+    liveSubagentTokens:
+      typeof u.live_subagent_tokens === "number"
+        ? u.live_subagent_tokens
+        : typeof u.liveSubagentTokens === "number"
+          ? u.liveSubagentTokens
+          : undefined,
+  };
 }
 
 /**
  * 从会话 updates.jsonl 尾部读取最新 goal_updated。
- * 实时 ACP 偶发丢事件时，以此为同源权威回读。
  */
 export function readLastGoalUpdatedFromSession(
   sessionId: string,
@@ -112,7 +363,6 @@ export function readLastGoalUpdatedFromSession(
     const st = fs.statSync(updatesPath);
     const size = st.size;
     if (size <= 0) return null;
-    // 只读尾部，避免大会话全量加载
     const chunk = Math.min(size, 512 * 1024);
     const fd = fs.openSync(updatesPath, "r");
     try {
@@ -129,74 +379,107 @@ export function readLastGoalUpdatedFromSession(
   const lines = text.split(/\r?\n/).filter((l) => l.includes("goal_updated"));
   let last: AgentGoalSnapshot | null = null;
   for (const line of lines) {
-    // 跳过截断的首行
-    if (!line.trim().startsWith("{")) continue;
-    try {
-      const j = JSON.parse(line) as {
-        params?: { update?: Record<string, unknown> };
-      };
-      const u = j.params?.update;
-      if (!u || u.sessionUpdate !== "goal_updated") continue;
-      last = {
-        objective: String(u.objective ?? ""),
-        status: String(u.status ?? "active"),
-        lastEvent:
-          typeof u.last_event === "string" ? u.last_event : undefined,
-        elapsedMs:
-          typeof u.elapsed_ms === "number" ? u.elapsed_ms : undefined,
-        goalId:
-          typeof u.goal_id === "string"
-            ? u.goal_id
-            : typeof u.goalId === "string"
-              ? u.goalId
-              : undefined,
-      };
-    } catch {
-      /* 半截 JSON 忽略 */
+    const snap = parseGoalUpdatedLine(line);
+    if (!snap) continue;
+    // 同 goal：complete / budget_limited 粘性（对齐 GoalTracker no-op pause）
+    if (last) {
+      const same =
+        (last.goalId &&
+          snap.goalId &&
+          last.goalId === snap.goalId) ||
+        (!snap.goalId && Boolean(last.goalId));
+      if (same) {
+        const prevSt = parseGoalWireStatus(last.status);
+        const nextSt = parseGoalWireStatus(snap.status);
+        if (
+          shouldDropGoalStatusDowngrade(prevSt, nextSt, true)
+        ) {
+          continue;
+        }
+      }
     }
+    last = snap;
   }
   return last;
 }
 
 /**
- * 从 agent 日志同步并写回 goal.json。
- * 仅当 Desktop 侧已有 goal.json（用户显式 /goal 或 goals.set）时才投影，
- * 避免 agent 自发 goal_updated 把普通会话拉进目标模式。
+ * 冷启动 bootstrap：jsonl 最新 goal_updated → session-goal-store。
+ * 仅当 agent 日志声明有 goal 时建立投影（不对脏 goal.json opt-in）。
  */
 export function syncGoalFromAgentLog(
   sessionId: string,
   home?: string,
-): { state: GoalState | null; agent: AgentGoalSnapshot | null } {
+): {
+  state: GoalState | null;
+  agent: AgentGoalSnapshot | null;
+  projection: SessionGoalProjection | null;
+} {
   const agent = readLastGoalUpdatedFromSession(sessionId, home);
-  const existing = loadGoal(sessionId, home);
   if (!agent) {
-    return { state: existing, agent: null };
+    const existing = getSessionGoal(sessionId);
+    return {
+      state: existing ? projectionToLegacyState(existing) : null,
+      agent: null,
+      projection: existing,
+    };
   }
-  // agent 首启 goal 时也落盘，不要求 Desktop 先有 goal.json
-  try {
-    const state = applyAgentGoalProjection(
-      sessionId,
-      agent.objective || existing?.title || "Goal",
-      agent.status,
-      home,
-    );
-    return { state, agent };
-  } catch {
-    // 会话目录尚未就绪时仅回传 agent 快照
-    return { state: existing, agent };
-  }
+
+  const input: GoalUpdatedInput = {
+    sessionId,
+    goalId: agent.goalId,
+    objective: agent.objective,
+    status: agent.status,
+    phase: agent.phase,
+    tokenBudget: agent.tokenBudget,
+    tokensUsed: agent.tokensUsed,
+    elapsedMs: agent.elapsedMs,
+    lastEvent: agent.lastEvent,
+    lastEventDetail: agent.lastEventDetail,
+    message: agent.message,
+    verifyingCompletion: agent.verifyingCompletion,
+    planning: agent.planning,
+    classifierRunsAttempted: agent.classifierRunsAttempted,
+    classifierMaxRuns: agent.classifierMaxRuns,
+    lastClassifierVerdict: agent.lastClassifierVerdict,
+    lastClassifierDetailsPath: agent.lastClassifierDetailsPath,
+    tokenBaseline: agent.tokenBaseline,
+    finishedSubagentTokens: agent.finishedSubagentTokens,
+    liveSubagentTokens: agent.liveSubagentTokens,
+  };
+
+  const result = applyGoalUpdated(input);
+  writeProjectionCache(sessionId, result.projection, home);
+  return {
+    state: result.projection
+      ? projectionToLegacyState(result.projection)
+      : null,
+    agent,
+    projection: result.projection,
+  };
 }
 
 export function clearGoal(sessionId: string, home?: string): boolean {
+  markGoalClearedLocal(sessionId);
+  writeProjectionCache(sessionId, null, home);
   const dir = findSessionDir(sessionId, home);
-  if (!dir) return false;
-  const goalPath = path.join(dir, "goal.json");
-  if (fs.existsSync(goalPath)) {
-    fs.unlinkSync(goalPath);
-    return true;
+  if (!dir) return true;
+  let cleared = false;
+  for (const name of ["goal.json", "goal-projection.json"]) {
+    const p = path.join(dir, name);
+    if (fs.existsSync(p)) {
+      try {
+        fs.unlinkSync(p);
+        cleared = true;
+      } catch {
+        /* ignore */
+      }
+    }
   }
-  return false;
+  return cleared;
 }
+
+// ── Plan / Subagent（原 goals.ts 职责保留，行为不变）────────────────
 
 export function loadPlan(sessionId: string, home?: string): PlanState | null {
   const dir = findSessionDir(sessionId, home);
@@ -259,7 +542,10 @@ export function setPlanStatus(
   return { ...plan, status };
 }
 
-export function loadSubagentTree(sessionId: string, home?: string): SubagentNode[] {
+export function loadSubagentTree(
+  sessionId: string,
+  home?: string,
+): SubagentNode[] {
   const dir = findSessionDir(sessionId, home);
   if (!dir) return [];
   const treePath = path.join(dir, "subagents.json");

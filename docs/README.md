@@ -7,6 +7,7 @@ Grok Desktop 是 **Grok Build 的桌面客户端**：Electron 指挥面 + Host�
 | [架构与协议.md](./架构与协议.md) | 分层、进程、Host API、会话与安全 |
 | [cli-desktop-capability-matrix.md](./cli-desktop-capability-matrix.md) | CLI ↔ Desktop 能力对照（欢迎共维；现行能力真源） |
 | [cli-desktop-align-plan.md](./cli-desktop-align-plan.md) | cancel / 回合 / 队列对齐计划与 N1–N11 验收 |
+| [goal-handtest-checklist.md](./goal-handtest-checklist.md) | Goal 手测厚清单（维护者/发版参考） |
 | [BRANCHING.md](./BRANCHING.md) | 分支模型（main + 短功能分支）与发版 |
 | [archive/session-agent-improve-plan.md](./archive/session-agent-improve-plan.md) | **历史**：2026-07 会话/Agent 完整开发计划（已交付；勿作 backlog） |
 | [根 README（English，主文档）](../README.md) | **End-user README**: intro, install, screenshots |

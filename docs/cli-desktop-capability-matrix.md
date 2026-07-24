@@ -256,7 +256,10 @@ grok agent stdio（agent-bin / 安装包 / PATH）
 | G1 | always-approve / yolo | `/always-approve` | chip + slash + meta | ✅ | |
 | G2 | plan 模式 | `/plan` | chip + slash + 面板 + set_mode | ✅ | 2026-07-23：进 plan 开侧栏；回合结束自动 surface |
 | G3 | exit plan 审批 | reverse request | 同 | ✅ | |
-| G4 | goal set/status/clear/pause/resume | Shell `/goal` + `--budget` | slash + banner + budget 弹窗 | ✅ | |
+| G4a | goal 命令入口 set/status/clear/pause/resume/`--budget` | Shell `/goal` | slash + banner + budget 弹窗 | ✅ | 发送拼 `/goal …` |
+| G4b | goal 真源 / 投影 | `GoalTracker` + `goal_updated` + GoalModeState | `session-goal-store` per-session；不写权威 goal.json | ✅ | 2026-07-24：去掉 tool 合成与 auto opt-in |
+| G4c | 细状态 / clear 防复活 / elapsed floor | pager GoalDisplayStatus | wire 8 态 + clearedGoalIds + floor | ✅ | |
+| G4d | goal 详情面（classifier / history） | TUI goal_detail | banner phase + budget 进度 | 🟡 | 非全屏详情 |
 | G5 | model / effort 热切换 | set_model | chip + `/model` `/effort` | ✅ | 不兼容 harness → 新会话 |
 | G6 | `/auto` 权限 | pager 有 | **产品不做** | — | |
 | G7 | max-turns | flags | `/max-turns` → 新会话 meta | ✅ | |
@@ -304,7 +307,7 @@ grok agent stdio（agent-bin / 安装包 / PATH）
 |------|------|
 | `/always-approve` | ✅（主入口 chip） |
 | `/plan` `/view-plan` | ✅ / 🟡 深度 |
-| `/goal` `/goal-status` `/goal-clear` `/goal-pause` `/goal-resume` `/goal-budget` | ✅ |
+| `/goal` `/goal-status` `/goal-clear` `/goal-pause` `/goal-resume` `/goal-budget` | ✅ | 真源 G4b：`session-goal-store`；控制面 slash-only |
 | `/model` `/effort` `/max-turns` | ✅ |
 | `/context` `/status` | ✅ |
 | `/compact` `/export` `/fork` `/rewind` | ✅ |

@@ -371,6 +371,55 @@ export interface McpServerInfo {
   enabled?: boolean;
 }
 
+/**
+ * CLI GoalUpdated wire status（对齐 pager GoalDisplayStatus / shell GoalStatus）。
+ * 未知串 fail-safe → user_paused（不当 Active）。
+ */
+export type GoalWireStatus =
+  | "active"
+  | "user_paused"
+  | "back_off_paused"
+  | "no_progress_paused"
+  | "infra_paused"
+  | "blocked"
+  | "budget_limited"
+  | "complete"
+  | "cleared";
+
+export type GoalPhase = "idle" | "planning" | "executing";
+
+/**
+ * per-session Goal 投影（对齐 CLI AgentView.goal_state）。
+ * 真源：agent sessionUpdate goal_updated；Desktop 不抢 GoalTracker。
+ */
+export interface SessionGoalProjection {
+  sessionId: string;
+  goalId: string;
+  objective: string;
+  status: GoalWireStatus;
+  phase: GoalPhase;
+  tokenBudget: number | null;
+  tokensUsed: number;
+  /** wire 权威 elapsed 基线 */
+  elapsedMs: number;
+  /** 防回拨 floor（对齐 pager elapsed_floor_ms） */
+  elapsedFloorMs: number;
+  pauseMessage?: string;
+  lastEvent?: string;
+  lastEventDetail?: string;
+  verifyingCompletion: boolean;
+  planning: boolean;
+  classifierRunsAttempted?: number;
+  classifierMaxRuns?: number;
+  lastClassifierVerdict?: string;
+  lastClassifierDetailsPath?: string;
+  tokenBaseline?: number;
+  finishedSubagentTokens?: number;
+  liveSubagentTokens?: number;
+  updatedAt: string;
+}
+
+/** @deprecated 粗粒度 UI 兼容；新代码用 GoalWireStatus + SessionGoalProjection */
 export type GoalStatus =
   | "active"
   | "paused"
@@ -378,6 +427,7 @@ export type GoalStatus =
   | "completed"
   | "cancelled";
 
+/** @deprecated 假 tree 模型；保留给旧 IPC 消费者，goals.get 已返回投影 */
 export interface GoalNode {
   id: string;
   title: string;
@@ -386,12 +436,18 @@ export interface GoalNode {
   note?: string;
 }
 
+/**
+ * 旧 GoalState 形状（磁盘 goal.json 缓存兼容）。
+ * 权威投影见 SessionGoalProjection。
+ */
 export interface GoalState {
   sessionId: string;
   title: string;
   status: GoalStatus;
   tree: GoalNode[];
   updatedAt: string;
+  /** 可选：完整投影快照（新缓存） */
+  projection?: SessionGoalProjection;
 }
 
 export interface PlanState {

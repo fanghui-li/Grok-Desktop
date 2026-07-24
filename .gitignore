@@ -17,3 +17,7 @@ tmp/
 docs/private/
 docs/dev/
 *.local.md
+
+# 维护者本地测试工作流（不入库；本机 /desktop-test + 运行归档）
+.grok/skills/desktop-test/
+docs/test-archive/
