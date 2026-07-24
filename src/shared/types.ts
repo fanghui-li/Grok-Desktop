@@ -145,6 +145,14 @@ export interface ModelInfo {
   /** 展示名，缺省用 id */
   name?: string;
   isDefault?: boolean;
+  /**
+   * 鉴权/来源分组（对齐 CLI catalog）：
+   * - official：无自定义 base_url，走 OAuth/session 或内置
+   * - custom：config `[model.*]` 带 base_url 的中转
+   *
+   * Host `models.list`：未官方登录时不返回 official（只保留 custom）。
+   */
+  source?: "official" | "custom";
 }
 
 /** 会话上下文占用（signals.json / CLI /context 同源字段） */

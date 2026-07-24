@@ -6,7 +6,7 @@
  */
 import type { HostIpcMethod } from "../shared/host-api.js";
 import type { NormalizedEvent } from "../shared/events.js";
-import { matchFriendlyErrorTitleKey } from "../shared/friendly-error-title.js";
+import { formatFriendlyErrorLabelTitle } from "../shared/friendly-error-title.js";
 import {
   armClearsHistoryResyncBlock,
   assistantsAfterLastUser,
@@ -33,6 +33,27 @@ import {
   shouldRehydrateBusy,
   type SessionTurnProjection,
 } from "./session-turn-store.js";
+import {
+  clearSessionPlan,
+  getSessionPlan,
+  patchSessionPlan,
+  setSessionPlan,
+  type PlanPhase,
+  type SessionPlanPendingApproval,
+} from "./session-plan-store.js";
+import {
+  beginBtwFlight,
+  cancelSessionBtwFlight,
+  clearSessionBtw,
+  getOrCreateSessionBtw,
+  isBtwFlightCurrent,
+  isBtwInFlight,
+  listSessionBtw,
+  replaceSessionBtwFromDisk,
+  upsertBtwExchange,
+  type BtwExchange,
+  type BtwExchangeState,
+} from "./session-btw-store.js";
 import {
   applyDomI18n,
   onLocaleChange,
@@ -245,17 +266,13 @@ let accessMode: SettingsPermMode = "normal";
  * - active：agent 已进 plan（set_mode 或 plan.mode.changed）
  * 与 accessMode 独立，不再塞进同一个三态枚举。
  */
-let planPhase: "off" | "pending" | "active" = "off";
+let planPhase: PlanPhase = "off";
 
 function isPlanOn(): boolean {
   return planPhase !== "off";
 }
-/** 当前待审批的 exit_plan_mode 请求 */
-let pendingPlanApproval: {
-  requestId: string;
-  sessionId: string;
-  planContent: string;
-} | null = null;
+/** 当前前台待审批的 exit_plan_mode 请求（仅 active 会话） */
+let pendingPlanApproval: SessionPlanPendingApproval | null = null;
 /**
  * turns.prompt IPC 返回与 turn.completed / 末包 message.delta 可能乱序；
  * endTurn 后短窗口内仍接受本 turn 的 assistant 流，避免「会话断了、最后一泡没了」。
@@ -724,7 +741,8 @@ function ensureTurnPhaseWorking(): void {
   tick();
   stopTurnPhaseTimer();
   turnPhaseTimer = setInterval(tick, 1000);
-  scrollTranscript();
+  // 仅创建 Working 条时可能贴底；之后每秒钉位置不改 scroll
+  scrollTranscriptIfSticky();
 }
 
 /**
@@ -753,7 +771,7 @@ function paintTurnPhaseDone(
     if (root.lastElementChild !== turnPhaseEl) {
       root.appendChild(turnPhaseEl);
     }
-    scrollTranscript();
+    scrollTranscriptIfSticky();
     return;
   }
 
@@ -768,7 +786,7 @@ function paintTurnPhaseDone(
   foot.innerHTML = `<span class="turn-phase-label">${esc(label)}</span>`;
   root.appendChild(foot);
   turnPhaseEl = foot;
-  scrollTranscript();
+  scrollTranscriptIfSticky();
 }
 
 /** @deprecated 名保留；逻辑并入 paintTurnPhaseDone */
@@ -824,7 +842,7 @@ function appendProcessText(text: string): void {
     processItemCount += 1;
     updateProcessHeader();
   }
-  scrollTranscript();
+  scrollTranscriptIfSticky();
 }
 
 function endProcessTextStream(): void {
@@ -840,7 +858,7 @@ function appendProcessNode(node: HTMLElement): void {
   body.appendChild(node);
   processItemCount += 1;
   updateProcessHeader();
-  scrollTranscript();
+  scrollTranscriptIfSticky();
 }
 
 function resetStreamState(finalize = true): void {
@@ -883,6 +901,9 @@ function clearTranscript(): void {
   processBodyEl = null;
   processItemCount = 0;
   streamIsProcess = false;
+  // 新时间线默认重新 stick
+  chatStick = true;
+  chatLastScrollTop = 0;
 }
 
 function normalizeAssistantForDedupe(s: string): string {
@@ -893,18 +914,43 @@ function normalizeAssistantForDedupe(s: string): string {
     .toLowerCase();
 }
 
-/** 把 agent/provider 错误收成短友好标题（无操作建议） */
+/**
+ * 把 agent/provider 错误收成可展示文案。
+ * - 提供商/中转（有映射且域为上游/配置）：责任域 · 原样错误信息
+ * - 本机/软件：责任域 · 短标题
+ * - 无映射：短原文（不加伪标签）
+ */
 function formatTurnErrorMessage(
   message: string | undefined,
   details?: unknown,
 ): string {
   const raw = (message ?? "").trim() || "";
+  const isGenericShell = (s: string) =>
+    !s ||
+    /^internal error\.?$/i.test(s) ||
+    s === "ACP error" ||
+    /^method not found\.?$/i.test(s);
+
   const tryMsg = (v: unknown): string | null => {
-    if (typeof v === "string" && v.trim()) return v.trim();
+    if (typeof v === "string" && v.trim()) {
+      const t = v.trim();
+      // 纯字符串 data（CLI btw 等）本身即真因
+      return isGenericShell(t) ? null : t;
+    }
     if (v && typeof v === "object") {
       const o = v as Record<string, unknown>;
-      if (typeof o.message === "string" && o.message.trim()) return o.message.trim();
-      if (o.data != null) return tryMsg(o.data);
+      // 优先 data：message 常为 "Internal error" 外壳
+      if (o.data != null) {
+        const fromData = tryMsg(o.data);
+        if (fromData) return fromData;
+      }
+      if (typeof o.message === "string" && o.message.trim()) {
+        const m = o.message.trim();
+        if (!isGenericShell(m)) return m;
+      }
+      if (typeof o.error_message === "string" && o.error_message.trim()) {
+        return o.error_message.trim();
+      }
     }
     return null;
   };
@@ -919,13 +965,33 @@ function formatTurnErrorMessage(
   }
   if (!detail && details != null) detail = tryMsg(details);
 
-  const haystack = [raw, detail].filter(Boolean).join("\n");
-  const key = matchFriendlyErrorTitleKey(haystack);
-  if (key) return tr(key);
+  // raw 本身已是 enrich 后的真因时，直接参与匹配
+  const primary =
+    raw && !isGenericShell(raw) ? raw : detail || raw;
+  // 匹配可用多段；提供商正文只用单条真因（避免 haystack 重复）
+  const bodySource =
+    (detail && !isGenericShell(detail) ? detail : null) ||
+    (primary && !isGenericShell(primary) ? primary : null) ||
+    raw;
+  const haystack = [bodySource, detail, raw].filter(Boolean).join("\n");
+  const labeled = formatFriendlyErrorLabelTitle(haystack, tr, {
+    body: bodySource,
+  });
+  if (labeled) return labeled;
 
-  // 未映射：取首行短标题，去掉 Internal error 外壳
-  let line = (detail || raw || tr("err.internal")).split(/\r?\n/)[0]?.trim() || tr("err.internal");
+  // 未映射：取首行短标题，去掉 Internal error 外壳（不加伪责任域）
+  let line =
+    (detail && !isGenericShell(detail) ? detail : primary || tr("err.internal"))
+      .split(/\r?\n/)[0]
+      ?.trim() || tr("err.internal");
   line = line.replace(/^internal error:\s*/i, "").trim() || tr("err.internal");
+  // 侧问常见前缀：缩短展示
+  line = line
+    .replace(/^side question model call failed:\s*/i, "")
+    .trim() || line;
+  if (isGenericShell(line) || line === tr("err.internal")) {
+    return `${tr("err.domain.app")} · ${tr("err.internal")}`;
+  }
   if (line.length > 80) line = line.slice(0, 80) + "…";
   return line;
 }
@@ -994,7 +1060,7 @@ function appendAssistantStream(el: HTMLElement, raw: string): void {
   if (streamScrollRaf) return;
   streamScrollRaf = requestAnimationFrame(() => {
     streamScrollRaf = 0;
-    scrollTranscript();
+    scrollTranscriptIfSticky();
   });
 }
 
@@ -1008,7 +1074,7 @@ function flushAssistantMarkdown(el: HTMLElement | null): void {
   const raw = el.dataset.raw ?? "";
   if (raw) {
     paintAssistantHtml(el, raw, { highlight: true, cwd: activeCwd });
-    scrollTranscript();
+    scrollTranscriptIfSticky();
   }
 }
 
@@ -1019,10 +1085,60 @@ function chatScroller(): HTMLElement {
   );
 }
 
-function scrollTranscript(): void {
+/**
+ * 会话区 sticky-bottom（最简正确模型）
+ *
+ * chatStick === true  → 内容变更时程序贴底
+ * chatStick === false → **绝不写 scrollTop**
+ *
+ * 状态更新规则（无 pin / 无 ignore / 无 resize 旁路）：
+ *   - scrollTop 变小（上滑/拖条上移）→ 立刻 unstick
+ *   - 距底 ≤ NEAR 且未因上滑离开 → stick
+ * 上滚轮额外立刻 unstick（赶在流式 rAF 之前）
+ *
+ * 截图「截断」：↓ FAB 仍在 = 下文在视口外，是滚不动/被拽回，
+ * 不是正文被 slice。内容无 max-height 截断。
+ */
+const CHAT_NEAR_BOTTOM_PX = 80;
+const CHAT_FAB_HIDE_PX = 64;
+
+let chatStick = true;
+/** 用于判断 scrollTop 增减（上滑 unstick） */
+let chatLastScrollTop = 0;
+
+function chatScrollGap(scroller?: HTMLElement): number {
+  const s = scroller ?? chatScroller();
+  return s.scrollHeight - s.scrollTop - s.clientHeight;
+}
+
+function applyScrollToBottom(): void {
+  if (!chatStick) {
+    updateScrollDownFab();
+    return;
+  }
   const scroller = chatScroller();
   scroller.scrollTop = scroller.scrollHeight;
+  chatLastScrollTop = scroller.scrollTop;
   updateScrollDownFab();
+}
+
+/** 发消息 / FAB / 进会话：强制 stick 并滚到底 */
+function scrollTranscript(): void {
+  chatStick = true;
+  if (streamScrollRaf) {
+    cancelAnimationFrame(streamScrollRaf);
+    streamScrollRaf = 0;
+  }
+  applyScrollToBottom();
+}
+
+/** 流式 / 工具 / DOM 变更：仅 stick 时贴底，否则零写入 */
+function scrollTranscriptIfSticky(): void {
+  if (!chatStick) {
+    updateScrollDownFab();
+    return;
+  }
+  applyScrollToBottom();
 }
 
 /** 底栏贴底：消息区优先让位；坞 max-height 保证完整在 chat 内，工具栏优先 */
@@ -1063,7 +1179,7 @@ function syncChatComposerReserve(): void {
 
   const h = Math.ceil(dock.getBoundingClientRect().height);
   chat.style.setProperty("--chat-composer-h", `${Math.max(h, 72)}px`);
-  updateScrollDownFab();
+  scrollTranscriptIfSticky();
 }
 
 /** 对话输入框随内容增高，不超过 maxPx，空内容回到默认 */
@@ -1081,18 +1197,83 @@ function updateScrollDownFab(): void {
   const fab = document.getElementById("btn-scroll-down");
   const scroller = document.getElementById("chat-scroll");
   if (!fab || !scroller) return;
-  const gap =
-    scroller.scrollHeight - scroller.scrollTop - scroller.clientHeight;
-  fab.classList.toggle("hidden", gap < 80);
+  const show = !chatStick || chatScrollGap(scroller) >= CHAT_FAB_HIDE_PX;
+  fab.classList.toggle("hidden", !show);
 }
 
 function bindChatScrollLayout(): void {
   const scroller = document.getElementById("chat-scroll");
   const dock = document.getElementById("chat-composer-dock");
   const fab = document.getElementById("btn-scroll-down");
-  scroller?.addEventListener("scroll", () => updateScrollDownFab(), {
-    passive: true,
-  });
+  if (!scroller) return;
+
+  chatLastScrollTop = scroller.scrollTop;
+
+  const unstickNow = () => {
+    chatStick = false;
+    if (streamScrollRaf) {
+      cancelAnimationFrame(streamScrollRaf);
+      streamScrollRaf = 0;
+    }
+    updateScrollDownFab();
+  };
+
+  // 上滚轮：在 scroll / 流式 rAF 之前立刻 unstick
+  scroller.addEventListener(
+    "wheel",
+    (e) => {
+      if (e.deltaY < 0 && scroller.scrollHeight > scroller.clientHeight) {
+        unstickNow();
+      }
+    },
+    { passive: true },
+  );
+
+  /**
+   * 原生滚动条：pointer 落在 clientWidth 右侧（scrollbar 槽）。
+   * 按下瞬间 unstick，避免「拖条首帧前」流式 rAF 仍贴底把 thumb 拽回。
+   * 不写 scrollTop，只改标志。
+   */
+  window.addEventListener(
+    "pointerdown",
+    (e) => {
+      if (e.button !== 0) return;
+      const rect = scroller.getBoundingClientRect();
+      if (
+        e.clientY < rect.top ||
+        e.clientY > rect.bottom ||
+        e.clientX < rect.left ||
+        e.clientX > rect.right
+      ) {
+        return;
+      }
+      // classic scrollbar：clientWidth 以右；overlay：右缘 ~16px
+      const barLeft = Math.min(rect.left + scroller.clientWidth, rect.right - 16);
+      if (e.clientX >= barLeft) unstickNow();
+    },
+    { capture: true },
+  );
+
+  /**
+   * scrollTop 变小 → 用户上滑/拖条上移 → 立刻 unstick（即使仍在近底 80px 内）。
+   * 距底 ≤ NEAR 且 scrollTop 未减小 → stick（用户滚回底部 / 程序贴底）。
+   */
+  scroller.addEventListener(
+    "scroll",
+    () => {
+      const top = scroller.scrollTop;
+      const gap = chatScrollGap(scroller);
+      if (top < chatLastScrollTop - 0.5) {
+        chatStick = false;
+      } else if (gap <= CHAT_NEAR_BOTTOM_PX) {
+        chatStick = true;
+      }
+      chatLastScrollTop = top;
+      updateScrollDownFab();
+    },
+    { passive: true },
+  );
+
   fab?.addEventListener("click", () => scrollTranscript());
   const chat = document.getElementById("chat");
   const chatInput = document.getElementById("chat-input") as HTMLTextAreaElement | null;
@@ -1109,10 +1290,8 @@ function bindChatScrollLayout(): void {
   }
   window.addEventListener("resize", () => {
     syncChatComposerReserve();
-    // 窗口拉伸后 fixed 菜单坐标失效，直接关闭（权限 / 模型 / +）
     hideEphemeralMenus();
   });
-  // 显示对话 / 目标条 / 权限条显隐时再量一次
   if (chat && typeof MutationObserver !== "undefined") {
     new MutationObserver(() => {
       if (!chat.classList.contains("hidden")) {
@@ -1217,6 +1396,7 @@ function clearPromptQueue(opts?: { silent?: boolean }): void {
   if (sid) {
     void hostClearQueue(inv, sid).then((f) => {
       applyHostQueueMirror(f);
+      removeAllQueuedSystemLines();
       if (!opts?.silent) showToast(tr("queue.cleared"));
     });
     return;
@@ -1224,6 +1404,7 @@ function clearPromptQueue(opts?: { silent?: boolean }): void {
   promptQueue.length = 0;
   queuePausedByInterrupt = false;
   syncPromptQueueBar();
+  removeAllQueuedSystemLines();
   if (!opts?.silent) showToast(tr("queue.cleared"));
 }
 
@@ -1235,20 +1416,115 @@ function refreshQueueModalIfOpen(): void {
 }
 
 function removeQueuedPrompt(id: string): void {
+  void removeQueuedPromptAsync(id);
+}
+
+/** 移除时间线上「已排队：…」系统行（与 queue 项 id 绑定） */
+function removeQueuedSystemLine(queueItemId: string): void {
+  if (!queueItemId) return;
+  const root = document.getElementById("transcript");
+  if (!root) return;
+  for (const n of Array.from(
+    root.querySelectorAll(".line.system[data-queue-id]"),
+  )) {
+    if ((n as HTMLElement).dataset.queueId === queueItemId) n.remove();
+  }
+}
+
+function removeAllQueuedSystemLines(): void {
+  const root = document.getElementById("transcript");
+  if (!root) return;
+  root
+    .querySelectorAll(".line.system[data-queue-id]")
+    .forEach((n) => n.remove());
+}
+
+/** 时间线提示：已排队（不画用户气泡）；插话/出队时按 data-queue-id 清除 */
+function appendQueuedSystemLine(queueItemId: string, preview: string): void {
+  const el = $("transcript");
+  const div = document.createElement("div");
+  div.className = "line system";
+  div.dataset.messageAuthorRole = "system";
+  div.dataset.queueId = queueItemId;
+  div.textContent = tr("queue.queuedLine", {
+    preview: preview.replace(/\s+/g, " ").slice(0, 60),
+  });
+  el.appendChild(div);
+  scrollTranscriptIfSticky();
+}
+
+/** 出队（awaitable；插话 / 立即发送先出队再发） */
+async function removeQueuedPromptAsync(id: string): Promise<boolean> {
   const sid = activeSessionId;
   if (sid) {
-    void hostRemoveItem(inv, sid, id).then((f) => {
-      applyHostQueueMirror(f);
-      refreshQueueModalIfOpen();
-    });
-    return;
+    const f = await hostRemoveItem(inv, sid, id);
+    applyHostQueueMirror(f);
+    refreshQueueModalIfOpen();
+    removeQueuedSystemLine(id);
+    return Boolean(f);
   }
   const i = promptQueue.findIndex((q) => q.id === id);
-  if (i < 0) return;
+  if (i < 0) return false;
   promptQueue.splice(i, 1);
   if (!promptQueue.length) queuePausedByInterrupt = false;
   syncPromptQueueBar();
   refreshQueueModalIfOpen();
+  removeQueuedSystemLine(id);
+  return true;
+}
+
+/**
+ * 队列「插话」：经 threads.interject 注入当前回合（不 cancel），成功后再出队。
+ * 仅 working 可用；与 /interject 同路径。
+ */
+async function interjectQueuedPrompt(id: string): Promise<void> {
+  const q = promptQueue.find((x) => x.id === id);
+  if (!q || q.status === "sending") return;
+  if (turnUiPhase === "cancelling") {
+    showToast(tr("interject.cancelling"), "error");
+    return;
+  }
+  if (!turnActive || turnUiPhase !== "working") {
+    showToast(tr("interject.needTurn"), "error");
+    return;
+  }
+  const text = (q.content || q.display).trim();
+  if (!text) {
+    showToast(tr("interject.empty"), "error");
+    return;
+  }
+  const result = await runInterjectCommand(text);
+  if (result.ok) {
+    await removeQueuedPromptAsync(id);
+  } else if (result.message) {
+    showToast(result.message, "error");
+  }
+}
+
+/**
+ * 队列「立即发送」：先出队，再 cancel 当前回合并发送此条（CLI send_now）。
+ * 须先出队，否则 cancel 后 drain 可能抢发同一条。无进行中回合时直接 dispatch。
+ */
+async function sendNowQueuedPrompt(id: string): Promise<void> {
+  const q = promptQueue.find((x) => x.id === id);
+  if (!q || q.status === "sending") return;
+  if (turnUiPhase === "cancelling") {
+    showToast(tr("interject.cancelling"), "error");
+    return;
+  }
+  const content = q.content;
+  const display = q.display;
+  const wasBusy = turnActive;
+  await removeQueuedPromptAsync(id);
+  const result = await dispatchAgentPrompt(content, display, {
+    force: false,
+    interrupt: wasBusy ? "send_now" : undefined,
+  });
+  if (result.ok) {
+    if (wasBusy) showToast(tr("chat.sendNow"));
+  } else if (result.error) {
+    showToast(result.error, "error");
+  }
 }
 
 function moveQueuedPrompt(id: string, dir: -1 | 1): void {
@@ -1410,6 +1686,7 @@ async function drainPromptQueue(): Promise<void> {
       syncPromptQueueBar();
       return;
     }
+    removeQueuedSystemLine(next.id);
     syncPromptQueueBar();
     await dispatchAgentPrompt(next.content, next.display, { force: false });
     return;
@@ -1434,6 +1711,8 @@ async function drainPromptQueue(): Promise<void> {
   }
   applyHostQueueMirror(taken.queue);
   const item = taken.item;
+  // take 后该项已离队：清掉时间线「已排队」提示
+  removeQueuedSystemLine(item.id);
   const result = await dispatchAgentPrompt(item.content, item.display, {
     force: false,
   });
@@ -2203,7 +2482,7 @@ function ensureTurnStatus(label = tr("turn.thinking")): HTMLElement {
   div.innerHTML = `<span class="status-dots" aria-hidden="true"><i></i><i></i><i></i></span><span class="status-label">${esc(label)}</span>`;
   el.appendChild(div);
   turnStatusEl = div;
-  scrollTranscript();
+  scrollTranscriptIfSticky();
   return div;
 }
 
@@ -2230,7 +2509,7 @@ function promoteTurnStatusToDone(
     turnStatusEl.classList.remove("is-working");
     turnStatusEl.innerHTML = `<span class="status-check" aria-hidden="true">${kind === "stopped" ? "■" : "✓"}</span><span class="status-label">${esc(label)}</span>`;
   }
-  scrollTranscript();
+  scrollTranscriptIfSticky();
   turnStatusDoneTimer = setTimeout(() => {
     turnStatusDoneTimer = null;
     if (turnStatusEl?.isConnected) {
@@ -2851,7 +3130,7 @@ function appendLine(
       }
       p.textContent = nextRaw;
       streamBubble = p;
-      scrollTranscript();
+      scrollTranscriptIfSticky();
       return;
     }
 
@@ -2923,7 +3202,7 @@ function appendLine(
       updateProcessHeader();
       // history 回放后保持折叠
       if (processBlockEl) processBlockEl.classList.add("collapsed");
-      scrollTranscript();
+      scrollTranscriptIfSticky();
       return;
     }
     // 仅合并「紧邻上一条」实质相同的助手气泡（history 回补 vs 流式定稿）。
@@ -2941,7 +3220,7 @@ function appendLine(
     div.dataset.messageAuthorRole = "assistant";
     paintAssistantHtml(div, text, { highlight: true, cwd: activeCwd });
     el.appendChild(div);
-    scrollTranscript();
+    scrollTranscriptIfSticky();
     return;
   }
 
@@ -2959,7 +3238,9 @@ function appendLine(
   }
   div.textContent = text;
   el.appendChild(div);
-  scrollTranscript();
+  // 错误/系统行：流式中不强制打断用户上滑阅读
+  if (cls === "error") scrollTranscript();
+  else scrollTranscriptIfSticky();
 }
 
 function endStreamBubble(): void {
@@ -3872,7 +4153,21 @@ async function applySessionModelAndEffort(opts?: {
   );
   if (!hasLiveSession) {
     // 无会话：改的是「新对话默认」，并同步 chip
-    if (opts?.modelId) defaultModelLabel = modelLabel;
+    // 对齐 CLI `/model` → SetDefaultModel：纯改模型时写入 [models].default
+    if (opts?.modelId) {
+      defaultModelLabel = modelLabel;
+      try {
+        const persist = await inv<{ defaultModel: string }>(
+          "providers.setDefault",
+          { modelId: modelLabel },
+        );
+        if (persist.ok) {
+          modelsCache = null; // 下次拉列表刷新 isDefault
+        }
+      } catch {
+        /* 内存默认仍生效；持久化失败不挡 chip */
+      }
+    }
     if (opts?.effort) defaultEffortLevel = effortLevel;
     const focus = opts?.focus ?? "both";
     if (focus === "effort") {
@@ -3884,12 +4179,12 @@ async function applySessionModelAndEffort(opts?: {
     if (focus === "model") {
       return {
         ok: true,
-        message: `默认模型 → ${modelLabel}；将用于新会话`,
+        message: tr("model.defaultPersisted", { model: modelLabel }),
       };
     }
     return {
       ok: true,
-      message: `默认 ${modelLabel} · ${effortLabel()}；将用于新会话`,
+      message: tr("model.defaultPersisted", { model: modelLabel }),
     };
   }
 
@@ -4013,18 +4308,29 @@ async function promptSetEffort(): Promise<{ ok: boolean; message?: string }> {
   });
 }
 
-type ModelRow = { id: string; name?: string; isDefault?: boolean };
+type ModelRow = {
+  id: string;
+  name?: string;
+  isDefault?: boolean;
+  source?: "official" | "custom";
+};
 
-const FALLBACK_MODELS: ModelRow[] = [
-  { id: "grok-4.5", name: "grok-4.5", isDefault: true },
-  { id: "grok-composer-2.5-fast", name: "grok-composer-2.5-fast" },
-  { id: "grok-build", name: "grok-build" },
-];
+/**
+ * 渲染侧**禁止**硬编码官方模型表。
+ * 无缓存 / 请求失败时用空表，等 Host `models.list`（已按登录态过滤）。
+ */
+const FALLBACK_MODELS: ModelRow[] = [];
 
 /** 渲染侧缓存：点 chip 不阻塞等待 grok models */
 let modelsCache: ModelRow[] | null = null;
 let modelsFetch: Promise<ModelRow[]> | null = null;
 let modelMenuSeq = 0;
+
+/** 登录/登出后丢弃缓存，强制重新拉可见 catalog */
+function invalidateModelsCache(): void {
+  modelsCache = null;
+  modelsFetch = null;
+}
 
 function hideModelMenu(): void {
   modelMenuSeq += 1;
@@ -4054,28 +4360,34 @@ async function ensureChipModelAvailable(opts?: {
   toast?: boolean;
   /** 全页设置打开时禁止 setModel（延后到 onClosed） */
   allowSetModel?: boolean;
+  /** 登录/登出后强制重新拉 list */
+  force?: boolean;
 }): Promise<boolean> {
   const want = (modelLabel || "").trim();
-  const list = await fetchModelsList();
+  const list = await fetchModelsList(
+    opts?.force ? { force: true } : undefined,
+  );
   if (want && list.some((m) => m.id === want)) return true;
   const prev = want || "(empty)";
-  const next =
+  const preferred =
     (defaultModelLabel || "").trim() ||
     list.find((m) => m.isDefault)?.id?.trim() ||
     list[0]?.id?.trim() ||
-    "grok";
-  // 默认本身也可能已从目录消失时，再落到列表首项
-  const resolved = list.some((m) => m.id === next)
-    ? next
-    : list[0]?.id?.trim() || "grok";
+    "";
+  // 默认本身也可能已从目录消失时，再落到列表首项；禁止幽灵 "grok"
+  const resolved = list.some((m) => m.id === preferred)
+    ? preferred
+    : list[0]?.id?.trim() || "";
   if (resolved === want) return true;
   modelLabel = resolved;
+  if (resolved) defaultModelLabel = resolved;
   syncModelLabels();
   // 设置/插件盖住主壳时只改 chip，不打 setModel（避免与 inert 恢复竞态）
   const canSetModel =
     opts?.allowSetModel !== false && !isMainShellOverlayOpen();
   if (
     canSetModel &&
+    resolved &&
     activeThreadId &&
     !activeThreadId.startsWith("disk_") &&
     activeSessionId
@@ -4086,7 +4398,13 @@ async function ensureChipModelAvailable(opts?: {
       effort: effortLevel,
     }).catch(() => undefined);
   }
-  if (opts?.toast && want && want !== resolved && !isMainShellOverlayOpen()) {
+  if (
+    opts?.toast &&
+    want &&
+    want !== resolved &&
+    resolved &&
+    !isMainShellOverlayOpen()
+  ) {
     showToast(tr("model.unavailableFallback", { prev, next: resolved }));
   }
   return false;
@@ -4102,11 +4420,16 @@ function shortModelName(id: string = modelLabel): string {
   return short;
 }
 
-function fetchModelsList(): Promise<ModelRow[]> {
+function fetchModelsList(opts?: { force?: boolean }): Promise<ModelRow[]> {
+  if (opts?.force) {
+    modelsCache = null;
+    modelsFetch = null;
+  }
   if (modelsFetch) return modelsFetch;
   modelsFetch = inv<ModelRow[]>("models.list")
     .then((r) => {
-      const list = r.data?.length ? r.data : FALLBACK_MODELS;
+      // 空列表合法（未登录且无自定义）；勿回落幽灵官方表
+      const list = Array.isArray(r.data) ? r.data : [];
       modelsCache = list;
       // 列表带上 display name 后刷新 chip（否则仍显示 id）
       syncModelLabels();
@@ -4124,9 +4447,20 @@ function prefetchModelsList(): void {
   void fetchModelsList();
 }
 
+/** 模型菜单行（对齐 CLI catalog：官方 / 自定义分组） */
+function modelMenuItemHtml(m: ModelRow): string {
+  const on = m.id === modelLabel;
+  const name = m.name || m.id;
+  return `<button type="button" class="menu-item${on ? " is-checked" : ""}" data-model="${esc(m.id)}" role="menuitem">
+        <span>${esc(name)}</span>
+        <span class="menu-check" aria-hidden="true">✓</span>
+      </button>`;
+}
+
 /**
  * Codex 式：主面板 = 推理 + 当前模型行(>)；
  * 模型侧栏默认收起，点击模型行才展开。
+ * 侧栏按官方 / 自定义分组（对齐 CLI 鉴权语义，非 Leader 内部结构）。
  */
 function modelMenuHtml(models: ModelRow[], flyoutOpen: boolean): string {
   const effortHtml = effortOptions().map((e) => {
@@ -4137,16 +4471,17 @@ function modelMenuHtml(models: ModelRow[], flyoutOpen: boolean): string {
     </button>`;
   }).join("");
 
-  const modelHtml = models
-    .map((m) => {
-      const on = m.id === modelLabel;
-      const name = m.name || m.id;
-      return `<button type="button" class="menu-item${on ? " is-checked" : ""}" data-model="${esc(m.id)}" role="menuitem">
-        <span>${esc(name)}</span>
-        <span class="menu-check" aria-hidden="true">✓</span>
-      </button>`;
-    })
-    .join("");
+  const official = models.filter((m) => m.source !== "custom");
+  const custom = models.filter((m) => m.source === "custom");
+  let modelHtml = "";
+  if (official.length && custom.length) {
+    modelHtml += `<div class="menu-section-label">${esc(tr("model.groupOfficial"))}</div>`;
+    modelHtml += official.map(modelMenuItemHtml).join("");
+    modelHtml += `<div class="menu-section-label">${esc(tr("model.groupCustom"))}</div>`;
+    modelHtml += custom.map(modelMenuItemHtml).join("");
+  } else {
+    modelHtml = models.map(modelMenuItemHtml).join("");
+  }
 
   return `
     <div class="model-menu-primary">
@@ -4158,7 +4493,7 @@ function modelMenuHtml(models: ModelRow[], flyoutOpen: boolean): string {
       </button>
     </div>
     <div class="model-menu-flyout${flyoutOpen ? "" : " hidden"}" role="menu" aria-label="${tr("model.pick")}">
-      <div class="menu-section-label">模型</div>
+      ${official.length && custom.length ? "" : `<div class="menu-section-label">模型</div>`}
       ${modelHtml}
       <button type="button" class="menu-item" data-model-custom role="menuitem">
         <span>自定义…</span>
@@ -4381,6 +4716,13 @@ async function setThreadModeLive(
 function exitPlanMode(): void {
   if (!isPlanOn()) return;
   planPhase = "off";
+  if (activeSessionId) {
+    patchSessionPlan(activeSessionId, {
+      planPhase: "off",
+      // 用户主动关模式：若仍有 exit_plan 挂起，保留 pending 供审批
+      pendingApproval: pendingPlanApproval,
+    });
+  }
   // 退出 plan 不碰 accessMode（Build：yolo 标记在 plan 退出后重新露出）
   syncPermLabels();
   void syncSessionPolicyLive({ plan: false }).then((r) => {
@@ -4394,11 +4736,17 @@ function exitPlanMode(): void {
 /** 开启计划模式（UI + ACP session/set_mode plan）；保留当前 accessMode */
 async function enterPlanMode(): Promise<{ ok: boolean; message?: string }> {
   planPhase = "pending";
+  if (activeSessionId) {
+    patchSessionPlan(activeSessionId, { planPhase: "pending" });
+  }
   syncPermLabels();
   if (activeSessionId || activeThreadId) {
     const r = await syncSessionPolicyLive({ plan: true });
     if (!r.ok) {
       planPhase = "off";
+      if (activeSessionId) {
+        patchSessionPlan(activeSessionId, { planPhase: "off" });
+      }
       syncPermLabels();
       return {
         ok: false,
@@ -4429,19 +4777,64 @@ async function showViewPlan(): Promise<{ ok: boolean; message?: string }> {
 }
 
 /**
- * 新建/切换会话时关闭计划侧栏，并清理本会话计划 UI 状态。
- * 若有未决 exit_plan 审批则 abandoned，避免旧 waiter 挂起。
+ * 阶段一：把前台 plan 状态写入 per-session 投影（切走前调用）。
+ * 对齐 CLI：切焦点不 resolve exit_plan waiter。
  */
-function closePlanPanelOnSessionChange(): void {
+function snapshotActiveSessionPlan(
+  sessionId: string | null | undefined,
+): void {
+  const sid = sessionId?.trim();
+  if (!sid) return;
+  setSessionPlan(sid, {
+    planPhase,
+    pendingApproval: pendingPlanApproval
+      ? {
+          requestId: pendingPlanApproval.requestId,
+          sessionId: pendingPlanApproval.sessionId || sid,
+          planContent: pendingPlanApproval.planContent ?? "",
+        }
+      : null,
+  });
+}
+
+/**
+ * 新建/切换会话时关闭计划侧栏，并清理前台 plan UI。
+ * 默认 stash pending（不 abandoned）；硬离开且 abandonPending 时才 resolve waiter。
+ */
+function closePlanPanelOnSessionChange(opts?: {
+  /** 写入 stash 的会话（切走时的 prev）；缺省用 pending/active */
+  stashSessionId?: string | null;
+  /**
+   * true：对未决 exit_plan 发 abandoned（仅硬 detach / 删会话等）。
+   * false（默认）：只 stash，对齐方案 B 后台继续。
+   */
+  abandonPending?: boolean;
+}): void {
+  const abandon = opts?.abandonPending === true;
   const pending = pendingPlanApproval;
-  pendingPlanApproval = null;
-  if (pending?.requestId) {
+  const stashSid =
+    (opts?.stashSessionId ?? pending?.sessionId ?? activeSessionId)?.trim() ||
+    null;
+
+  if (abandon && pending?.requestId) {
     void inv("plans.respond", {
       requestId: pending.requestId,
       outcome: "abandoned",
       sessionId: pending.sessionId,
     });
+    if (stashSid) {
+      setSessionPlan(stashSid, {
+        planPhase: "off",
+        pendingApproval: null,
+      });
+    }
+  } else if (stashSid) {
+    // 先快照当前前台（含 pending），再清 UI
+    snapshotActiveSessionPlan(stashSid);
   }
+
+  pendingPlanApproval = null;
+  planPhase = "off";
   planPanelPath = null;
   planPanelSavedContent = "";
   planPanelBusy = false;
@@ -4452,6 +4845,53 @@ function closePlanPanelOnSessionChange(): void {
   sidePane?.closePlanCategory();
   syncPlanPanelChrome();
   syncPlanRailActivity();
+}
+
+/**
+ * 切回会话：从 per-session 投影恢复 planPhase / pending。
+ * 有未决审批时打开计划侧栏（不抢其它会话焦点）。
+ */
+async function rehydrateSessionPlan(
+  sessionId: string,
+  opts?: { viewGen?: number },
+): Promise<void> {
+  const sid = sessionId?.trim();
+  if (!sid) return;
+  const viewGen = opts?.viewGen;
+  const proj = getSessionPlan(sid);
+  planPhase = proj?.planPhase ?? "off";
+  pendingPlanApproval = proj?.pendingApproval
+    ? {
+        requestId: proj.pendingApproval.requestId,
+        sessionId: proj.pendingApproval.sessionId || sid,
+        planContent: proj.pendingApproval.planContent ?? "",
+      }
+    : null;
+  // 审批只属于该 session
+  if (
+    pendingPlanApproval &&
+    pendingPlanApproval.sessionId &&
+    pendingPlanApproval.sessionId !== sid
+  ) {
+    pendingPlanApproval = null;
+  }
+  syncPermLabels();
+  syncPlanPanelChrome();
+
+  if (!pendingPlanApproval?.requestId) return;
+  if (viewGen !== undefined && viewGen !== sessionViewGen) return;
+  if (activeSessionId !== sid) return;
+
+  await openPlanPanel({
+    requestId: pendingPlanApproval.requestId,
+    seedContent: pendingPlanApproval.planContent || null,
+    forceReload: true,
+    ownerSessionId: sid,
+  });
+  if (viewGen !== undefined && viewGen !== sessionViewGen) return;
+  if (activeSessionId !== sid) return;
+  setTurnStatus(tr("plan.awaiting") || "等待计划审批…");
+  showToast(tr("plan.reopenedAwaiting") || tr("plan.awaiting"), "info");
 }
 
 function planEditorEl(): HTMLTextAreaElement | null {
@@ -4474,6 +4914,14 @@ function planPreviewEl(): HTMLElement | null {
   return document.getElementById("plan-panel-preview");
 }
 
+/**
+ * 方案 A：审批底栏仅在 exit_plan_mode reverse-RPC 挂起时可用。
+ * 对齐 CLI PlanApprovalView（有 response_tx）；无 requestId 不显示 a/s/q。
+ */
+function isPlanApprovalArmed(): boolean {
+  return Boolean(pendingPlanApproval?.requestId?.trim());
+}
+
 function syncPlanPanelChrome(): void {
   const status = document.getElementById("plan-panel-status");
   const pathEl = document.getElementById("plan-panel-path");
@@ -4481,6 +4929,10 @@ function syncPlanPanelChrome(): void {
   const ed = planEditorEl();
   const prev = planPreviewEl();
   const modeBtn = document.getElementById("btn-plan-view-mode");
+  const footer = document.querySelector(
+    "#side-cat-plan .plan-panel-footer",
+  ) as HTMLElement | null;
+  const armed = isPlanApprovalArmed();
   if (pathEl) {
     pathEl.textContent = planPanelPath ?? tr("plan.noPlanMd");
     pathEl.title = planPanelPath ?? "";
@@ -4497,7 +4949,7 @@ function syncPlanPanelChrome(): void {
       );
     }
     if (planPanelDirty()) bits.push(tr("plan.unsaved"));
-    if (pendingPlanApproval) bits.push(tr("plan.awaiting"));
+    if (armed) bits.push(tr("plan.awaiting"));
     status.textContent = bits.join(" · ");
   }
   if (modeBtn) {
@@ -4505,6 +4957,11 @@ function syncPlanPanelChrome(): void {
     modeBtn.textContent = isPreview ? tr("common.source") : tr("common.preview");
     modeBtn.title = tr("side.planToggleView");
     modeBtn.setAttribute("aria-pressed", isPreview ? "true" : "false");
+  }
+  // 方案 A：无挂起 exit_plan 时隐藏批准/修改/放弃（非文档编辑区）
+  if (footer) {
+    footer.classList.toggle("hidden", !armed);
+    footer.setAttribute("aria-hidden", armed ? "false" : "true");
   }
   const text = ed?.value ?? "";
   const hasBody = Boolean(text.trim()) || planPanelDirty();
@@ -4522,7 +4979,7 @@ function syncPlanRailActivity(): void {
   if (!sidePane) return;
   const ed = planEditorEl();
   const hasBody = Boolean((ed?.value ?? "").trim() || planPanelPath);
-  if (pendingPlanApproval) {
+  if (isPlanApprovalArmed()) {
     sidePane.setPlanRailActivity("pending");
     return;
   }
@@ -4615,24 +5072,47 @@ function bindPlanPanel(): void {
 /**
  * 打开右栏「计划」面板并加载 session plan.md。
  * 真源优先 session；空则镜像工作区 *plan* 产物。
+ * ownerSessionId：审批归属会话（默认 active）；禁止把 pending 写到错误会话。
  */
 async function openPlanPanel(opts?: {
   requestId?: string | null;
   forceReload?: boolean;
   /** agent 刚写入的正文（exit_plan 参数） */
   seedContent?: string | null;
+  /** pending / 读写归属；须与 active 一致才改前台 */
+  ownerSessionId?: string | null;
 }): Promise<void> {
   bindPlanPanel();
   if (!activeSessionId) {
     showToast(tr("plan.noSession"), "error");
     return;
   }
+  const ownerSid =
+    (opts?.ownerSessionId ?? activeSessionId)?.trim() || activeSessionId;
+  // 禁止在错误前台打开他会话的审批面板
+  if (ownerSid !== activeSessionId) {
+    patchSessionPlan(ownerSid, {
+      planPhase: "active",
+      pendingApproval: opts?.requestId
+        ? {
+            requestId: opts.requestId,
+            sessionId: ownerSid,
+            planContent: opts.seedContent ?? "",
+          }
+        : getSessionPlan(ownerSid)?.pendingApproval ?? null,
+    });
+    return;
+  }
   if (opts?.requestId) {
     pendingPlanApproval = {
       requestId: opts.requestId,
-      sessionId: activeSessionId,
+      sessionId: ownerSid,
       planContent: opts.seedContent ?? "",
     };
+    patchSessionPlan(ownerSid, {
+      planPhase: planPhase === "off" ? "active" : planPhase,
+      pendingApproval: pendingPlanApproval,
+    });
   }
 
   sidePane?.openPlanCategory();
@@ -4642,7 +5122,7 @@ async function openPlanPanel(opts?: {
     status: string;
     content: string;
     path?: string | null;
-  } | null>("plans.get", { sessionId: activeSessionId });
+  } | null>("plans.get", { sessionId: ownerSid });
 
   let content = (res.ok ? res.data?.content : "") ?? "";
   let path = (res.ok ? res.data?.path : null) ?? null;
@@ -4671,14 +5151,29 @@ async function openPlanPanel(opts?: {
     if (body.trim()) {
       content = body;
       await inv("plans.write", {
-        sessionId: activeSessionId,
+        sessionId: ownerSid,
         content: body,
       });
       const again = await inv<{ path?: string | null } | null>("plans.get", {
-        sessionId: activeSessionId,
+        sessionId: ownerSid,
       });
       path = again.ok ? again.data?.path ?? path : path;
     }
+  }
+
+  // 异步期间可能已切走
+  if (activeSessionId !== ownerSid) {
+    if (opts?.requestId) {
+      patchSessionPlan(ownerSid, {
+        planPhase: "active",
+        pendingApproval: {
+          requestId: opts.requestId,
+          sessionId: ownerSid,
+          planContent: content || opts.seedContent || "",
+        },
+      });
+    }
+    return;
   }
 
   const ed = planEditorEl();
@@ -4694,6 +5189,7 @@ async function openPlanPanel(opts?: {
   planPanelPath = path;
   if (planPanelViewMode === "preview") renderPlanPanelPreview();
   syncPlanPanelChrome();
+  if (activeSessionId) snapshotActiveSessionPlan(activeSessionId);
 }
 
 async function savePlanPanel(): Promise<boolean> {
@@ -4739,7 +5235,8 @@ function setPlanPanelBusy(busy: boolean, approveLabel?: string): void {
 
 /**
  * 计划面板底栏：批准 / 要求修改 / 放弃
- * （对齐 CLI/Codex：批准即开始实现；可先改 plan.md 再批）
+ * 方案 A：仅 exit_plan 挂起（有 requestId）时可点；对齐 CLI PlanApprovalView a/s/q。
+ * 可先改 plan.md 再批；无挂起时不人造 prompt / plans.approve。
  */
 async function respondPlanPanel(
   outcome: "approved" | "cancelled" | "abandoned",
@@ -4747,6 +5244,21 @@ async function respondPlanPanel(
   if (planPanelBusy) return;
   if (!activeSessionId) {
     showToast(tr("plan.noSession"), "error");
+    return;
+  }
+  const requestId = pendingPlanApproval?.requestId?.trim() || null;
+  const ownerSid =
+    (pendingPlanApproval?.sessionId || activeSessionId)?.trim() || null;
+  if (!requestId || !ownerSid) {
+    // 方案 A：非审批期无 a/s/q（底栏应已隐藏；防直接调/竞态）
+    showToast(tr("plan.approvalRequired"), "info");
+    syncPlanPanelChrome();
+    return;
+  }
+  // 禁止在错误会话上 resolve 他会话的 waiter
+  if (ownerSid !== activeSessionId) {
+    showToast(tr("plan.approvalRequired"), "info");
+    syncPlanPanelChrome();
     return;
   }
   setPlanPanelBusy(
@@ -4758,7 +5270,6 @@ async function respondPlanPanel(
         : tr("plan.processing"),
   );
   const feedback = (planFeedbackEl()?.value ?? "").trim();
-  const requestId = pendingPlanApproval?.requestId ?? null;
 
   try {
     // 批准 / 要求修改前先落盘编辑器内容
@@ -4772,30 +5283,19 @@ async function respondPlanPanel(
       }
     }
 
-    if (requestId) {
-      const r = await inv("plans.respond", {
-        requestId,
-        outcome,
-        feedback:
-          outcome === "cancelled" || outcome === "approved"
-            ? feedback || undefined
-            : undefined,
-        sessionId: activeSessionId,
-      });
-      if (!r.ok) {
-        showToast(r.error?.message ?? tr("plan.respondFail"), "error");
-        setPlanPanelBusy(false);
-        return;
-      }
-    } else if (outcome === "approved") {
-      const r = await inv("plans.approve", { sessionId: activeSessionId });
-      if (!r.ok) {
-        showToast(r.error?.message ?? tr("plan.writeStatusFail"), "error");
-        setPlanPanelBusy(false);
-        return;
-      }
-    } else if (outcome === "abandoned") {
-      await inv("plans.reject", { sessionId: activeSessionId });
+    const r = await inv("plans.respond", {
+      requestId,
+      outcome,
+      feedback:
+        outcome === "cancelled" || outcome === "approved"
+          ? feedback || undefined
+          : undefined,
+      sessionId: ownerSid,
+    });
+    if (!r.ok) {
+      showToast(r.error?.message ?? tr("plan.respondFail"), "error");
+      setPlanPanelBusy(false);
+      return;
     }
 
     pendingPlanApproval = null;
@@ -4809,27 +5309,25 @@ async function respondPlanPanel(
     if (outcome === "approved") {
       // 退出 plan，保留 accessMode（Build：yolo 在 plan 下 armed，批准后继续）
       planPhase = "off";
+      patchSessionPlan(ownerSid, {
+        planPhase: "off",
+        pendingApproval: null,
+      });
       syncPermLabels();
       await syncSessionPolicyLive({ plan: false });
       setPlanPanelBusy(false);
       sidePane?.closePlanCategory();
       syncPlanPanelChrome();
-      if (requestId) {
-        // exit_plan reverse-RPC 已 resolve，agent 在同一回合继续实现
-        showToast(tr("plan.approvedToast"));
-        appendLine(tr("plan.approvedLine"), "system");
-      } else {
-        const implPrompt = feedback
-          ? `计划已批准（以当前 plan.md 为准）。附加意见：\n${feedback}\n\n请按计划开始实现，不要扩大范围；完成后简要汇报变更。`
-          : `计划已批准（以当前 plan.md 为准）。请按计划开始实现，不要扩大范围；完成后简要汇报变更。`;
-        showToast(tr("plan.implStartToast"));
-        await dispatchAgentPrompt(implPrompt, tr("plan.implUser"), {
-          force: true,
-        });
-      }
+      // exit_plan reverse-RPC 已 resolve，agent 在同一回合继续实现
+      showToast(tr("plan.approvedToast"));
+      appendLine(tr("plan.approvedLine"), "system");
     } else if (outcome === "abandoned") {
       // 退出 plan；保留 accessMode
       planPhase = "off";
+      patchSessionPlan(ownerSid, {
+        planPhase: "off",
+        pendingApproval: null,
+      });
       syncPermLabels();
       await syncSessionPolicyLive({ plan: false });
       setPlanPanelBusy(false);
@@ -4838,33 +5336,25 @@ async function respondPlanPanel(
       showToast(tr("plan.abandonToast"));
       appendLine(tr("plan.abandonLine"), "system");
     } else {
-      // cancelled = 要求修改：保持 plan + accessMode；计划面板不关（方案 A）
+      // cancelled = 要求修改：保持 plan；收起审批条；勿再 session/prompt
       planPhase = "active";
+      patchSessionPlan(ownerSid, {
+        planPhase: "active",
+        pendingApproval: null,
+      });
       syncPermLabels();
       setPlanPanelBusy(false);
-      // 主时间线可见「要求修改 + 意见」（RPC feedback 不会自动画用户泡）
       const reviseDisplay = feedback
         ? `${tr("plan.reviseUser")}\n${feedback}`
         : tr("plan.reviseUser");
       showWelcome(false);
       sidePane?.openPlanCategory();
       syncPlanPanelChrome();
-
-      if (requestId) {
-        // reverse-RPC 已把 cancelled+feedback 交回 agent，本回合会 Continue。
-        // 切勿再 session/prompt，否则会与进行中回合冲突 → Internal error。
-        paintUserMessage(reviseDisplay);
-        showToast(feedback ? tr("plan.reviseToastFb") : tr("plan.reviseToast"));
-        setTurnStatus(tr("plan.revising"));
-        syncPlanRailActivity();
-      } else {
-        const revPrompt = feedback
-          ? `请根据以下意见修改计划（仍在计划模式：更新 plan.md，不要改业务代码）。我已直接编辑了 plan.md，请在其基础上修订：\n${feedback}`
-          : `请根据我已编辑的 plan.md 继续完善计划（仍在计划模式：只更新 plan.md，不要改业务代码）。补充风险、验收标准与可落地步骤。`;
-        showToast(tr("plan.reviseStartToast"));
-        // dispatch 会 paint 用户泡；display 含意见正文
-        await dispatchAgentPrompt(revPrompt, reviseDisplay, { force: true });
-      }
+      // reverse-RPC 已把 cancelled+feedback 交回 agent，本回合会 Continue。
+      paintUserMessage(reviseDisplay);
+      showToast(feedback ? tr("plan.reviseToastFb") : tr("plan.reviseToast"));
+      setTurnStatus(tr("plan.revising"));
+      syncPlanRailActivity();
     }
   } catch (err) {
     showToast(err instanceof Error ? err.message : tr("plan.opFail"), "error");
@@ -6272,7 +6762,11 @@ async function forkSessionFrom(
 
   const projectId = source.projectId || selectedProject()?.id;
   const forkTitle = tr("slash.forkTitle", { title: baseTitle }).slice(0, 48);
-  closePlanPanelOnSessionChange();
+  // fork 前卸下前台 plan UI；源会话 pending 仅 stash（新会话无该 waiter）
+  closePlanPanelOnSessionChange({
+    stashSessionId: activeSessionId,
+    abandonPending: false,
+  });
   const res = await inv<{
     threadId: string;
     sessionId: string;
@@ -6638,18 +7132,7 @@ function bindSlashPalette(): void {
     const ta = document.getElementById(id) as HTMLTextAreaElement | null;
     if (ta) slashPalette.attach(ta);
   }
-  for (const id of ["btn-slash", "btn-slash-chat"] as const) {
-    const btn = document.getElementById(id);
-    if (!btn) continue;
-    btn.addEventListener("click", () => {
-      atFilePalette?.hide();
-      const welcome = !$("welcome").classList.contains("hidden");
-      const ta = (
-        welcome ? $("composer-input") : $("chat-input")
-      ) as HTMLTextAreaElement;
-      void slashPalette?.openFor(ta);
-    });
-  }
+  // 命令中心入口：在输入框键入 `/`（或 Ctrl+/）；不再提供工具栏 `/` 按钮
 }
 
 function bindAtFilePalette(): void {
@@ -8049,7 +8532,10 @@ async function leaveCurrentSessionToWelcome(opts?: {
 
   if (keepBackground) {
     // 软离开：快照 turn 投影 + 卸主区；磁盘队列保留；不 cancel / 不 detach
-    if (prevSid) snapshotActiveSessionTurn(prevSid);
+    if (prevSid) {
+      snapshotActiveSessionTurn(prevSid);
+      snapshotActiveSessionPlan(prevSid);
+    }
     if (clearQueue) {
       clearPromptQueue({ silent: true });
     } else {
@@ -8060,6 +8546,11 @@ async function leaveCurrentSessionToWelcome(opts?: {
     if (turnActive) {
       endTurn({ skipQueueDrain: true, skipSessionStoreSync: true });
     }
+    // 阶段一：软离开保留 exit_plan pending（不 abandoned）
+    closePlanPanelOnSessionChange({
+      stashSessionId: prevSid,
+      abandonPending: false,
+    });
   } else {
     if (turnActive) {
       // 停当前 turn；默认不 wipe 队列（interrupt pause 语义仍可用）
@@ -8087,13 +8578,25 @@ async function leaveCurrentSessionToWelcome(opts?: {
     }
     // detach 后 agent 已停，侧栏不应再转圈
     if (prevSid) markSessionWorking(prevSid, false);
+    // 硬离开：agent 将关 → 未决 plan 审批 abandoned（对齐 acp close）
+    closePlanPanelOnSessionChange({
+      stashSessionId: prevSid,
+      abandonPending: true,
+    });
+    if (prevSid) clearSessionPlan(prevSid);
   }
 
-  closePlanPanelOnSessionChange();
   sessionViewGen += 1;
   activeThreadId = null;
   activeSessionId = null;
   setActiveCwd(null);
+  // B1：离开会话后隐藏旁路侧问轨（协议 btw 必须 sessionId）
+  // 硬离开（detach）：丢弃 in-flight 侧问；软离开（后台继续）仅卸 DOM，投影保留
+  if (prevSid && !keepBackground) {
+    cancelSessionBtwFlight(prevSid, tr("btw.stopped"));
+  }
+  rebindBtwSideForSession(null);
+  sidePane?.onSessionChanged();
   applyDefaultToChip();
   stopContextPolling();
   lastContextUsage = null;
@@ -8688,6 +9191,7 @@ async function openThread(t: ThreadRow): Promise<void> {
   if (!sameSession && prevSid) {
     // 必须在 endTurn 之前快照（含 turnActive=true）
     snapshotActiveSessionTurn(prevSid);
+    snapshotActiveSessionPlan(prevSid);
   }
   // 清主区 DOM/锁，勿写回 idle 覆盖 snapshot
   endTurn({ skipQueueDrain: true, skipSessionStoreSync: true });
@@ -8709,7 +9213,11 @@ async function openThread(t: ThreadRow): Promise<void> {
   hideAgentCrashBanner();
   agentAvailableCommands = [];
   if (!sameSession) {
-    closePlanPanelOnSessionChange();
+    // 阶段一：切走 stash plan/pending，不 abandoned
+    closePlanPanelOnSessionChange({
+      stashSessionId: prevSid,
+      abandonPending: false,
+    });
     // S17：换会话重置 prompt 历史，稍后从磁盘 seed
     clearPromptHistoryStore();
     goalTokenBudget = null;
@@ -8718,6 +9226,22 @@ async function openThread(t: ThreadRow): Promise<void> {
   }
   activeThreadId = t.id;
   activeSessionId = t.sessionId;
+  // 先套上目标会话的 plan 投影（避免全局 planPhase 残留导致误 surface）
+  if (!sameSession) {
+    const planProj = getSessionPlan(t.sessionId);
+    planPhase = planProj?.planPhase ?? "off";
+    pendingPlanApproval = planProj?.pendingApproval
+      ? { ...planProj.pendingApproval }
+      : null;
+    if (
+      pendingPlanApproval &&
+      pendingPlanApproval.sessionId &&
+      pendingPlanApproval.sessionId !== t.sessionId
+    ) {
+      pendingPlanApproval = null;
+    }
+    syncPermLabels();
+  }
   // 默认 history_only；按 sessionId 同步真实附着（disk_ 也可能已有 live）
   setAttachUiState("history_only");
   // 方案 B：并行查 Host 是否仍有 in-flight prompt（切回 rehydrate 真源）
@@ -8750,6 +9274,9 @@ async function openThread(t: ThreadRow): Promise<void> {
   // L1 按会话加载持久队列（勿静默清空）
   void reloadPromptQueueFromHost();
   setActiveCwd(t.cwd);
+  // 按会话换绑旁路侧问 DOM（投影在 session-btw-store；勿沿用上一会话线程）
+  rebindBtwSideForSession(t.sessionId);
+  void loadBtwHistoryForSession(t.sessionId, viewGen);
   sidePane?.onSessionChanged();
   // chip 跟随会话模型，不用全局默认盖住
   applyThreadToChip(t);
@@ -8856,6 +9383,8 @@ async function openThread(t: ThreadRow): Promise<void> {
         threadStatus: attachSt?.data?.threadStatus ?? t.status,
         promptInFlight: attachSt?.data?.promptInFlight,
       });
+      // 阶段一：恢复 plan / 未决 exit_plan（有 pending 则开侧栏）
+      void rehydrateSessionPlan(t.sessionId, { viewGen });
     }
   }
 }
@@ -8935,8 +9464,12 @@ function markToolIncomplete(
 /**
  * 将 chip 上的 model/effort 同步到 live agent。
  * attach/load 后 session 磁盘模型可能与 UI 不一致，发送前再校准一次。
+ *
+ * 主 turn 进行中禁止 setModel：Desktop 侧问/插话会走 ensureLiveThread，
+ * 若在 busy 时再打 session/set_model，会干扰 agent 并发侧问采样（CLI /btw 不会改 model）。
  */
 async function syncLiveSessionModel(threadId: string): Promise<void> {
+  if (turnActive) return;
   const id = (modelLabel || "").trim();
   if (!id || threadId.startsWith("disk_")) return;
   const r = await inv("threads.setModel", {
@@ -8953,8 +9486,19 @@ async function syncLiveSessionModel(threadId: string): Promise<void> {
   }
 }
 
+type EnsureLiveThreadOpts = {
+  /**
+   * 是否把 chip 模型同步到 agent。主发送默认 true；
+   * 旁路侧问 / 插话应 false（对齐 CLI：只发 x.ai/btw，不先 setModel）。
+   */
+  syncModel?: boolean;
+};
+
 /** Disk session → attach live ACP so turns.prompt works. Ping if already live. */
-async function ensureLiveThread(): Promise<string | null> {
+async function ensureLiveThread(
+  opts?: EnsureLiveThreadOpts,
+): Promise<string | null> {
+  const syncModel = opts?.syncModel !== false;
   if (!activeSessionId || !activeCwd) return null;
   const wantSession = activeSessionId;
   const wantCwd = activeCwd;
@@ -8969,7 +9513,7 @@ async function ensureLiveThread(): Promise<string | null> {
     }
     if (ping.ok && ping.data?.ok && ping.data.alive) {
       setAttachUiState("live");
-      await syncLiveSessionModel(activeThreadId);
+      if (syncModel) await syncLiveSessionModel(activeThreadId);
       return activeThreadId;
     }
     // stale live id → force reattach（发送路径自动重连，不要求用户先点）
@@ -9001,8 +9545,8 @@ async function ensureLiveThread(): Promise<string | null> {
     activeThreadId = att.data.threadId;
     setAttachUiState("live");
     hideAgentCrashBanner();
-    // Host attach 已按 meta setModel；再用 chip 校准（用户可能已改 chip 未落盘）
-    await syncLiveSessionModel(activeThreadId);
+    // Host attach 已按 meta setModel；主路径再用 chip 校准（侧问/插话跳过）
+    if (syncModel) await syncLiveSessionModel(activeThreadId);
     if (viewGen !== sessionViewGen || activeSessionId !== wantSession) {
       return null;
     }
@@ -9136,8 +9680,11 @@ async function startNewChat(prompt?: string): Promise<void> {
     projectId = undefined;
     cwd = undefined;
   }
-  // 选定工作目录后再关计划栏（取消选目录时不关）
-  closePlanPanelOnSessionChange();
+  // 选定工作目录后再关计划栏（取消选目录时不关）；stash 不 abandon
+  closePlanPanelOnSessionChange({
+    stashSessionId: activeSessionId,
+    abandonPending: false,
+  });
   const raw =
     prompt ??
     ($("composer-input") as HTMLTextAreaElement).value.trim() ??
@@ -9247,6 +9794,9 @@ async function startNewChat(prompt?: string): Promise<void> {
   // Pending → Active：下一条消息进入计划 Active
   if (planPhase === "pending") {
     planPhase = "active";
+    if (activeSessionId) {
+      patchSessionPlan(activeSessionId, { planPhase: "active" });
+    }
   }
   lastPlanArtifactPath = null;
   setTurnStatus(tr("turn.thinking"));
@@ -9322,8 +9872,8 @@ function parseInlineBtwOrInterject(
 }
 
 /** 旁路侧问：画到右侧「旁路侧问」栏线程（对齐 Codex 侧边聊天，不进主 transcript） */
-function ensureBtwSideOpen(): void {
-  sidePane?.openBtwCategory(false);
+function ensureBtwSideOpen(): boolean {
+  return sidePane?.openBtwCategory(false) ?? false;
 }
 
 function btwSideThreadEl(): HTMLElement | null {
@@ -9334,52 +9884,167 @@ function btwSideHideEmpty(): void {
   document.getElementById("btw-side-empty")?.classList.add("hidden");
 }
 
-function paintBtwExchange(
-  question: string,
-  state: "loading" | "done" | "error",
-  answerOrError?: string,
-  exchangeId?: string,
-): string {
-  ensureBtwSideOpen();
+function btwSideShowEmpty(): void {
   const thread = btwSideThreadEl();
-  if (!thread) return exchangeId ?? "";
+  const empty = document.getElementById("btw-side-empty");
+  if (!thread || !empty) return;
+  empty.classList.remove("hidden");
+  if (!thread.contains(empty)) thread.appendChild(empty);
+}
+
+/** 将 store 中的一条 exchange 画到 #btw-side-thread（仅前台会话应调用） */
+function paintBtwExchangeDom(ex: BtwExchange): void {
+  const thread = btwSideThreadEl();
+  if (!thread) return;
   btwSideHideEmpty();
-  const id =
-    exchangeId ||
-    `btw_ex_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 7)}`;
-  let block = document.getElementById(id) as HTMLElement | null;
+  let block = document.getElementById(ex.id) as HTMLElement | null;
   if (!block) {
     block = document.createElement("div");
-    block.id = id;
+    block.id = ex.id;
     block.className = "btw-ex";
     thread.appendChild(block);
   }
+  const state = ex.state;
   block.classList.toggle("btw-ex--error", state === "error");
   block.classList.toggle("btw-ex--done", state === "done");
   block.classList.toggle("btw-ex--loading", state === "loading");
-  const qHtml = `<div class="btw-ex-q"><div class="btw-ex-bubble btw-ex-bubble-user">${esc(question)}</div></div>`;
+  block.classList.toggle("btw-ex--stopped", state === "stopped");
+  const qHtml = `<div class="btw-ex-q"><div class="btw-ex-bubble btw-ex-bubble-user">${esc(ex.question)}</div></div>`;
   let aHtml: string;
   if (state === "loading") {
     aHtml = `<div class="btw-ex-a"><div class="btw-ex-bubble btw-ex-bubble-ai btw-loading">${esc(tr("btw.loading"))}</div></div>`;
   } else if (state === "error") {
-    aHtml = `<div class="btw-ex-a"><div class="btw-ex-bubble btw-ex-bubble-ai btw-err">${esc(answerOrError || tr("btw.fail"))}</div></div>`;
+    aHtml = `<div class="btw-ex-a"><div class="btw-ex-bubble btw-ex-bubble-ai btw-err">${esc(ex.body || tr("btw.fail"))}</div></div>`;
+  } else if (state === "stopped") {
+    aHtml = `<div class="btw-ex-a"><div class="btw-ex-bubble btw-ex-bubble-ai">${esc(ex.body || tr("btw.stopped"))}</div></div>`;
   } else {
-    aHtml = `<div class="btw-ex-a"><div class="btw-ex-bubble btw-ex-bubble-ai">${renderMarkdownToSafeHtml(answerOrError ?? "")}</div></div>`;
+    aHtml = `<div class="btw-ex-a"><div class="btw-ex-bubble btw-ex-bubble-ai">${renderMarkdownToSafeHtml(ex.body ?? "")}</div></div>`;
   }
   block.innerHTML = qHtml + aHtml;
   thread.scrollTop = thread.scrollHeight;
-  return id;
 }
 
-function clearBtwSideThread(): void {
+/**
+ * 按 sessionId 重绘侧问线程（切会话 / 清空 / 离开）。
+ * DOM 是全局单例，投影按会话存在 session-btw-store。
+ */
+function rebindBtwSideForSession(sessionId: string | null): void {
   const thread = btwSideThreadEl();
   if (!thread) return;
   thread.querySelectorAll(".btw-ex").forEach((n) => n.remove());
-  const empty = document.getElementById("btw-side-empty");
-  if (empty) {
-    empty.classList.remove("hidden");
-    if (!thread.contains(empty)) thread.appendChild(empty);
+  const list = sessionId ? listSessionBtw(sessionId) : [];
+  if (!list.length) {
+    btwSideShowEmpty();
+  } else {
+    for (const ex of list) paintBtwExchangeDom(ex);
   }
+  syncBtwSideComposer(sessionId);
+}
+
+/** 侧栏发送钮：空闲=发送，本会话侧问 in-flight=停止（不禁用输入） */
+function syncBtwSideComposer(sessionId?: string | null): void {
+  const sid = sessionId === undefined ? activeSessionId : sessionId;
+  const busy = Boolean(sid && isBtwInFlight(sid));
+  const sendBtn = document.getElementById(
+    "btn-btw-send",
+  ) as HTMLButtonElement | null;
+  if (sendBtn) {
+    sendBtn.disabled = false;
+    if (busy) {
+      sendBtn.classList.add("stop");
+      sendBtn.innerHTML = sendButtonIconHtml(true);
+      sendBtn.title = tr("btw.stop");
+      sendBtn.setAttribute("aria-label", tr("btw.stop"));
+    } else {
+      sendBtn.classList.remove("stop");
+      sendBtn.innerHTML = sendButtonIconHtml(false);
+      sendBtn.title = tr("btw.send");
+      sendBtn.setAttribute("aria-label", tr("btw.send"));
+    }
+  }
+  // 侧问进行中仍可编辑草稿；仅发送钮变 stop
+  const ta = document.getElementById(
+    "btw-side-input",
+  ) as HTMLTextAreaElement | null;
+  if (ta) ta.readOnly = false;
+}
+
+/** store 更新后：仅当前前台会话刷新对应 DOM 块 */
+function applyBtwExchangeUi(
+  sessionId: string,
+  ex: BtwExchange,
+  opts?: { openSide?: boolean },
+): void {
+  if (sessionId !== activeSessionId) {
+    syncBtwSideComposer(activeSessionId);
+    return;
+  }
+  if (opts?.openSide) ensureBtwSideOpen();
+  paintBtwExchangeDom(ex);
+  syncBtwSideComposer(sessionId);
+}
+
+function clearBtwSideThread(): void {
+  if (activeSessionId) {
+    // 清空 UI 投影；进行中的 RPC 也丢弃
+    cancelSessionBtwFlight(activeSessionId, tr("btw.stopped"));
+    clearSessionBtw(activeSessionId);
+  }
+  rebindBtwSideForSession(activeSessionId);
+}
+
+/** 丢弃本会话 in-flight 侧问结果（无 agent cancel API；仅 UI + flightGen） */
+function stopBtwSideQuestion(): void {
+  if (!activeSessionId || !isBtwInFlight(activeSessionId)) return;
+  const r = cancelSessionBtwFlight(activeSessionId, tr("btw.stopped"));
+  if (r?.exchangeId) {
+    const ex = listSessionBtw(activeSessionId).find(
+      (e) => e.id === r.exchangeId,
+    );
+    if (ex) applyBtwExchangeUi(activeSessionId, ex);
+    else rebindBtwSideForSession(activeSessionId);
+  } else {
+    syncBtwSideComposer(activeSessionId);
+  }
+  showToast(tr("btw.stopped"), "info");
+}
+
+/**
+ * 打开会话时从磁盘 btw_history.jsonl 合并进 store（可与内存 in-flight 并存）。
+ */
+async function loadBtwHistoryForSession(
+  sessionId: string,
+  viewGen: number,
+): Promise<void> {
+  const sid = sessionId.trim();
+  if (!sid) return;
+  const res = await inv<{
+    sessionId: string;
+    entries: Array<{
+      btwSessionId: string;
+      question: string;
+      answer: string;
+      success: boolean;
+      error?: string;
+      askedAt?: string;
+    }>;
+  }>("history.btwLoad", { sessionId: sid });
+  if (viewGen !== sessionViewGen) return;
+  if (activeSessionId !== sid) return;
+  if (!res.ok || !res.data?.entries?.length) {
+    // 无磁盘记录时仍可能有内存侧问（本会话刚发的）
+    rebindBtwSideForSession(sid);
+    return;
+  }
+  const fromDisk: BtwExchange[] = res.data.entries.map((e) => ({
+    id: `btw_disk_${e.btwSessionId}`,
+    question: e.question,
+    state: (e.success ? "done" : "error") as BtwExchangeState,
+    body: e.success ? e.answer : e.error || e.answer || tr("btw.fail"),
+    updatedAtMs: e.askedAt ? Date.parse(e.askedAt) || Date.now() : Date.now(),
+  }));
+  replaceSessionBtwFromDisk(sid, fromDisk);
+  rebindBtwSideForSession(sid);
 }
 
 /** @deprecated 主时间线卡片已弃用；保留 dismiss 以免旧 DOM 残留 */
@@ -9387,7 +10052,7 @@ function dismissBtwCard(): void {
   document.getElementById("btw-live-card")?.remove();
 }
 
-/** 插话用户块（视觉上区别于普通 user 气泡）；失败时可 rollback */
+/** 插话用户块（对齐 user-msg-block；虚线边区分普通气泡）；失败时可 rollback */
 function paintInterjectionMessage(
   text: string,
   interjectionId?: string,
@@ -9396,33 +10061,48 @@ function paintInterjectionMessage(
   if (!t) return null;
   const el = $("transcript");
   const wrap = document.createElement("div");
-  wrap.className = "line user interjection";
+  wrap.className = "user-msg-block interjection";
+  wrap.dataset.messageAuthorRole = "user";
   if (interjectionId) wrap.dataset.interjectionId = interjectionId;
-  wrap.innerHTML = `
-    <div class="bubble interjection-bubble">
-      <div class="interjection-tag">${esc(tr("interject.tag"))}</div>
-      <div class="bubble-text">${esc(t)}</div>
-    </div>`;
+  wrap.dataset.rawText = t;
+
+  const bubble = document.createElement("div");
+  bubble.className = "line user interjection-bubble";
+
+  const tag = document.createElement("div");
+  tag.className = "interjection-tag";
+  tag.textContent = tr("interject.tag");
+
+  const body = document.createElement("div");
+  body.className = "msg-user-text";
+  body.textContent = t;
+
+  bubble.appendChild(tag);
+  bubble.appendChild(body);
+  wrap.appendChild(bubble);
   el.appendChild(wrap);
-  el.scrollTop = el.scrollHeight;
+  // 插话在流式中：用户若在上滑阅读，勿强拉到底
+  scrollTranscriptIfSticky();
   return wrap;
 }
 
 /** 本端已乐观绘制的 interjection id（回声去重） */
 const selfInterjectionIds = new Set<string>();
-/** btw 进行中：防连点 / 与主 turn 并行时的二次发送 */
-let btwInFlight = false;
 /** interject 进行中：防连点风暴 */
 let interjectInFlight = false;
 
 /**
  * 旁路侧问：打开右侧「旁路侧问」栏（对齐 Codex 侧边聊天布局）。
  * 协议仍是 Grok `_x.ai/btw`；无问题正文时只展开面板。
- * 可与主 turn 并行（CLI 语义：不打断、不进主对话）。
+ * B1：必须有当前会话（sessionId）；可与主 turn 并行。
  */
 async function runBtwCommand(
   questionArg?: string,
 ): Promise<{ ok: boolean; message?: string }> {
+  if (!activeSessionId) {
+    sidePane?.syncBtwAvailability();
+    return { ok: false, message: tr("btw.needSession") };
+  }
   let question = (questionArg ?? "").trim();
   if (!question) {
     const fromComposer = activeComposerInput()?.value.trim() ?? "";
@@ -9441,22 +10121,25 @@ async function runBtwCommand(
     }
   }
   if (!question) {
-    sidePane?.openBtwCategory(true);
+    const opened = sidePane?.openBtwCategory(true) ?? false;
+    if (!opened) {
+      return { ok: false, message: tr("btw.needSession") };
+    }
     return { ok: true, message: tr("btw.sideOpened") };
   }
   return sendBtwQuestion(question);
 }
 
-/** 从侧栏输入框发送侧问 */
+/** 从侧栏输入框发送侧问；进行中时点击 = 停止 */
 async function sendBtwFromSidePanel(): Promise<void> {
+  if (activeSessionId && isBtwInFlight(activeSessionId)) {
+    stopBtwSideQuestion();
+    return;
+  }
   const ta = document.getElementById(
     "btw-side-input",
   ) as HTMLTextAreaElement | null;
   if (!ta) return;
-  if (btwInFlight) {
-    showToast(tr("btw.inFlight"), "info");
-    return;
-  }
   const question = ta.value.trim();
   if (!question) {
     showToast(tr("btw.empty"), "error");
@@ -9473,29 +10156,64 @@ async function sendBtwQuestion(
 ): Promise<{ ok: boolean; message?: string }> {
   const q = question.trim();
   if (!q) return { ok: false, message: tr("btw.empty") };
-  if (btwInFlight) {
+  if (!activeSessionId) {
+    sidePane?.syncBtwAvailability();
+    return { ok: false, message: tr("btw.needSession") };
+  }
+  const sessionId = activeSessionId;
+  if (isBtwInFlight(sessionId)) {
     return { ok: false, message: tr("btw.inFlight") };
   }
 
   showWelcome(false);
-  ensureBtwSideOpen();
-  const exId = paintBtwExchange(q, "loading");
+  if (!sidePane?.openBtwCategory(false)) {
+    return { ok: false, message: tr("btw.needSession") };
+  }
+
+  const exId = `btw_ex_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 7)}`;
+  const loading: BtwExchange = {
+    id: exId,
+    question: q,
+    state: "loading",
+    updatedAtMs: Date.now(),
+  };
+  upsertBtwExchange(sessionId, loading);
+  const flightGen = beginBtwFlight(sessionId, exId);
+  applyBtwExchangeUi(sessionId, loading, { openSide: true });
   recordPromptHistory(`/btw ${q}`);
-  btwInFlight = true;
-  setBtwSideBusy(true);
 
   try {
-    const threadId = await ensureLiveThread();
+    // 对齐 CLI：/btw 只发扩展 RPC，不在侧问前 setModel（busy 时 setModel 会污染侧问采样）
+    const threadId = await ensureLiveThread({ syncModel: false });
+    // attach 期间用户可能已切会话 / 停止侧问
+    if (!isBtwFlightCurrent(sessionId, flightGen, exId)) {
+      return { ok: false, message: tr("btw.stopped") };
+    }
     if (!threadId) {
-      paintBtwExchange(q, "error", tr("chat.connectFail"), exId);
-      return { ok: false, message: tr("chat.connectFail") };
+      const msg = tr("btw.connectFail");
+      const errEx: BtwExchange = {
+        id: exId,
+        question: q,
+        state: "error",
+        body: msg,
+        updatedAtMs: Date.now(),
+      };
+      if (isBtwFlightCurrent(sessionId, flightGen, exId)) {
+        upsertBtwExchange(sessionId, errEx);
+        applyBtwExchangeUi(sessionId, errEx);
+      }
+      return { ok: false, message: msg };
     }
 
-    // 不 cancel 主 turn；btw 与 busy 可并行
+    // 不 cancel 主 turn；btw 与 busy 可并行。闭包绑定 sessionId，结果写回该会话 store。
     const res = await inv<{ sessionId: string; answer: string }>("threads.btw", {
       threadId,
       question: q,
     });
+    if (!isBtwFlightCurrent(sessionId, flightGen, exId)) {
+      // 已停止或被新侧问取代：丢弃结果，勿污染 UI
+      return { ok: false, message: tr("btw.stopped") };
+    }
     if (!res.ok) {
       const msg = formatTurnErrorMessage(
         res.error?.message ?? tr("btw.fail"),
@@ -9503,26 +10221,48 @@ async function sendBtwQuestion(
           ? (res.error as { details?: unknown }).details
           : undefined,
       );
-      paintBtwExchange(q, "error", msg, exId);
+      const errEx: BtwExchange = {
+        id: exId,
+        question: q,
+        state: "error",
+        body: msg,
+        updatedAtMs: Date.now(),
+      };
+      upsertBtwExchange(sessionId, errEx);
+      applyBtwExchangeUi(sessionId, errEx);
       return { ok: false, message: msg };
     }
-    paintBtwExchange(q, "done", res.data?.answer ?? "", exId);
+    const doneEx: BtwExchange = {
+      id: exId,
+      question: q,
+      state: "done",
+      body: res.data?.answer ?? "",
+      updatedAtMs: Date.now(),
+    };
+    upsertBtwExchange(sessionId, doneEx);
+    applyBtwExchangeUi(sessionId, doneEx);
     return { ok: true, message: tr("btw.ok") };
   } finally {
-    btwInFlight = false;
-    setBtwSideBusy(false);
+    // 若仍是本 flight 的 loading（异常路径未 upsert），清 inFlight 标记
+    const p = getOrCreateSessionBtw(sessionId);
+    if (p.inFlightId === exId && p.flightGen === flightGen) {
+      const cur = p.exchanges.find((e) => e.id === exId);
+      if (cur?.state === "loading") {
+        const errEx: BtwExchange = {
+          id: exId,
+          question: q,
+          state: "error",
+          body: tr("btw.fail"),
+          updatedAtMs: Date.now(),
+        };
+        upsertBtwExchange(sessionId, errEx);
+        applyBtwExchangeUi(sessionId, errEx);
+      } else if (p.inFlightId === exId) {
+        p.inFlightId = null;
+      }
+    }
+    if (activeSessionId === sessionId) syncBtwSideComposer(sessionId);
   }
-}
-
-function setBtwSideBusy(busy: boolean): void {
-  const sendBtn = document.getElementById(
-    "btn-btw-send",
-  ) as HTMLButtonElement | null;
-  if (sendBtn) sendBtn.disabled = busy;
-  const ta = document.getElementById(
-    "btw-side-input",
-  ) as HTMLTextAreaElement | null;
-  if (ta) ta.readOnly = busy;
 }
 
 function bindBtwSidePanel(): void {
@@ -9539,6 +10279,11 @@ function bindBtwSidePanel(): void {
   ta?.addEventListener("keydown", (e) => {
     if (e.key === "Enter" && !e.shiftKey) {
       e.preventDefault();
+      // 进行中时 Enter 不触发停止，避免误触；用按钮 stop
+      if (activeSessionId && isBtwInFlight(activeSessionId)) {
+        showToast(tr("btw.inFlight"), "info");
+        return;
+      }
       void sendBtwFromSidePanel();
     }
   });
@@ -9587,7 +10332,7 @@ async function runInterjectCommand(
     const threadId =
       activeThreadId && !activeThreadId.startsWith("disk_")
         ? activeThreadId
-        : await ensureLiveThread();
+        : await ensureLiveThread({ syncModel: false });
     if (!threadId) {
       rollbackInterjection(interjectionId, painted);
       return { ok: false, message: tr("chat.connectFail") };
@@ -9659,18 +10404,13 @@ function tryEnqueueFromComposer(): boolean {
   }
   const taken = takeComposerPrompt();
   if (!taken) return false;
-  enqueuePrompt({
+  const qid = enqueuePrompt({
     display: taken.display,
     content: taken.content,
     attachments: taken.attachSnap,
   });
-  // 时间线提示（不画用户气泡，避免与真实发送重复）
-  appendLine(
-    tr("queue.queuedLine", {
-      preview: taken.display.replace(/\s+/g, " ").slice(0, 60),
-    }),
-    "system",
-  );
+  // 时间线提示（不画用户气泡）；插话/移出/清空时按 queue id 清除
+  appendQueuedSystemLine(qid, taken.display);
   return true;
 }
 
@@ -9759,6 +10499,9 @@ async function sendContinue(): Promise<void> {
   // Pending → Active：下一条消息进入计划 Active
   if (planPhase === "pending") {
     planPhase = "active";
+    if (activeSessionId) {
+      patchSessionPlan(activeSessionId, { planPhase: "active" });
+    }
   }
   lastPlanArtifactPath = null;
   setTurnStatus(tr("turn.thinking"));
@@ -10181,12 +10924,12 @@ function applyDesktopConfig(cfg: {
     syncPermLabels();
   }
   // 供应商列表可能已变，清掉模型菜单缓存并校验当前 chip
-  modelsCache = null;
-  modelsFetch = null;
+  invalidateModelsCache();
   // 设置仍开着：只校准 chip，禁止 setModel / toast（关页时再补）
   void ensureChipModelAvailable({
     toast: Boolean(activeSessionId) && !isMainShellOverlayOpen(),
     allowSetModel: !isMainShellOverlayOpen(),
+    force: true,
   });
 }
 
@@ -10246,6 +10989,15 @@ async function showSettingsPage(section?: string): Promise<void> {
       getSelectedProjectId: () => selectedProjectId,
       onConfigApplied: applyDesktopConfig,
       onClosed: restoreComposerAfterOverlay,
+      onAuthChanged: () => {
+        invalidateModelsCache();
+        // 设置仍开着：只校准 chip；force 拉目录异步不堵主进程，关页后再 setModel/toast
+        void ensureChipModelAvailable({
+          toast: !isMainShellOverlayOpen(),
+          force: true,
+          allowSetModel: !isMainShellOverlayOpen(),
+        });
+      },
       resolveThemeVariant: () => resolveTheme(themePreference),
       getAppearance: (v) => appearanceForVariant(v),
       exportThemeString: () => exportCurrentThemeString(),
@@ -10486,6 +11238,12 @@ async function cycleSessionMode(): Promise<void> {
   }
   if (isPlanOn()) {
     planPhase = "off";
+    if (activeSessionId) {
+      patchSessionPlan(activeSessionId, {
+        planPhase: "off",
+        pendingApproval: pendingPlanApproval,
+      });
+    }
     accessMode = "always_approve";
     syncPermLabels();
     const r = await syncSessionPolicyLive({ plan: false, alwaysApprove: true });
@@ -10499,6 +11257,9 @@ async function cycleSessionMode(): Promise<void> {
   // always_approve（非 plan）→ normal
   accessMode = "normal";
   planPhase = "off";
+  if (activeSessionId) {
+    patchSessionPlan(activeSessionId, { planPhase: "off" });
+  }
   syncPermLabels();
   void syncSessionPolicyLive({ plan: false, alwaysApprove: false });
   showToast("已恢复默认确认");
@@ -10952,39 +11713,13 @@ function onEvent(raw: unknown): void {
     sidePane?.scheduleRefreshFileTree();
     return;
   }
-  // 计划审批 / 模式变更：与 transcript 挂起无关（exit_plan 可在任意时机弹出）
+  // 计划审批 / 模式变更：按 session 路由（阶段一：禁止串台到错误前台）
   if (ev.type === "plan.approval.requested") {
-    if (
-      "threadId" in ev &&
-      ev.threadId &&
-      activeThreadId &&
-      ev.threadId !== activeThreadId &&
-      !activeThreadId.startsWith("disk_")
-    ) {
-      return;
-    }
     void handlePlanApprovalRequested(ev);
     return;
   }
   if (ev.type === "plan.mode.changed") {
-    if (
-      "threadId" in ev &&
-      ev.threadId &&
-      activeThreadId &&
-      ev.threadId !== activeThreadId &&
-      !activeThreadId.startsWith("disk_")
-    ) {
-      return;
-    }
-    if (ev.active) {
-      // 用户 /plan 已为 pending：保持 Pending 至下一条消息；
-      // agent 主动进入时直接 Active。不改 accessMode。
-      if (planPhase === "off") planPhase = "active";
-    } else if (isPlanOn()) {
-      // agent 退出 plan；保留 accessMode（yolo 可重新露出）
-      planPhase = "off";
-    }
-    syncPermLabels();
+    handlePlanModeChanged(ev);
     return;
   }
   // handoff / 全局状态始终处理
@@ -11326,41 +12061,119 @@ function onEvent(raw: unknown): void {
   }
 }
 
-/** agent 发起 x.ai/exit_plan_mode → 打开计划面板审批 */
+/**
+ * agent 发起 x.ai/exit_plan_mode。
+ * 阶段一：仅当前前台会话打开侧栏；后台只写入 session-plan-store。
+ */
 async function handlePlanApprovalRequested(ev: {
   requestId: string;
   sessionId: string;
+  threadId?: string;
   toolCallId?: string;
   planContent?: string | null;
 }): Promise<void> {
-  endStreamBubble();
-  setTurnStatus("等待计划审批…");
+  const ownerSid = (ev.sessionId || "").trim();
+  if (!ownerSid || !ev.requestId?.trim()) return;
+
   let content = (ev.planContent ?? "").trim();
-  if (!content && ev.sessionId) {
+  if (!content) {
     const res = await inv<{
       content?: string;
-    } | null>("plans.get", { sessionId: ev.sessionId });
+    } | null>("plans.get", { sessionId: ownerSid });
     if (res.ok && res.data?.content) {
       content = res.data.content.trim();
     }
   }
-  // 若 agent 带了正文且 session 尚空，先写入真源
-  if (content && ev.sessionId) {
+  // 若 agent 带了正文且 session 尚空，先写入真源（可后台）
+  if (content) {
     const cur = await inv<{ content?: string } | null>("plans.get", {
-      sessionId: ev.sessionId,
+      sessionId: ownerSid,
     });
     if (cur.ok && !(cur.data?.content ?? "").trim()) {
-      await inv("plans.write", { sessionId: ev.sessionId, content });
+      await inv("plans.write", { sessionId: ownerSid, content });
     }
   }
+
+  const pending: SessionPlanPendingApproval = {
+    requestId: ev.requestId.trim(),
+    sessionId: ownerSid,
+    planContent: content,
+  };
+  patchSessionPlan(ownerSid, {
+    planPhase: "active",
+    pendingApproval: pending,
+  });
+
+  // 后台会话：不抢前台侧栏 / 不改全局 planPhase
+  if (!eventBelongsToActiveSession(ev)) {
+    markSessionWorking(ownerSid, true);
+    const row = threads.find((t) => t.sessionId === ownerSid);
+    const title =
+      row?.title?.trim() ||
+      ownerSid.slice(0, 8);
+    showToast(tr("plan.bgAwaiting", { title }), "info");
+    return;
+  }
+
+  endStreamBubble();
+  setTurnStatus(tr("plan.awaiting") || "等待计划审批…");
   planPhase = "active";
+  pendingPlanApproval = pending;
   syncPermLabels();
   await openPlanPanel({
-    requestId: ev.requestId,
+    requestId: pending.requestId,
     seedContent: content || null,
     forceReload: true,
+    ownerSessionId: ownerSid,
   });
-  showToast("请在右侧「计划」面板审阅并批准", "info");
+  if (activeSessionId !== ownerSid) return;
+  showToast(tr("plan.pleaseReview") || "请在右侧「计划」面板审阅并批准", "info");
+}
+
+/** plan.mode.changed：按 session 写入投影；仅前台改 chip */
+function handlePlanModeChanged(ev: {
+  sessionId?: string;
+  threadId?: string;
+  active: boolean;
+  modeId?: string;
+}): void {
+  const sid = (ev.sessionId || "").trim();
+  if (sid) {
+    if (ev.active) {
+      const cur = getSessionPlan(sid);
+      // 前台可能已是 pending（用户 /plan）；勿用 active 盖掉
+      const keepPending =
+        eventBelongsToActiveSession(ev) && planPhase === "pending";
+      const nextPhase: PlanPhase = keepPending
+        ? "pending"
+        : cur?.planPhase === "pending"
+          ? "pending"
+          : "active";
+      patchSessionPlan(sid, { planPhase: nextPhase });
+    } else {
+      // agent 退出 plan：清 phase；若仍有 pending 审批则保留 pending 槽
+      const cur = getSessionPlan(sid);
+      patchSessionPlan(sid, {
+        planPhase: cur?.pendingApproval ? "active" : "off",
+      });
+    }
+  }
+
+  if (!eventBelongsToActiveSession(ev) && sid) {
+    // 后台：只更新 store
+    return;
+  }
+
+  if (ev.active) {
+    // 用户 /plan 已为 pending：保持 Pending 至下一条消息；
+    // agent 主动进入时直接 Active。不改 accessMode。
+    if (planPhase === "off") planPhase = "active";
+  } else if (isPlanOn()) {
+    // agent 退出 plan；若本会话仍有 exit_plan 待批则保持 active 供审批
+    if (!isPlanApprovalArmed()) planPhase = "off";
+  }
+  if (activeSessionId) snapshotActiveSessionPlan(activeSessionId);
+  syncPermLabels();
 }
 
 // ── Boot ───────────────────────────────────────────────────
@@ -11802,9 +12615,31 @@ npm start</pre>
     }
   });
 
-  // 排队条：移除 / 编辑 / 上下移 / 清空 / 恢复发送
+  // 排队条：插话 / 立即发送 / 移除 / 编辑 / 上下移 / 清空 / 恢复发送
   document.addEventListener("click", (e) => {
     const t = e.target as HTMLElement;
+    const interjectBtn = t.closest(
+      "[data-queue-interject]",
+    ) as HTMLElement | null;
+    if (
+      interjectBtn?.dataset.queueInterject &&
+      !interjectBtn.hasAttribute("disabled")
+    ) {
+      e.preventDefault();
+      void interjectQueuedPrompt(interjectBtn.dataset.queueInterject);
+      return;
+    }
+    const sendNowBtn = t.closest(
+      "[data-queue-send-now]",
+    ) as HTMLElement | null;
+    if (
+      sendNowBtn?.dataset.queueSendNow &&
+      !sendNowBtn.hasAttribute("disabled")
+    ) {
+      e.preventDefault();
+      void sendNowQueuedPrompt(sendNowBtn.dataset.queueSendNow);
+      return;
+    }
     const rm = t.closest("[data-queue-rm]") as HTMLElement | null;
     if (rm?.dataset.queueRm) {
       e.preventDefault();

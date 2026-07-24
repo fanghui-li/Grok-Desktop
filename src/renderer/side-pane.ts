@@ -170,6 +170,7 @@ export class SidePaneController {
     this.bindChrome();
     this.applyOpenState(false);
     this.applyCategory();
+    this.syncBtwAvailability();
     this.applyTreeVisible();
     this.applyFocusMode();
     if (this.open) this.applyOpenState(true);
@@ -305,8 +306,16 @@ export class SidePaneController {
     void this.refreshAgentsTree();
   }
 
-  /** 打开并聚焦「旁路侧问」分类（对齐 Codex 侧边聊天面板） */
-  openBtwCategory(focusInput = true): void {
+  /**
+   * 打开并聚焦「旁路侧问」分类（对齐 Codex 侧边聊天面板）。
+   * B1：无当前会话时不可用（协议 btw 必须 sessionId）。
+   * @returns 是否已打开 btw 面板
+   */
+  openBtwCategory(focusInput = true): boolean {
+    if (!this.hasSessionForBtw()) {
+      this.syncBtwAvailability();
+      return false;
+    }
     this.category = "btw";
     this.open = true;
     // 侧问面板不需要全屏文件沉浸
@@ -327,10 +336,36 @@ export class SidePaneController {
         ta?.focus();
       });
     }
+    return true;
+  }
+
+  /** B1：有磁盘会话即可显示侧问轨（不要求 live attach） */
+  hasSessionForBtw(): boolean {
+    return Boolean(this.getSessionId()?.trim());
+  }
+
+  /**
+   * 按当前会话显隐「旁路侧问」轨按钮；无会话时若正停在 btw 则退回 files。
+   */
+  syncBtwAvailability(): void {
+    const ok = this.hasSessionForBtw();
+    const btn = document.getElementById("btn-cat-btw");
+    if (btn) {
+      btn.classList.toggle("hidden", !ok);
+      btn.setAttribute("aria-hidden", ok ? "false" : "true");
+      if (!ok) btn.classList.remove("active");
+    }
+    if (!ok && this.category === "btw") {
+      this.category = "files";
+      this.applyCategory();
+      this.persist();
+      if (this.open) void this.refreshFileTree();
+    }
   }
 
   /** 会话切换时清空 / 重载树 */
   onSessionChanged(): void {
+    this.syncBtwAvailability();
     const sid = this.getSessionId();
     if (sid !== this.agentsSessionId) {
       this.agentsSessionId = sid;
@@ -464,7 +499,9 @@ export class SidePaneController {
         c === "btw" ||
         c === "agents"
       ) {
-        this.category = c;
+        // btw 仅在有会话时可恢复；否则落到 files（B1）
+        this.category =
+          c === "btw" && !this.hasSessionForBtw() ? "files" : c;
       }
     } catch {
       /* ignore */

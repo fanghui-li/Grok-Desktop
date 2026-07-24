@@ -69,6 +69,8 @@ export interface SettingsPageCallbacks {
   }) => void;
   /** 关闭设置页后（恢复主界面交互 / 焦点） */
   onClosed?: () => void;
+  /** 官方登录/登出后：刷新模型目录（隐藏/恢复官方模型） */
+  onAuthChanged?: () => void;
   esc: (s: string) => string;
   /** 当前 resolved 变体（system 跟 OS） */
   resolveThemeVariant: () => ThemeVariant;
@@ -932,6 +934,38 @@ export class SettingsPageController {
     const statusLine = a?.authenticated
       ? `${tr("settings.loggedIn")}${a.label ? ` · ${this.cb.esc(a.label)}` : ""}`
       : tr("settings.loggedOut");
+    const modelsRes = await this.cb.inv<
+      Array<{
+        id: string;
+        name?: string;
+        isDefault?: boolean;
+        source?: "official" | "custom";
+      }>
+    >("models.list");
+    const models = modelsRes.data ?? [];
+    const currentDefault =
+      models.find((m) => m.isDefault)?.id?.trim() ||
+      (this.cfg.defaultModel ?? "").trim() ||
+      "grok";
+    const official = models.filter((m) => m.source !== "custom");
+    const custom = models.filter((m) => m.source === "custom");
+    const opt = (m: { id: string; name?: string }) => {
+      const label = (m.name || m.id).trim() || m.id;
+      const sel = m.id === currentDefault ? " selected" : "";
+      return `<option value="${this.cb.esc(m.id)}"${sel}>${this.cb.esc(label)}</option>`;
+    };
+    let modelOptions = "";
+    if (official.length) {
+      modelOptions += `<optgroup label="${this.cb.esc(tr("settings.defaultModelOfficial"))}">${official.map(opt).join("")}</optgroup>`;
+    }
+    if (custom.length) {
+      modelOptions += `<optgroup label="${this.cb.esc(tr("settings.defaultModelCustom"))}">${custom.map(opt).join("")}</optgroup>`;
+    }
+    if (!modelOptions) {
+      modelOptions = `<option value="">${this.cb.esc(tr("settings.defaultModelEmpty"))}</option>`;
+    }
+    const currentLabel =
+      models.find((m) => m.id === currentDefault)?.name || currentDefault;
     return `
       <section class="settings-block">
         <h2 class="settings-h2">${this.cb.esc(tr("settings.officialH2"))}</h2>
@@ -952,6 +986,24 @@ export class SettingsPageController {
           </div>
           <div class="settings-kv"><span>${this.cb.esc(tr("settings.desktopHome"))}</span><span class="mono">${this.cb.esc(a?.grokHome ?? this.cfg.paths?.grokHome ?? "—")}</span></div>
           <div class="settings-kv"><span>${this.cb.esc(tr("settings.cliHome"))}</span><span class="mono">${this.cb.esc(a?.cliGrokHome ?? "—")}</span></div>
+        </div>
+      </section>
+      <section class="settings-block">
+        <h2 class="settings-h2">${this.cb.esc(tr("settings.defaultModelH2"))}</h2>
+        <p class="settings-desc">${this.cb.esc(tr("settings.defaultModelSub"))}</p>
+        <div class="settings-card">
+          <div class="settings-row">
+            <div class="settings-row-text">
+              <div class="settings-row-title">${this.cb.esc(tr("settings.defaultModelPick"))}</div>
+              <div class="settings-row-sub">${this.cb.esc(tr("settings.defaultModelCurrent"))} · <span class="mono">${this.cb.esc(currentLabel)}</span></div>
+            </div>
+            <div class="settings-row-actions">
+              <select id="sel-default-model" class="settings-select settings-select-wide" aria-label="${this.cb.esc(tr("settings.defaultModelPick"))}"${models.length ? "" : " disabled"}>
+                ${modelOptions}
+              </select>
+            </div>
+          </div>
+          <p class="settings-muted" id="default-model-hint" hidden></p>
         </div>
       </section>
     `;
@@ -1194,6 +1246,15 @@ export class SettingsPageController {
       if (device) device.onclick = () => void this.runAuthLogin("device-auth");
       const logout = root.querySelector("#btn-auth-logout") as HTMLElement | null;
       if (logout) logout.onclick = () => void this.runAuthLogout();
+      const sel = root.querySelector(
+        "#sel-default-model",
+      ) as HTMLSelectElement | null;
+      if (sel) {
+        sel.onchange = () => {
+          const id = sel.value.trim();
+          if (id) void this.setCatalogDefaultModel(id, root);
+        };
+      }
       return;
     }
     // custom tab — 列表
@@ -1604,6 +1665,40 @@ export class SettingsPageController {
     await this.renderContent();
   }
 
+  /**
+   * 对齐 CLI Settings `default_model` / `set_default_model`：
+   * 全 catalog（官方 + 自定义）均可写入 `[models].default`。
+   */
+  private async setCatalogDefaultModel(
+    id: string,
+    root: HTMLElement,
+  ): Promise<void> {
+    const hint = root.querySelector(
+      "#default-model-hint",
+    ) as HTMLElement | null;
+    const res = await this.cb.inv<{ defaultModel: string }>(
+      "providers.setDefault",
+      { modelId: id },
+    );
+    if (!res.ok) {
+      if (hint) {
+        hint.hidden = false;
+        hint.textContent =
+          res.error?.message ?? tr("settings.defaultModelSetFail");
+      } else {
+        window.alert(res.error?.message ?? tr("settings.defaultModelSetFail"));
+      }
+      return;
+    }
+    // patch → applyToApp 已推 defaultModel 并触发主界面校准；勿再 applyToApp 连打 models.list
+    await this.patch({ defaultModel: id });
+    if (hint) {
+      hint.hidden = false;
+      hint.textContent = tr("settings.defaultModelSetOk", { model: id });
+    }
+    await this.renderContent();
+  }
+
   private async pingProvider(id: string): Promise<void> {
     this.providerPing[id] = "loading";
     // 只更新该卡片上的 ping 展示，避免整页闪烁
@@ -1672,6 +1767,7 @@ export class SettingsPageController {
       return;
     }
     window.alert(res.data?.message ?? tr("prov.loginStarted"));
+    this.cb.onAuthChanged?.();
     await this.renderContent();
   }
 
@@ -1679,11 +1775,32 @@ export class SettingsPageController {
     if (!window.confirm(tr("prov.confirmLogout"))) {
       return;
     }
-    const res = await this.cb.inv("system.auth.logout", {});
+    const res = await this.cb.inv<{
+      cleared: boolean;
+      wasLoggedIn: boolean;
+      method: string;
+      detachedThreadIds: string[];
+      message?: string;
+    }>("system.auth.logout", {});
     if (!res.ok) {
       window.alert(res.error?.message ?? tr("prov.logoutFail"));
       return;
     }
+    const data = res.data;
+    const n = data?.detachedThreadIds?.length ?? 0;
+    let msg = data?.message?.trim() || "";
+    if (!msg) {
+      if (!data?.wasLoggedIn && !data?.cleared) {
+        msg = tr("prov.logoutNone");
+      } else if (n > 0) {
+        msg = tr("prov.logoutOkDetached", { n: String(n) });
+      } else {
+        msg = tr("prov.logoutOk");
+      }
+    }
+    window.alert(msg);
+    // 登出后 Host 已清 modelsListCache；Renderer 须立刻丢掉官方幽灵缓存并校准 chip
+    this.cb.onAuthChanged?.();
     await this.renderContent();
   }
 

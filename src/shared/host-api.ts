@@ -89,6 +89,7 @@ export type HostIpcMethod =
   | "permissions.respond"
   | "askUser.respond"
   | "history.load"
+  | "history.btwLoad"
   // roster / inbox
   | "roster.list"
   | "inbox.list"

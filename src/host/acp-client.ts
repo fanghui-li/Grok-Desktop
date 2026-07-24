@@ -1,10 +1,14 @@
 import { ChildProcessWithoutNullStreams, spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import readline from "node:readline";
+import { enrichAcpErrorMessage } from "../shared/enrich-acp-error.js";
 import { HostError } from "../shared/errors.js";
 import type { NormalizedEvent } from "../shared/events.js";
 import type { GrokCapabilities } from "../shared/types.js";
-import { CLIENT_IDENTIFIER, readAppVersion } from "./app-version.js";
+import {
+  ACP_WIRE_CLIENT_IDENTIFIER,
+  readAppVersion,
+} from "./app-version.js";
 import {
   BASELINE_CAPABILITIES,
   parseInitializeCapabilities,
@@ -77,58 +81,6 @@ function extractToolFailureMessage(
   }
   if (parts.length <= (name?.trim() ? 1 : 0)) return null;
   return parts.join(": ").slice(0, 320);
-}
-
-/** 从 agent Internal error 包装里抽出可读原因（API 400 / 空 tool name 等） */
-function enrichAcpErrorMessage(
-  message: string | undefined,
-  data: unknown,
-): string {
-  const raw = (message ?? "").trim() || "ACP error";
-  const tryParseObject = (s: string): Record<string, unknown> | null => {
-    const start = s.indexOf("{");
-    const end = s.lastIndexOf("}");
-    if (start < 0 || end <= start) return null;
-    try {
-      return JSON.parse(s.slice(start, end + 1)) as Record<string, unknown>;
-    } catch {
-      return null;
-    }
-  };
-  const pickMessage = (obj: Record<string, unknown> | null): string | null => {
-    if (!obj) return null;
-    const m = obj.message ?? obj.error_message ?? obj.error;
-    if (typeof m === "string" && m.trim()) return m.trim();
-    if (m && typeof m === "object" && "message" in (m as object)) {
-      const inner = (m as { message?: unknown }).message;
-      if (typeof inner === "string" && inner.trim()) return inner.trim();
-    }
-    return null;
-  };
-
-  let detail = pickMessage(tryParseObject(raw));
-  if (!detail && data != null) {
-    if (typeof data === "string") detail = pickMessage(tryParseObject(data));
-    else if (typeof data === "object") {
-      detail = pickMessage(data as Record<string, unknown>);
-      if (!detail && "data" in (data as object)) {
-        const nested = (data as { data?: unknown }).data;
-        if (typeof nested === "string") detail = pickMessage(tryParseObject(nested));
-        else if (nested && typeof nested === "object") {
-          detail = pickMessage(nested as Record<string, unknown>);
-        }
-      }
-    }
-  }
-
-  if (detail && detail !== raw) {
-    // 已是完整句子则直接用；否则挂在 Internal error 后
-    if (/^internal error/i.test(raw) || raw === "ACP error") return detail;
-    if (!raw.includes(detail.slice(0, Math.min(40, detail.length)))) {
-      return `${raw}: ${detail}`;
-    }
-  }
-  return raw;
 }
 
 /**
@@ -271,9 +223,12 @@ export class AcpClient {
       args: this.opts.args,
     });
 
+    const appVersion = readAppVersion();
     const env = {
       ...(this.opts.env ?? process.env),
-      GROK_CLIENT_VERSION: readAppVersion(),
+      // 与 ACP wire 身份一致：process 级 header 默认也走 shell 准入
+      GROK_CLIENT_NAME: ACP_WIRE_CLIENT_IDENTIFIER,
+      GROK_CLIENT_VERSION: appVersion,
     };
 
     this.proc = spawn(this.opts.command, this.opts.args, {
@@ -321,11 +276,10 @@ export class AcpClient {
     this.rl = readline.createInterface({ input: this.proc.stdout });
     this.rl.on("line", (line) => this.onLine(line));
 
-    const appVersion = readAppVersion();
     const initParams = {
       protocolVersion: 1,
       clientInfo: {
-        name: CLIENT_IDENTIFIER,
+        name: ACP_WIRE_CLIENT_IDENTIFIER,
         version: appVersion,
       },
       clientCapabilities: {
@@ -333,14 +287,15 @@ export class AcpClient {
         terminal: false,
       },
       _meta: {
-        clientIdentifier: CLIENT_IDENTIFIER,
+        clientIdentifier: ACP_WIRE_CLIENT_IDENTIFIER,
         clientVersion: appVersion,
       },
     };
     this.lastInitializeParams = initParams;
     this.opts.logger?.info("acp.initialize", {
       version: appVersion,
-      clientIdentifier: CLIENT_IDENTIFIER,
+      clientIdentifier: ACP_WIRE_CLIENT_IDENTIFIER,
+      wireCompat: "shell-for-official-proxy",
     });
 
     const initResult = await this.request("initialize", initParams);

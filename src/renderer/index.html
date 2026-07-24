@@ -225,7 +225,6 @@
                   <div class="composer-toolbar">
                     <div class="composer-left">
                       <button type="button" class="icon-ghost sm" id="btn-attach" data-i18n-title="composer.attach" title="添加" aria-haspopup="menu">+</button>
-                      <button type="button" class="icon-ghost sm" id="btn-slash" data-i18n-title="composer.slash" title="命令 /（Ctrl+/）">/</button>
                       <button type="button" class="mode-chip" id="btn-perm-mode">
                         <span class="mode-dot">◎</span>
                         <span id="perm-label" data-i18n="composer.permFull">完全访问</span>
@@ -302,13 +301,12 @@
                 <span class="context-chip-text" id="context-label">—</span>
               </button>
               <!-- 消息滚动 + 输入贴底：同盒 flex，矮窗不裁切 -->
-              <div
-                class="chat-scroll"
-                id="chat-scroll"
-                role="log"
-                aria-live="polite"
-                aria-relevant="additions"
-              >
+              <!--
+                不要在滚动容器上挂 role=log / aria-live：
+                Chromium 对 live region 的「滚入视口」会在流式追加时强拉到底，
+                与用户上滑阅读冲突。状态播报改由 turn-phase / toast 承担。
+              -->
+              <div class="chat-scroll" id="chat-scroll">
                 <div id="transcript" class="transcript"></div>
                 <div class="chat-scroll-spacer" id="chat-scroll-spacer" aria-hidden="true"></div>
               </div>
@@ -340,7 +338,6 @@
                     <div class="composer-toolbar">
                       <div class="composer-left">
                         <button type="button" class="icon-ghost sm" id="btn-attach-chat" data-i18n-title="composer.attach" title="添加" aria-haspopup="menu">+</button>
-                        <button type="button" class="icon-ghost sm" id="btn-slash-chat" data-i18n-title="composer.slash" title="命令 /（Ctrl+/）">/</button>
                         <button type="button" class="mode-chip" id="btn-perm-mode-2">
                           <span id="perm-label-2" data-i18n="composer.permFull">完全访问</span>
                           <span class="mode-chip-caret" aria-hidden="true">▾</span>
@@ -560,7 +557,8 @@
                   ></textarea>
                   <div class="plan-panel-preview prose hidden" id="plan-panel-preview"></div>
                 </div>
-                <div class="plan-panel-footer">
+                <!-- 方案 A：仅 exit_plan 挂起时由 JS 去掉 hidden -->
+                <div class="plan-panel-footer hidden" aria-hidden="true">
                   <textarea
                     id="plan-panel-feedback"
                     class="plan-panel-feedback"

@@ -5,7 +5,11 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-import { CLIENT_IDENTIFIER, readAppVersion } from "../src/host/app-version.js";
+import {
+  ACP_WIRE_CLIENT_IDENTIFIER,
+  CLIENT_IDENTIFIER,
+  readAppVersion,
+} from "../src/host/app-version.js";
 import {
   DEFAULT_IDLE_DETACH,
   pickLruDetachTargets,
@@ -122,8 +126,12 @@ afterEach(async () => {
 });
 
 describe("P1-A clientIdentifier + version", () => {
-  it("CLIENT_IDENTIFIER is grok-desktop", () => {
+  it("CLIENT_IDENTIFIER is grok-desktop (product id)", () => {
     expect(CLIENT_IDENTIFIER).toBe("grok-desktop");
+  });
+
+  it("ACP wire identity is grok-shell (official proxy compat)", () => {
+    expect(ACP_WIRE_CLIENT_IDENTIFIER).toBe("grok-shell");
   });
 
   it("readAppVersion matches package.json", () => {
@@ -156,10 +164,11 @@ describe("P1-A clientIdentifier + version", () => {
       clientInfo?: { name?: string; version?: string };
       _meta?: { clientIdentifier?: string; clientVersion?: string };
     };
-    expect(init.clientInfo?.name).toBe("grok-desktop");
+    expect(init.clientInfo?.name).toBe(ACP_WIRE_CLIENT_IDENTIFIER);
+    expect(init.clientInfo?.name).toBe("grok-shell");
     expect(init.clientInfo?.version).toBe(pkg.version);
     expect(init.clientInfo?.version).not.toBe("0.1.0");
-    expect(init._meta?.clientIdentifier).toBe("grok-desktop");
+    expect(init._meta?.clientIdentifier).toBe(ACP_WIRE_CLIENT_IDENTIFIER);
     expect(init._meta?.clientVersion).toBe(pkg.version);
   });
 

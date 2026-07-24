@@ -148,7 +148,7 @@ async function handleHostIpc(
         }),
       );
     case "system.auth.logout":
-      return resultOk(host.authLogout());
+      return resultOk(await host.authLogout());
     case "providers.list":
       return resultOk(host.providersList());
     case "providers.upsert":
@@ -667,6 +667,13 @@ async function handleHostIpc(
           maxBytes: typeof p.maxBytes === "number" ? p.maxBytes : undefined,
         }),
       );
+    case "history.btwLoad":
+      return resultOk(
+        host.historyBtwLoad(p.sessionId as string, {
+          maxEntries:
+            typeof p.maxEntries === "number" ? p.maxEntries : undefined,
+        }),
+      );
     case "session.context":
       return resultOk(host.sessionContext(p.sessionId as string));
     case "roster.list":
@@ -836,7 +843,7 @@ async function handleHostIpc(
     case "mcp.doctor":
       return resultOk(host.mcpDoctor(p.name as string | undefined));
     case "models.list":
-      return resultOk(host.modelsList());
+      return resultOk(await host.modelsList());
     case "graph.status":
       return resultOk(host.graphStatus(p.projectPath as string));
     case "graph.search":
@@ -1064,10 +1071,21 @@ async function createWindow(): Promise<void> {
   });
 
   // Close → hide while tray is active (do not destroy)
+  // 用户以为「退出」；实际进托盘。二次启动靠 single-instance handoff 唤起主窗。
   mainWindow.on("close", (e) => {
     if (!isQuitting && tray) {
       e.preventDefault();
       mainWindow?.hide();
+      try {
+        tray.displayBalloon?.({
+          title: "Grok Desktop",
+          content: isZhUi()
+            ? "仍在后台运行。点托盘图标可打开；彻底退出请用托盘菜单「退出」。"
+            : "Still running in the tray. Click the tray icon to open; use Quit to exit fully.",
+        });
+      } catch {
+        /* balloon optional */
+      }
     }
   });
 
@@ -1078,15 +1096,49 @@ async function createWindow(): Promise<void> {
   await mainWindow.loadFile(path.join(__dirname, "../renderer/index.html"));
 }
 
-/** Show main window, recreating if destroyed (tray Show / handoff). */
+/**
+ * Show main window, recreating if destroyed (tray Show / handoff / 二次启动).
+ * Windows 上 hide→show 后常需 restore + 置顶闪一下，否则用户感觉「闪一下又关了」
+ *（其实是次实例秒退，主实例窗口仍藏在托盘后）。
+ */
 async function showMainWindow(): Promise<BrowserWindow | null> {
   if (!windowAlive()) {
     await createWindow();
   }
   if (!windowAlive()) return null;
-  mainWindow!.show();
-  mainWindow!.focus();
-  return mainWindow;
+  const win = mainWindow!;
+  try {
+    if (win.isMinimized()) win.restore();
+  } catch {
+    /* ignore */
+  }
+  // 从托盘 hide 恢复：先 show，再抢焦点
+  if (!win.isVisible()) win.show();
+  try {
+    win.setSkipTaskbar(false);
+  } catch {
+    /* ignore */
+  }
+  win.show();
+  win.focus();
+  try {
+    app.focus({ steal: true });
+  } catch {
+    /* older Electron */
+  }
+  // Windows：短暂 topmost，避免被其它全屏窗挡住
+  if (process.platform === "win32") {
+    try {
+      win.setAlwaysOnTop(true, "screen-saver");
+      win.moveTop();
+      setTimeout(() => {
+        if (!win.isDestroyed()) win.setAlwaysOnTop(false);
+      }, 400);
+    } catch {
+      /* ignore */
+    }
+  }
+  return win;
 }
 
 function sendToRenderer(payload: unknown): void {
@@ -1239,10 +1291,12 @@ app.whenReady().then(async () => {
       process.argv.find(
         (a) => a.startsWith("grok://") || a.startsWith("grok-desktop://"),
       ) ?? "grok://focus";
-    await host.shellNotifyPrimary(deep);
+    // 给主实例 handoff 消费一点时间再退，避免用户只看到次实例闪一下
+    const ok = await host.shellNotifyPrimary(deep);
     console.log(
-      "Grok Desktop already running; handoff sent, exiting secondary",
+      `Grok Desktop already running; handoff sent (ok=${ok}), exiting secondary`,
     );
+    await new Promise((r) => setTimeout(r, 400));
     app.quit();
     return;
   }

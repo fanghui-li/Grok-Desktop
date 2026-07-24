@@ -232,7 +232,10 @@ export function authStatus(home?: string): {
   }
 }
 
-/** 清除 Desktop profile 登录态（不碰 CLI ~/.grok/auth.json） */
+/**
+ * 仅删 Desktop profile 的 auth.json（不碰 CLI ~/.grok/auth.json）。
+ * 主路径请走 Host `authLogout` → `grok logout`；本函数作 CLI 失败时的磁盘兜底。
+ */
 export function authLogout(home?: string): {
   cleared: boolean;
   authPath: string;

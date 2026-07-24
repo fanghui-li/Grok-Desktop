@@ -292,6 +292,16 @@ export const enUS: MessageDict = {
   "settings.deviceLogin": "Device code sign-in",
   "settings.desktopHome": "Desktop GROK_HOME",
   "settings.cliHome": "CLI home (read-only)",
+  "settings.defaultModelH2": "Default model",
+  "settings.defaultModelSub":
+    "Used for new sessions. Official models use OAuth; custom entries with base_url use their own API key (aligned with CLI /model and Settings).",
+  "settings.defaultModelPick": "Choose default model",
+  "settings.defaultModelOfficial": "Official",
+  "settings.defaultModelCustom": "Custom / relay",
+  "settings.defaultModelEmpty": "No models available",
+  "settings.defaultModelSetOk": "Default model set to {model}",
+  "settings.defaultModelSetFail": "Failed to set default model",
+  "settings.defaultModelCurrent": "Current default",
 
   "settings.providerUnnamed": "Unnamed provider",
   "settings.providerDefault": "Default",
@@ -441,6 +451,9 @@ export const enUS: MessageDict = {
   "model.customPh": "e.g. grok-4.5",
   "model.empty": "Model cannot be empty",
   "model.pick": "Choose model",
+  "model.groupOfficial": "Official",
+  "model.groupCustom": "Custom / relay",
+  "model.defaultPersisted": "Default model → {model} (saved to config)",
   "effort.low": "Low",
   "effort.medium": "Medium",
   "effort.high": "High",
@@ -457,6 +470,13 @@ export const enUS: MessageDict = {
     "Plan mode on (Pending): next message becomes Active",
   "plan.openedNew": "Plan mode on: will apply to new sessions",
   "plan.noSession": "No active session",
+  "plan.approvalRequired":
+    "Only available when the agent requests plan approval (exit plan mode). Edit or view the plan, then continue in chat.",
+  "plan.bgAwaiting":
+    "Session “{title}” is waiting for plan approval (switch back to approve)",
+  "plan.reopenedAwaiting":
+    "Restored a plan awaiting approval — review it in the side panel",
+  "plan.pleaseReview": "Review and approve the plan in the side panel",
   "plan.noPlanMd": "(no plan.md yet)",
   "plan.unsaved": "Unsaved",
   "plan.awaiting": "Awaiting approval",
@@ -609,7 +629,11 @@ export const enUS: MessageDict = {
   "chat.connectFail": "Could not connect session; send manually",
   "chat.sendFail": "Send failed",
   "chat.turnTimeout": "Turn timed out (agent idle too long). Try again or split the task.",
-  // Turn/API errors: friendly titles only, no action suggestions
+  // Turn/API errors: domain label · title (no action suggestions)
+  "err.domain.upstream": "Upstream",
+  "err.domain.config": "Account & config",
+  "err.domain.local": "Local session",
+  "err.domain.app": "App",
   "err.apiKeyInvalid": "Invalid API key",
   "err.unauthorized": "Unauthorized",
   "err.forbidden": "Access denied",
@@ -620,6 +644,7 @@ export const enUS: MessageDict = {
   "err.toolCallInvalid": "Tool call error",
   "err.timeout": "Request timed out",
   "err.network": "Network error",
+  "err.sessionDisconnected": "Session disconnected",
   "err.internal": "Internal error",
   "chat.turnEmpty": "Turn finished with no assistant reply. Check agent logs or retry.",
   "chat.turnToolsOnly": "Turn finished after tools ran, but no final reply text was streamed.",
@@ -940,8 +965,12 @@ export const enUS: MessageDict = {
   "prov.loginStarted":
     "Sign-in started; refresh this page when finished.",
   "prov.confirmLogout":
-    "Sign out of Desktop official account? Does not affect CLI or custom providers.",
+    "Sign out of Desktop official account? Connected sessions will detach (history kept). Does not affect CLI or custom providers.",
   "prov.logoutFail": "Sign-out failed",
+  "prov.logoutOk": "Signed out of official account",
+  "prov.logoutOkDetached":
+    "Signed out and detached {n} session(s) (history kept)",
+  "prov.logoutNone": "Not signed in to an official account",
 
   // ── auto-compact / context details ─────────────────────
   "chat.autoCompacted": "Context auto-compacted{detail}",
@@ -962,6 +991,10 @@ export const enUS: MessageDict = {
   "queue.more": "+{n} more…",
   "queue.clear": "Clear",
   "queue.remove": "Remove from queue",
+  "queue.interject": "Interject",
+  "queue.interjectTitle": "Inject into the current turn (does not cancel it)",
+  "queue.sendNow": "Send now",
+  "queue.sendNowTitle": "Cancel the current turn and send this message now",
   "queue.moveUp": "Move up",
   "queue.moveDown": "Move down",
   "queue.edit": "Edit",
@@ -1040,6 +1073,10 @@ export const enUS: MessageDict = {
   "btw.fail": "Side question failed",
   "btw.ok": "Side question done",
   "btw.empty": "Enter a side question",
+  "btw.needSession":
+    "Side questions need a chat. Create or open a session first.",
+  "btw.connectFail":
+    "This session isn’t connected. Send a message in the main chat or reconnect, then try again.",
   "btw.dismiss": "Dismiss",
   "btw.composerHint": "Continue in the side Q&A panel",
   "btw.sideOpened": "Side Q&A panel opened",
@@ -1050,6 +1087,8 @@ export const enUS: MessageDict = {
   "btw.modelReadonlyTitle": "Same as main session: {model}",
   "btw.sideBarHint": "Doesn’t interrupt the current turn",
   "btw.send": "Send side question",
+  "btw.stop": "Stop side question",
+  "btw.stopped": "Side question stopped",
   "btw.clearThread": "Clear side thread",
   "btw.cleared": "Side thread cleared",
   "btw.inFlight": "Side question in progress…",
@@ -1061,8 +1100,9 @@ export const enUS: MessageDict = {
   "interject.tag": "Interject",
   "interject.needTurn": "Interject only works while a turn is running",
   "interject.empty": "Enter text to inject into the current turn",
-  "interject.sent": "Injected into current turn",
-  "interject.ok": "Interjection delivered",
+  "interject.sent": "Interjection queued; applies at the next safe point in this turn",
+  "interject.ok":
+    "Interjection queued — applies at the next safe point (does not stop current output)",
   "interject.fail": "Failed to send interjection",
   "interject.cancelling": "Turn is stopping; try interject again after it settles",
   "interject.inFlight": "Interjection in flight…",

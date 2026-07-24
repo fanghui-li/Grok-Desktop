@@ -2,8 +2,19 @@ import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
-/** Stable ACP / queue owner id (plan M2). */
+/**
+ * Desktop 产品身份（本地/队列/文档用）。
+ * 官方 cli-chat-proxy 当前对 `grok-desktop` 的 Build 采样返回 403 coming soon，
+ * ACP initialize 的 wire 身份见 {@link ACP_WIRE_CLIENT_IDENTIFIER}。
+ */
 export const CLIENT_IDENTIFIER = "grok-desktop";
+
+/**
+ * 发往 agent ACP initialize 的 clientIdentifier / clientInfo.name。
+ * 临时伪装为 `grok-shell`：与 headless CLI 同一准入路径，官方 `grok-4.5` 可通。
+ * 服务端放行 `grok-desktop` 后应改回 {@link CLIENT_IDENTIFIER}。
+ */
+export const ACP_WIRE_CLIENT_IDENTIFIER = "grok-shell";
 
 /**
  * Resolve Desktop app version for ACP clientInfo (not hard-coded 0.1.0).

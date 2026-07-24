@@ -34,11 +34,14 @@ export function renderQueueItemRowHtml(
       : q.status === "sending"
         ? `<span class="prompt-queue-st sending">…</span>`
         : "";
+  const busyDis = q.status === "sending" ? " disabled" : "";
   return `<li class="prompt-queue-item" data-qid="${escHtml(q.id)}">
     <span class="prompt-queue-idx">${index + 1}</span>
     ${st}
     <span class="prompt-queue-text" title="${escHtml(q.content || q.display)}">${escHtml(preview)}</span>
     <span class="prompt-queue-actions">
+      <button type="button" class="prompt-queue-act prompt-queue-act--text" data-queue-interject="${escHtml(q.id)}" title="${escHtml(tr("queue.interjectTitle"))}"${busyDis}>${escHtml(tr("queue.interject"))}</button>
+      <button type="button" class="prompt-queue-act prompt-queue-act--text" data-queue-send-now="${escHtml(q.id)}" title="${escHtml(tr("queue.sendNowTitle"))}"${busyDis}>${escHtml(tr("queue.sendNow"))}</button>
       <button type="button" class="prompt-queue-act" data-queue-up="${escHtml(q.id)}" title="${escHtml(tr("queue.moveUp"))}"${upDis}>↑</button>
       <button type="button" class="prompt-queue-act" data-queue-down="${escHtml(q.id)}" title="${escHtml(tr("queue.moveDown"))}"${downDis}>↓</button>
       <button type="button" class="prompt-queue-act" data-queue-edit="${escHtml(q.id)}" title="${escHtml(tr("queue.edit"))}">✎</button>

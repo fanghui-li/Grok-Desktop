@@ -25,7 +25,7 @@ import type {
   ThreadsCreateResult,
   WorktreeInfo,
 } from "../shared/types.js";
-import { spawn, spawnSync } from "node:child_process";
+import { spawn } from "node:child_process";
 import { AcpClient } from "./acp-client.js";
 import { AutomationStore } from "./automations.js";
 import {
@@ -75,6 +75,7 @@ import {
   type GrokCliRunner,
 } from "./cli-plugins.js";
 import { COMPAT_DISABLED_ENV } from "./compat.js";
+import { loadBtwHistory } from "./btw-history.js";
 import {
   applyAgentGoalProjection,
   clearGoal,
@@ -386,6 +387,7 @@ export class DesktopHost {
       windowsHide: false,
     });
     child.unref();
+    this.invalidateModelsListCache();
     this.logger.info("auth.login_started", { method, grokHome, pid: child.pid });
     return {
       started: true,
@@ -398,9 +400,117 @@ export class DesktopHost {
     };
   }
 
-  authLogout() {
-    const res = authLogout(this.home);
-    this.logger.info("auth.logout", res);
+  /**
+   * 对齐 CLI `grok logout`：`GROK_HOME=~/.grok-desktop grok logout`
+   * - 不碰 CLI `~/.grok/auth.json`
+   * - 成功后 detach 所有 live agent，避免内存中仍握 OAuth token
+   * - CLI 失败或 binary 缺失时回落为删除 Desktop auth.json
+   * - CLI 用异步 spawn（禁止 spawnSync 堵主进程，否则设置关页后输入框无法聚焦）
+   */
+  async authLogout(): Promise<{
+    cleared: boolean;
+    wasLoggedIn: boolean;
+    authPath: string;
+    method: "cli" | "file" | "none";
+    detachedThreadIds: string[];
+    message: string;
+    cliOutput?: string;
+  }> {
+    const before = authStatus(this.home);
+    const wasLoggedIn = Boolean(before.authenticated);
+    const authPath =
+      before.authPath ?? path.join(grokHomeDir(this.home), "auth.json");
+    const info = this.grokInfo();
+    let method: "cli" | "file" | "none" = "none";
+    let cliOutput = "";
+
+    if (info.path) {
+      try {
+        const r = await this.runGrokCliAsync(info.path, ["logout"], 20_000);
+        cliOutput = `${r.stdout}\n${r.stderr}`.trim();
+        const cliOk = r.error == null && r.status === 0;
+        if (cliOk) method = "cli";
+        this.logger.info("auth.logout_cli", {
+          status: r.status,
+          signal: r.signal,
+          error: r.error,
+          output: cliOutput.slice(0, 500),
+        });
+      } catch (err) {
+        this.logger.warn("auth.logout_cli_failed", { err: String(err) });
+      }
+    } else {
+      this.logger.warn("auth.logout_no_binary", {});
+    }
+
+    // CLI 应已清盘；若 auth.json / lock 仍在则 Host 兜底删除（degraded）
+    const stillOnDisk =
+      fs.existsSync(authPath) || fs.existsSync(`${authPath}.lock`);
+    let fileCleared = false;
+    if (stillOnDisk) {
+      const fb = authLogout(this.home);
+      fileCleared = fb.cleared;
+      if (fileCleared && method !== "cli") method = "file";
+      if (fileCleared) {
+        this.logger.info("auth.logout_file_fallback", {
+          authPath,
+          afterCli: method === "cli",
+        });
+      }
+    }
+
+    const after = authStatus(this.home);
+    const cleared = wasLoggedIn && !after.authenticated;
+
+    // 有过 Desktop 登录态（或刚清掉文件）则 detach live，避免旧 token 继续推理
+    const detachedThreadIds: string[] = [];
+    if (wasLoggedIn || fileCleared || method === "cli") {
+      for (const tid of [...this.threads.keys()]) {
+        const live = this.threads.get(tid);
+        if (!live?.client) continue;
+        try {
+          await this.threadsDetach(tid);
+          detachedThreadIds.push(tid);
+        } catch (err) {
+          this.logger.warn("auth.logout_detach_failed", {
+            threadId: tid,
+            err: String(err),
+          });
+        }
+      }
+    }
+
+    this.invalidateModelsListCache();
+
+    let message: string;
+    if (!wasLoggedIn && !fileCleared && method === "none") {
+      message = "当前未登录官方账户（Desktop profile 无 session）";
+    } else if (!wasLoggedIn && method === "cli" && !fileCleared) {
+      message = "无缓存 session 可退出（与 grok logout 一致）";
+    } else if (detachedThreadIds.length > 0) {
+      message = `已退出 Desktop 官方登录，并断开 ${detachedThreadIds.length} 个会话连接（历史仍保留）`;
+    } else {
+      message =
+        method === "file"
+          ? "已退出 Desktop 官方登录（文件兜底；未走完整 CLI 副作用）"
+          : "已退出 Desktop 官方登录";
+    }
+
+    const res = {
+      cleared: cleared || fileCleared,
+      wasLoggedIn,
+      authPath,
+      method,
+      detachedThreadIds,
+      message,
+      cliOutput: cliOutput || undefined,
+    };
+    this.logger.info("auth.logout", {
+      cleared: res.cleared,
+      wasLoggedIn,
+      method,
+      detached: detachedThreadIds.length,
+    });
     return res;
   }
 
@@ -410,7 +520,7 @@ export class DesktopHost {
 
   providersUpsert(input: UpsertProviderInput) {
     const res = upsertCustomProvider(input, this.home);
-    this.modelsListCache = null;
+    this.invalidateModelsListCache();
     this.logger.info("providers.upsert", { id: input.id });
     return res;
   }
@@ -418,31 +528,37 @@ export class DesktopHost {
   providersRemove(id: string) {
     const res = removeCustomProvider(id, this.home);
     // 模型目录已变，作废缓存
-    this.modelsListCache = null;
+    this.invalidateModelsListCache();
     const sid = (id ?? "").trim().toLowerCase();
-    const fallback = (res.defaultModel ?? "grok").trim() || "grok";
+    // 回退须在当前可见 catalog 内（未登录时不会落到官方幽灵 id）
+    const fallback =
+      this.resolveAvailableModel(res.defaultModel) || this.defaultModelId();
     // 磁盘 meta：会话仍记着已删 provider id → 改回默认（对齐 CLI reselect）
-    const remapped = this.threadMeta.remapModels(
-      (m) => m.trim().toLowerCase() === sid,
-      fallback,
-    );
-    // 内存 live 线程同步
-    for (const live of this.threads.values()) {
-      const m = live.thread.model?.trim();
-      if (m && m.toLowerCase() === sid) {
-        live.thread.model = fallback;
+    let remappedSessions = 0;
+    if (fallback) {
+      const remapped = this.threadMeta.remapModels(
+        (m) => m.trim().toLowerCase() === sid,
+        fallback,
+      );
+      remappedSessions = remapped.updated;
+      // 内存 live 线程同步
+      for (const live of this.threads.values()) {
+        const m = live.thread.model?.trim();
+        if (m && m.toLowerCase() === sid) {
+          live.thread.model = fallback;
+        }
       }
     }
     this.logger.info("providers.remove", {
       id,
-      fallback,
-      remappedSessions: remapped.updated,
+      fallback: fallback || null,
+      remappedSessions,
     });
-    return { ...res, remappedSessions: remapped.updated };
+    return { ...res, remappedSessions };
   }
 
   providersSetDefault(modelId: string) {
-    this.modelsListCache = null;
+    this.invalidateModelsListCache();
     return setDefaultModelId(modelId, this.home);
   }
 
@@ -1869,21 +1985,110 @@ export class DesktopHost {
 
   /**
    * `/btw` 旁路侧问（`_x.ai/btw`）：不打断 turn、不进主对话。
+   *
+   * Desktop 注意：agent 的 btw 会快照**父会话**全文再采样。主 turn 正在讲
+   * 「解释操作系统」时，短问「今天日期」常被上下文带偏（落盘 btw_history 已是
+   * 错答，非 UI 串线）。CLI 同场景正常时，Desktop 在 busy 下改走**独立短会话**
+   * 侧问（不改 agent 源码），idle 仍走父会话以保留上下文侧问能力。
    */
   async threadsBtw(
     threadId: string,
     question: string,
   ): Promise<{ sessionId: string; answer: string }> {
     const live = this.requireWritable(threadId);
-    const answer = await live.client!.sideQuestion(question);
+    const q = question.trim();
+    if (!q) {
+      throw new HostError("INVALID_ARGUMENT", "btw question is empty");
+    }
+    const parentSessionId = live.thread.sessionId;
+    // 主 turn 进行中：父会话 btw 快照含未完成 OS 长文等，短问易被带偏；
+    // 且与主采样并发时 Desktop 上复现率高。独立进程侧问避开两者。
+    const busy =
+      live.client!.isPromptInFlight() || live.thread.status === "working";
+    const answer = busy
+      ? await this.sideQuestionIsolated(live, q)
+      : await live.client!.sideQuestion(q);
     live.thread.updatedAt = new Date().toISOString();
     this.logger.info("threads.btw", {
       threadId,
-      sessionId: live.thread.sessionId,
-      qLen: question.trim().length,
+      sessionId: parentSessionId,
+      qLen: q.length,
       aLen: answer.length,
+      isolated: busy,
+      qPreview: q.slice(0, 48),
+      aPreview: answer.replace(/\s+/g, " ").slice(0, 96),
     });
-    return { sessionId: live.thread.sessionId, answer };
+    return { sessionId: parentSessionId, answer };
+  }
+
+  /**
+   * 主 turn busy 时：另起一个 agent stdio + session/new，只发侧问，避免父会话
+   * 对话快照劫持答案。用完即关，不写主会话 chat_history。
+   */
+  private async sideQuestionIsolated(
+    live: LiveThread,
+    question: string,
+  ): Promise<string> {
+    const info = this.grokInfo();
+    if (!info.path) {
+      throw new HostError("BINARY_NOT_FOUND", "grok binary not found");
+    }
+    const cwd = live.thread.cwd || process.cwd();
+    const modelId = (live.thread.model ?? "").trim();
+    const effort = live.thread.effort;
+    const ephemeralThreadId = `btw_iso_${randomUUID()}`;
+    const client = new AcpClient({
+      command: info.path,
+      args: this.agentArgs,
+      cwd,
+      env: this.env,
+      logger: this.logger,
+      threadId: ephemeralThreadId,
+      allowFs: false,
+      onEvent: () => {
+        /* 隔离侧问：不把 ephemeral 事件投到主 UI */
+      },
+    });
+    try {
+      await client.start();
+      await client.createSession({
+        cwd,
+        meta: {
+          // 轻量旁路：不要把主会话计划/权限模式带进隔离会话
+          title: "desktop-btw-isolated",
+        },
+      });
+      if (modelId) {
+        try {
+          await client.setModel(modelId, {
+            effort:
+              effort && ["low", "medium", "high", "xhigh"].includes(effort)
+                ? effort
+                : undefined,
+          });
+        } catch (err) {
+          this.logger.warn("threads.btw_isolated_set_model_failed", {
+            modelId,
+            err: err instanceof Error ? err.message : String(err),
+          });
+        }
+      }
+      // 无父上下文时模型更易跟问；再加一句约束，避免沿用 system 默认「继续任务」口吻
+      const framed =
+        `【旁路侧问 · 与主对话任务无关】请只根据下面问题直接作答，` +
+        `不要复述或续写任何其它话题。\n\n${question}`;
+      const answer = await client.sideQuestion(framed);
+      this.logger.info("threads.btw_isolated", {
+        parentSessionId: live.thread.sessionId,
+        ephemeralSessionId: client.attachedSessionId,
+        modelId: modelId || undefined,
+        qLen: question.length,
+        aLen: answer.length,
+      });
+      return answer;
+    } finally {
+      await client.close().catch(() => undefined);
+    }
   }
 
   /**
@@ -1998,6 +2203,14 @@ export class DesktopHost {
     opts?: import("../shared/types.js").HistoryLoadOptions,
   ): HistoryPage {
     return loadChatHistory(sessionId, this.home, opts);
+  }
+
+  /** 会话目录 btw_history.jsonl（旁路侧问落盘；与 chat_history 分离） */
+  historyBtwLoad(
+    sessionId: string,
+    opts?: { maxEntries?: number },
+  ): ReturnType<typeof loadBtwHistory> {
+    return loadBtwHistory(sessionId, this.home, opts);
   }
 
   findSessionDir(sessionId: string): string | null {
@@ -2706,26 +2919,126 @@ export class DesktopHost {
     return mcpDoctorCli(this.requireGrokCli(), name);
   }
 
-  /** `grok models` 结果缓存，避免每次点 chip 都 spawn */
-  private modelsListCache: { at: number; list: ModelInfo[] } | null = null;
+  /**
+   * `grok models` 结果缓存。
+   * `authenticated` 参与键：登出/登录后不得继续吐出旧的官方目录。
+   */
+  private modelsListCache: {
+    at: number;
+    list: ModelInfo[];
+    authenticated: boolean;
+  } | null = null;
 
-  /** 当前全局默认模型 id（config / grok models / 内置） */
-  defaultModelId(): string {
-    const fromToml = listCustomProviders(this.home).defaultModel?.trim();
-    if (fromToml) return fromToml;
-    const list = this.modelsList();
-    const hit = list.find((m) => m.isDefault)?.id?.trim();
-    if (hit) return hit;
-    return list[0]?.id?.trim() || "grok";
+  /**
+   * 进行中的异步拉目录（单飞）。
+   * `gen` 与 `modelsListGeneration` 对齐；invalidate 后旧 flight 不可再被 join。
+   */
+  private modelsListInFlight: {
+    gen: number;
+    promise: Promise<ModelInfo[]>;
+  } | null = null;
+
+  /**
+   * 目录世代：invalidate 时自增；in-flight 完成时若世代变了则丢弃写回，
+   * 避免 logout 与 models.list 竞态把官方幽灵表写回 cache。
+   */
+  private modelsListGeneration = 0;
+
+  /** 作废模型目录缓存（登录/登出/提供商变更） */
+  private invalidateModelsListCache(): void {
+    this.modelsListCache = null;
+    this.modelsListGeneration += 1;
+    // 不取消子进程；仅丢弃其写回 / 禁止 join（见 modelsList）
   }
 
-  /** 模型 id 是否仍在 catalog / 自定义提供商配置中 */
+  /**
+   * 异步跑 grok CLI 子进程（stdout/stderr 文本）。
+   * 禁止在 ipcMain 路径用 spawnSync，否则会堵 Electron 主进程 → 输入框无法聚焦。
+   */
+  private runGrokCliAsync(
+    binary: string,
+    args: string[],
+    timeoutMs: number,
+  ): Promise<{
+    status: number | null;
+    signal: NodeJS.Signals | null;
+    stdout: string;
+    stderr: string;
+    error?: string;
+  }> {
+    return new Promise((resolve) => {
+      let stdout = "";
+      let stderr = "";
+      let settled = false;
+      const child = spawn(binary, args, {
+        env: this.env as NodeJS.ProcessEnv,
+        windowsHide: true,
+        stdio: ["ignore", "pipe", "pipe"],
+      });
+      const timer = setTimeout(() => {
+        if (settled) return;
+        try {
+          child.kill();
+        } catch {
+          /* ignore */
+        }
+        settled = true;
+        resolve({
+          status: null,
+          signal: "SIGTERM",
+          stdout,
+          stderr,
+          error: `timeout after ${timeoutMs}ms`,
+        });
+      }, timeoutMs);
+      child.stdout?.setEncoding("utf8");
+      child.stderr?.setEncoding("utf8");
+      child.stdout?.on("data", (chunk: string) => {
+        stdout += chunk;
+      });
+      child.stderr?.on("data", (chunk: string) => {
+        stderr += chunk;
+      });
+      child.on("error", (err) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        resolve({
+          status: null,
+          signal: null,
+          stdout,
+          stderr,
+          error: String(err),
+        });
+      });
+      child.on("close", (status, signal) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        resolve({ status, signal, stdout, stderr });
+      });
+    });
+  }
+
+  /** 当前全局默认模型 id（必须在当前可见 catalog 内） */
+  defaultModelId(): string {
+    const list = this.modelsListSync();
+    const fromToml = listCustomProviders(this.home).defaultModel?.trim();
+    // config 默认仅当仍在可见列表中才采用（未登录时官方 default 不可用）
+    if (fromToml && list.some((m) => m.id === fromToml)) return fromToml;
+    const hit = list.find((m) => m.isDefault)?.id?.trim();
+    if (hit) return hit;
+    // 无可用模型时返回空串（勿回落幽灵官方 id）
+    return list[0]?.id?.trim() || "";
+  }
+
+  /** 模型 id 是否仍在当前可见 catalog（含自定义提供商） */
   isModelAvailable(modelId: string | undefined | null): boolean {
     const id = (modelId ?? "").trim();
     if (!id) return false;
-    const list = this.modelsList();
+    const list = this.modelsListSync();
     if (list.some((m) => m.id === id)) return true;
-    // grok models 偶发漏列时：config 里仍有该 [model.id] 也算可用
+    // 自定义提供商：未登录时仍可用（与 list 合并逻辑一致）
     try {
       const { providers } = listCustomProviders(this.home);
       if (providers.some((p) => p.id === id)) return true;
@@ -2745,33 +3058,127 @@ export class DesktopHost {
     return this.defaultModelId();
   }
 
-  /** 列出可用模型（`grok models`；失败时回退内置表；默认缓存 5 分钟） */
-  modelsList(opts?: { force?: boolean }): ModelInfo[] {
+  /**
+   * 同步读模型目录：仅用缓存 + 自定义提供商，**绝不** spawnSync。
+   * 供 roster / attach 等热路径；官方表以最近一次异步 modelsList 为准。
+   */
+  modelsListSync(): ModelInfo[] {
+    const authenticated = Boolean(authStatus(this.home).authenticated);
     const ttlMs = 5 * 60_000;
     if (
-      !opts?.force &&
       this.modelsListCache &&
+      this.modelsListCache.authenticated === authenticated &&
       Date.now() - this.modelsListCache.at < ttlMs
     ) {
       return this.modelsListCache.list;
     }
-    const list = this.modelsListUncached();
-    // 合并自定义提供商 + 用 config 覆盖展示名（对齐 CLI：name ?? model ?? id）
+    // 缓存失效/登录态变了：立刻只返回自定义（不堵主进程）；后台补拉官方
+    const list = this.mergeModelsCatalog([], authenticated);
+    // 不写入长期 cache（避免把「仅自定义」当成完整目录缓存 5 分钟）
+    // 但若从未有过 cache，短暂可用；并触发异步刷新
+    if (
+      !this.modelsListInFlight ||
+      this.modelsListInFlight.gen !== this.modelsListGeneration
+    ) {
+      void this.modelsList({ force: true }).catch(() => undefined);
+    }
+    return list;
+  }
+
+  /**
+   * 列出可用模型（`grok models` + config 自定义；默认缓存 5 分钟）。
+   * - 真源：CLI 输出 + `[model.*]` base_url 提供商；**无硬编码幽灵官方表**
+   * - 未官方登录：隐藏 `source=official`，只保留自定义中转
+   * - CLI 异步 spawn；同世代并发单飞；invalidate 后不 join 旧 flight
+   */
+  async modelsList(opts?: { force?: boolean }): Promise<ModelInfo[]> {
+    const authenticated = Boolean(authStatus(this.home).authenticated);
+    const ttlMs = 5 * 60_000;
+    if (
+      !opts?.force &&
+      this.modelsListCache &&
+      this.modelsListCache.authenticated === authenticated &&
+      Date.now() - this.modelsListCache.at < ttlMs
+    ) {
+      return this.modelsListCache.list;
+    }
+
+    const flight = this.modelsListInFlight;
+    if (flight && flight.gen === this.modelsListGeneration) {
+      // 同世代：join 单飞（含 force 连打）
+      return flight.promise;
+    }
+    if (flight && flight.gen !== this.modelsListGeneration) {
+      // 世代已变：等旧进程结束（不采用其 cache 写回），再开新一轮
+      try {
+        await flight.promise;
+      } catch {
+        /* ignore */
+      }
+      // 旧 finally 可能已清 inFlight；再检查一次缓存
+      if (
+        !opts?.force &&
+        this.modelsListCache &&
+        this.modelsListCache.authenticated ===
+          Boolean(authStatus(this.home).authenticated) &&
+        Date.now() - this.modelsListCache.at < ttlMs
+      ) {
+        return this.modelsListCache.list;
+      }
+      if (
+        this.modelsListInFlight &&
+        this.modelsListInFlight.gen === this.modelsListGeneration
+      ) {
+        return this.modelsListInFlight.promise;
+      }
+    }
+
+    const gen = this.modelsListGeneration;
+    const promise = (async () => {
+      const cliModels = await this.modelsListUncachedAsync();
+      // 完成时再读登录态：logout 可能与拉目录并发，避免写回官方幽灵表
+      const authNow = Boolean(authStatus(this.home).authenticated);
+      const list = this.mergeModelsCatalog(cliModels, authNow);
+      if (gen === this.modelsListGeneration) {
+        this.modelsListCache = {
+          at: Date.now(),
+          list,
+          authenticated: authNow,
+        };
+      }
+      return list;
+    })().finally(() => {
+      if (this.modelsListInFlight?.promise === promise) {
+        this.modelsListInFlight = null;
+      }
+    });
+    this.modelsListInFlight = { gen, promise };
+    return promise;
+  }
+
+  /**
+   * 合并 CLI 官方表 + config 自定义提供商；按登录态过滤 official。
+   */
+  private mergeModelsCatalog(
+    cliModels: ModelInfo[],
+    authenticated: boolean,
+  ): ModelInfo[] {
+    const list: ModelInfo[] = cliModels.map((m) => ({ ...m }));
     try {
       const { providers, defaultModel } = listCustomProviders(this.home);
+      const customIds = new Set(providers.map((p) => p.id));
       const names = modelDisplayNamesFromConfig(this.home);
       for (const p of providers) {
-        const display =
-          (p.name || p.model || p.id).trim() || p.id;
+        const display = (p.name || p.model || p.id).trim() || p.id;
         const hit = list.find((m) => m.id === p.id);
         if (hit) {
           hit.name = display;
-          if (defaultModel === p.id) hit.isDefault = true;
+          hit.source = "custom";
         } else {
           list.push({
             id: p.id,
             name: display,
-            isDefault: defaultModel === p.id,
+            source: "custom",
           });
         }
       }
@@ -2779,33 +3186,68 @@ export class DesktopHost {
       for (const [id, display] of names) {
         const hit = list.find((m) => m.id === id);
         if (hit) {
-          // 自定义提供商已用 p.name 写过；此处补全仅 name/model 的段
           if (!hit.name || hit.name === hit.id) hit.name = display;
         }
       }
+      for (const m of list) {
+        m.source = customIds.has(m.id) ? "custom" : "official";
+      }
+
+      // 未官方登录：不展示官方模型（避免 slug 幽灵 + 误以为 OAuth 仍可用）
+      if (!authenticated) {
+        for (let i = list.length - 1; i >= 0; i--) {
+          if (list[i].source !== "custom") list.splice(i, 1);
+        }
+      }
+
+      // config `[models].default` 统一 isDefault；若 default 已被滤掉则改标首项
+      if (defaultModel && list.some((m) => m.id === defaultModel)) {
+        for (const m of list) m.isDefault = m.id === defaultModel;
+      } else if (list.length) {
+        for (const m of list) m.isDefault = false;
+        list[0].isDefault = true;
+      }
+
+      // 仅当 default 仍「可见」时补行：自定义始终可补；官方仅登录后可补
+      if (defaultModel && !list.some((m) => m.id === defaultModel)) {
+        const isCustom = customIds.has(defaultModel);
+        if (isCustom || authenticated) {
+          list.unshift({
+            id: defaultModel,
+            name: names.get(defaultModel) || defaultModel,
+            isDefault: true,
+            source: isCustom ? "custom" : "official",
+          });
+          for (let i = 1; i < list.length; i++) list[i].isDefault = false;
+        }
+      }
     } catch {
-      /* ignore */
+      for (const m of list) {
+        if (!m.source) m.source = "official";
+      }
+      if (!authenticated) {
+        for (let i = list.length - 1; i >= 0; i--) {
+          if (list[i].source !== "custom") list.splice(i, 1);
+        }
+      }
     }
-    this.modelsListCache = { at: Date.now(), list };
     return list;
   }
 
-  private modelsListUncached(): ModelInfo[] {
-    const fallback: ModelInfo[] = [
-      { id: "grok-4.5", name: "grok-4.5", isDefault: true },
-      { id: "grok-composer-2.5-fast", name: "grok-composer-2.5-fast" },
-      { id: "grok-build", name: "grok-build" },
-    ];
+  /**
+   * 异步解析 `grok models`。失败时返回空表（再由 merge 并入自定义提供商），
+   * **禁止**硬编码官方模型表冒充 catalog。
+   */
+  private async modelsListUncachedAsync(): Promise<ModelInfo[]> {
     const info = this.grokInfo();
-    if (!info.path) return fallback;
+    if (!info.path) return [];
     try {
-      const r = spawnSync(info.path, ["models"], {
-        encoding: "utf8",
-        timeout: 12_000,
-        env: this.env as NodeJS.ProcessEnv,
-        windowsHide: true,
-      });
-      const out = `${r.stdout ?? ""}\n${r.stderr ?? ""}`;
+      const r = await this.runGrokCliAsync(info.path, ["models"], 12_000);
+      if (r.error) {
+        this.logger.warn("models.list_cli_failed", { error: r.error });
+        return [];
+      }
+      const out = `${r.stdout}\n${r.stderr}`;
       const models: ModelInfo[] = [];
       let defaultId: string | undefined;
       for (const line of out.split(/\r?\n/)) {
@@ -2819,18 +3261,18 @@ export class DesktopHost {
           models.push({
             id,
             name: id,
+            // 初标 official；mergeModelsCatalog 会按 base_url 提供商改写为 custom
+            source: "official",
             isDefault:
               Boolean(defaultId && id === defaultId) ||
               /\(default\)/i.test(line),
           });
         }
       }
-      if (defaultId && !models.some((x) => x.id === defaultId)) {
-        models.unshift({ id: defaultId, name: defaultId, isDefault: true });
-      }
-      return models.length ? models : fallback;
-    } catch {
-      return fallback;
+      return models;
+    } catch (err) {
+      this.logger.warn("models.list_cli_exception", { err: String(err) });
+      return [];
     }
   }
 

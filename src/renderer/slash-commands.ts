@@ -84,6 +84,8 @@ export function getStaticSlashCommands(): SlashCommandDef[] {
       description: tr("slash.planDesc"),
       keywords: "plan 计划",
       icon: "≡",
+      // 主入口：权限 chip「计划模式」
+      paletteHidden: true,
       action: { kind: "set-perm", mode: "plan" },
     },
     {
@@ -92,6 +94,8 @@ export function getStaticSlashCommands(): SlashCommandDef[] {
       description: tr("slash.viewPlanDesc"),
       keywords: "view-plan show-plan plan-view",
       icon: "☰",
+      // 主入口：侧栏计划面板
+      paletteHidden: true,
       action: { kind: "view-plan" },
     },
     {
@@ -108,6 +112,8 @@ export function getStaticSlashCommands(): SlashCommandDef[] {
       description: tr("slash.goalStatusDesc"),
       keywords: "goal status",
       icon: "ⓘ",
+      // 主入口：goal banner
+      paletteHidden: true,
       action: { kind: "goal", sub: "status" },
     },
     {
@@ -116,6 +122,8 @@ export function getStaticSlashCommands(): SlashCommandDef[] {
       description: tr("slash.goalClearDesc"),
       keywords: "goal clear",
       icon: "✕",
+      // 主入口：goal banner / chip ×
+      paletteHidden: true,
       action: { kind: "goal", sub: "clear" },
     },
     {
@@ -124,6 +132,8 @@ export function getStaticSlashCommands(): SlashCommandDef[] {
       description: tr("slash.goalPauseDesc"),
       keywords: "goal pause 暂停",
       icon: "⏸",
+      // 主入口：goal banner
+      paletteHidden: true,
       action: { kind: "goal", sub: "pause" },
     },
     {
@@ -132,6 +142,8 @@ export function getStaticSlashCommands(): SlashCommandDef[] {
       description: tr("slash.goalResumeDesc"),
       keywords: "goal resume 恢复",
       icon: "▶",
+      // 主入口：goal banner
+      paletteHidden: true,
       action: { kind: "goal", sub: "resume" },
     },
     {
@@ -148,6 +160,8 @@ export function getStaticSlashCommands(): SlashCommandDef[] {
       description: tr("slash.modelDesc"),
       keywords: "model 模型",
       icon: "◇",
+      // 主入口：输入栏模型菜单
+      paletteHidden: true,
       action: { kind: "open-model-menu" },
     },
     {
@@ -156,6 +170,8 @@ export function getStaticSlashCommands(): SlashCommandDef[] {
       description: tr("slash.effortDesc"),
       keywords: "effort reasoning low medium high xhigh",
       icon: "◎",
+      // 主入口：输入栏模型菜单内推理档
+      paletteHidden: true,
       action: { kind: "set-effort" },
     },
     {
@@ -172,6 +188,8 @@ export function getStaticSlashCommands(): SlashCommandDef[] {
       description: tr("slash.contextDesc"),
       keywords: "context tokens window compact",
       icon: "▣",
+      // 主入口：角上 context chip
+      paletteHidden: true,
       action: { kind: "show-context" },
     },
     {
@@ -212,6 +230,8 @@ export function getStaticSlashCommands(): SlashCommandDef[] {
       description: tr("slash.queueDesc"),
       keywords: "queue follow-up 排队 队列",
       icon: "☰",
+      // 主入口：输入框上方排队条
+      paletteHidden: true,
       action: { kind: "show-queue" },
     },
     {
@@ -220,6 +240,8 @@ export function getStaticSlashCommands(): SlashCommandDef[] {
       description: tr("slash.queueClearDesc"),
       keywords: "queue clear 清空队列",
       icon: "✕",
+      // 主入口：排队条操作
+      paletteHidden: true,
       action: { kind: "clear-queue" },
     },
     {
@@ -236,6 +258,8 @@ export function getStaticSlashCommands(): SlashCommandDef[] {
       description: tr("slash.interjectDesc"),
       keywords: "interject steer 插话 中途 打断",
       icon: "⚡",
+      // 主入口：排队条「插话」/ 行内 /interject；不占默认命令中心列表
+      paletteHidden: true,
       action: { kind: "interject" },
     },
     {
@@ -252,6 +276,8 @@ export function getStaticSlashCommands(): SlashCommandDef[] {
       description: tr("slash.historyDesc"),
       keywords: "history prompt 历史 输入 召回",
       icon: "◷",
+      // 主入口：↑ 召回；手输 /history 仍可；不占默认命令中心列表
+      paletteHidden: true,
       action: { kind: "show-prompt-history" },
     },
     {
@@ -320,7 +346,7 @@ export function filterSlashCommands(
 ): SlashCommandDef[] {
   const q = query.trim().toLowerCase();
   if (!q) {
-    // 默认列表：隐藏 paletteHidden（如 /always-approve，主入口是权限 chip）
+    // 默认列表：隐藏 paletteHidden（主入口在 chip / 侧栏 / banner 的会话命令）
     return commands.filter((c) => !c.paletteHidden);
   }
   return commands.filter((c) => {
