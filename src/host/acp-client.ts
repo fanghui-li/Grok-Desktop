@@ -400,10 +400,25 @@ export class AcpClient {
     });
   }
 
-  async prompt(text: string): Promise<{ stopReason?: string }> {
+  /**
+   * 发送 session/prompt。
+   * - string：纯文本（兼容旧路径）
+   * - blocks：ACP ContentBlock 数组（图 = type:image + data + mimeType）
+   */
+  async prompt(
+    content:
+      | string
+      | Array<Record<string, unknown>>,
+  ): Promise<{ stopReason?: string }> {
     if (!this.sessionId) {
       throw new HostError("NOT_ATTACHED", "No ACP session attached");
     }
+
+    const promptBlocks: Array<Record<string, unknown>> = Array.isArray(content)
+      ? content.length
+        ? content
+        : [{ type: "text", text: "" }]
+      : [{ type: "text", text: content }];
 
     // Wait out any cancel; never stack a new prompt on a half-dead turn
     if (this.cancelInFlight) {
@@ -444,7 +459,7 @@ export class AcpClient {
         "session/prompt",
         {
           sessionId: this.sessionId,
-          prompt: [{ type: "text", text }],
+          prompt: promptBlocks,
           _meta: { promptId: clientPromptId },
         },
         { idleMs: 15 * 60_000, maxMs: 2 * 60 * 60_000 },

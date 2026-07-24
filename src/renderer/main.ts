@@ -70,6 +70,10 @@ import {
   renderMarkdownToSafeHtml,
 } from "./markdown.js";
 import { bindFileLinkDelegate } from "./file-links.js";
+import {
+  openWorkspacePath,
+  type OpenWorkspacePathOpts,
+} from "./open-workspace-path.js";
 import { SidePaneController } from "./side-pane.js";
 import {
   SettingsPageController,
@@ -134,6 +138,8 @@ import type { AttachState } from "../shared/types.js";
 interface Bridge {
   invoke(method: HostIpcMethod, params?: unknown): Promise<unknown>;
   onEvent(handler: (event: unknown) => void): () => void;
+  /** Electron 32+：从 File 取本地绝对路径（File.path 已不可用） */
+  getPathForFile?: (file: File) => string;
 }
 
 declare global {
@@ -1688,7 +1694,10 @@ async function drainPromptQueue(): Promise<void> {
     }
     removeQueuedSystemLine(next.id);
     syncPromptQueueBar();
-    await dispatchAgentPrompt(next.content, next.display, { force: false });
+    await dispatchAgentPrompt(next.content, next.display, {
+      force: false,
+      attachments: next.attachments as ComposerAttachment[] | undefined,
+    });
     return;
   }
   // L1 权威：take → 发送 → complete（勿只 shift 内存，否则磁盘项会复活）
@@ -1715,6 +1724,7 @@ async function drainPromptQueue(): Promise<void> {
   removeQueuedSystemLine(item.id);
   const result = await dispatchAgentPrompt(item.content, item.display, {
     force: false,
+    attachments: (item.attachments as ComposerAttachment[]) ?? undefined,
   });
   // 仅当仍在原会话时镜像 UI；complete 始终写回原 sid 的 L1
   await hostCompleteSending(
@@ -3314,22 +3324,30 @@ function renderMsgImages(
       ph.className = "msg-attach-thumb-ph";
       ph.textContent = attachIcon("image");
       thumb.appendChild(ph);
-      void inv<{ dataUrl: string }>("files.readDataUrl", { path: a.path }).then(
-        (res) => {
-          if (!res.ok || !res.data?.dataUrl) return;
-          a.previewUrl = res.data.dataUrl;
-          const img = document.createElement("img");
-          img.className = "msg-attach-thumb-img";
-          img.src = res.data.dataUrl;
-          img.alt = a.name;
-          img.draggable = false;
-          ph.replaceWith(img);
-        },
-      );
+      void inv<{ dataUrl: string }>("files.readDataUrl", {
+        path: a.path,
+        // 历史 session 图在 sessions/.../images/，需放行
+        sessionId: activeSessionId || undefined,
+      }).then((res) => {
+        if (!res.ok || !res.data?.dataUrl) return;
+        a.previewUrl = res.data.dataUrl;
+        const img = document.createElement("img");
+        img.className = "msg-attach-thumb-img";
+        img.src = res.data.dataUrl;
+        img.alt = a.name;
+        img.draggable = false;
+        ph.replaceWith(img);
+      });
     }
     thumb.onclick = (e) => {
       e.stopPropagation();
-      openComposerImagePreview(a);
+      void openPathInWorkspace({
+        path: a.path,
+        kind: "image",
+        previewUrl: a.previewUrl,
+        name: a.name,
+        sessionId: activeSessionId,
+      });
     };
     row.appendChild(thumb);
   }
@@ -3353,7 +3371,12 @@ function renderMsgFileChips(
     chip.innerHTML = `<span class="msg-attach-ico" aria-hidden="true">${attachIcon(a.kind)}</span><span class="msg-attach-name">${esc(a.name)}</span>`;
     chip.onclick = (e) => {
       e.stopPropagation();
-      void inv("system.openPath", { path: a.path });
+      void openPathInWorkspace({
+        path: a.path,
+        kind: a.kind === "folder" ? "folder" : a.kind === "image" ? "image" : "file",
+        name: a.name,
+        sessionId: activeSessionId,
+      });
     };
     chips.appendChild(chip);
   }
@@ -5548,12 +5571,17 @@ async function maybeSurfacePlanAfterTurn(): Promise<void> {
  * 系统代发一条用户消息并跑一轮。
  * force：计划批准等场景下若 UI 仍标 turnActive（exit_plan 挂起/事件乱序），先 endTurn 再发。
  * interrupt:"send_now"：cancel 当前 turn 后再发（CLI send_now）。
+ * attachments：图片 path → Host 组装 ACP Image blocks（历史 path 块仍在 content 里）。
  * @returns 是否已成功提交到 agent（队列 L1 complete 依赖此值）
  */
 async function dispatchAgentPrompt(
   content: string,
   display?: string,
-  opts?: { force?: boolean; interrupt?: "queue" | "send_now" },
+  opts?: {
+    force?: boolean;
+    interrupt?: "queue" | "send_now";
+    attachments?: ComposerAttachment[];
+  },
 ): Promise<{ ok: boolean; error?: string }> {
   const shown = (display ?? content).trim();
   const agentText = content.trim();
@@ -5584,13 +5612,14 @@ async function dispatchAgentPrompt(
     appendLine(tr("chat.connectFail"), "error");
     return { ok: false, error: tr("chat.connectFail") };
   }
-  paintUserMessage(shown);
+  paintUserMessage(shown, opts?.attachments);
   if (activeSessionId) markSessionWorking(activeSessionId, true);
   setTurnStatus(tr("turn.thinking"));
   const wireContent = await prepareAgentContentAfterCancel(threadId, agentText);
   const res = await inv("turns.prompt", {
     threadId,
     content: wireContent,
+    attachments: wireAttachmentsForPrompt(opts?.attachments),
   });
   if (!res.ok) {
     // prompt 未进 agent：标失败气泡，勿当作已成功发出
@@ -5613,6 +5642,24 @@ async function dispatchAgentPrompt(
   void refreshContextUsage();
   void refreshProjectsAndThreads();
   return { ok: true };
+}
+
+/** turns.prompt 的 attachments 载荷：仅 path/kind（图由 Host 读盘） */
+function wireAttachmentsForPrompt(
+  attachments?: ComposerAttachment[] | unknown[] | null,
+): Array<{ path: string; kind?: string }> | undefined {
+  if (!attachments?.length) return undefined;
+  const out: Array<{ path: string; kind?: string }> = [];
+  for (const raw of attachments) {
+    const a = raw as { path?: string; kind?: string };
+    const p = typeof a?.path === "string" ? a.path.trim() : "";
+    if (!p) continue;
+    out.push({
+      path: p,
+      kind: typeof a.kind === "string" ? a.kind : undefined,
+    });
+  }
+  return out.length ? out : undefined;
 }
 
 /** turns.prompt 失败：给最近一条用户消息加失败态（不删，便于对照重发） */
@@ -6915,9 +6962,9 @@ function bindImagePaste(): void {
 
     const considerFile = (f: File | null) => {
       if (!f || !f.type.startsWith("image/")) return;
-      const withPath = f as File & { path?: string };
-      if (withPath.path) {
-        pathSet.add(withPath.path);
+      const localPath = resolveLocalFilePath(f);
+      if (localPath) {
+        pathSet.add(localPath);
         return;
       }
       if (f.size <= 0) return;
@@ -7046,13 +7093,19 @@ function bindComposerDrop(): void {
       const paths: string[] = [];
       const previewMap: Record<string, string> = {};
       let tooLarge = 0;
+      let skippedNoPath = 0;
       for (const f of Array.from(files)) {
-        const withPath = f as File & { path?: string };
-        if (withPath.path) {
-          paths.push(withPath.path);
+        // Electron 35：必须用 webUtils.getPathForFile；File.path 常为空
+        const localPath = resolveLocalFilePath(f);
+        if (localPath) {
+          if (!paths.includes(localPath)) paths.push(localPath);
           continue;
         }
-        if (!f.type.startsWith("image/") || f.size <= 0) continue;
+        // 无本地路径：仅图片可落盘为临时附件，其它类型无法挂路径上下文
+        if (!f.type.startsWith("image/") || f.size <= 0) {
+          skippedNoPath++;
+          continue;
+        }
         if (f.size > MAX_PASTE_IMAGE_BYTES_UI) {
           tooLarge++;
           continue;
@@ -7066,7 +7119,7 @@ function bindComposerDrop(): void {
             { base64, mime },
           );
           if (res.ok && res.data?.path) {
-            paths.push(res.data.path);
+            if (!paths.includes(res.data.path)) paths.push(res.data.path);
             previewMap[res.data.path] = `data:${mime};base64,${base64}`;
           } else {
             showToast(
@@ -7082,7 +7135,12 @@ function bindComposerDrop(): void {
         showToast(tr("attach.imageTooLarge", { max: "20" }), "error");
       }
       if (!paths.length) {
-        showToast(tr("attach.dropNone"), "error");
+        showToast(
+          skippedNoPath > 0
+            ? tr("attach.dropNoPath")
+            : tr("attach.dropNone"),
+          "error",
+        );
         return;
       }
       const added = addAttachments(paths, {
@@ -7090,6 +7148,8 @@ function bindComposerDrop(): void {
       });
       if (added > 0) {
         showToast(tr("attach.addedN", { n: String(added) }));
+      } else if (skippedNoPath > 0) {
+        showToast(tr("attach.dropPartialNoPath", { n: String(skippedNoPath) }), "info");
       }
     })();
   };
@@ -7173,6 +7233,7 @@ function bindAtFilePalette(): void {
 
 // ── 附件 / + 菜单 ─────────────────────────────────────────
 
+/** 与 CLI IMAGE_EXTENSIONS 对齐（无 SVG；含 tiff/tif） */
 const IMAGE_EXT = new Set([
   "png",
   "jpg",
@@ -7180,12 +7241,33 @@ const IMAGE_EXT = new Set([
   "gif",
   "webp",
   "bmp",
-  "svg",
+  "tiff",
+  "tif",
 ]);
 /** 与 Host MAX_COMPOSER_ATTACHMENTS 对齐 */
 const MAX_COMPOSER_ATTACHMENTS = 20;
+/** 与 Host MAX_COMPOSER_IMAGES / CLI IMAGE_CAP 对齐 */
+const MAX_COMPOSER_IMAGES = 10;
 /** 粘贴单图客户端预检（Host 再验 20MB） */
 const MAX_PASTE_IMAGE_BYTES_UI = 20 * 1024 * 1024;
+
+/**
+ * 解析拖放/剪贴板 File 的本地绝对路径。
+ * Electron 35 渲染进程不再可靠暴露 File.path，须走 preload webUtils.getPathForFile。
+ */
+function resolveLocalFilePath(file: File): string {
+  try {
+    const viaBridge = window.grokDesktop?.getPathForFile?.(file);
+    if (typeof viaBridge === "string" && viaBridge.trim()) {
+      return viaBridge.trim();
+    }
+  } catch {
+    /* ignore */
+  }
+  const legacy = (file as File & { path?: string }).path;
+  if (typeof legacy === "string" && legacy.trim()) return legacy.trim();
+  return "";
+}
 
 function attachmentKind(filePath: string): "file" | "image" | "folder" {
   const base = filePath.split(/[/\\]/).pop() ?? filePath;
@@ -7215,6 +7297,7 @@ function addAttachments(
   let added = 0;
   let skippedDup = 0;
   let skippedCap = 0;
+  let skippedImageCap = 0;
   for (const p of paths) {
     if (!p) continue;
     const abs = p.replace(/[/\\]+$/, "") || p;
@@ -7228,6 +7311,14 @@ function addAttachments(
     }
     const name = abs.split(/[/\\]/).pop() || abs;
     const kind = opts?.kind ?? attachmentKind(abs);
+    if (kind === "image") {
+      const imageCount = composerAttachments.filter((a) => a.kind === "image")
+        .length;
+      if (imageCount >= MAX_COMPOSER_IMAGES) {
+        skippedImageCap++;
+        continue;
+      }
+    }
     const pathKey = kind === "folder" ? abs : p;
     composerAttachments.push({
       path: pathKey,
@@ -7243,6 +7334,11 @@ function addAttachments(
   if (skippedCap > 0) {
     showToast(
       tr("attach.maxReached", { max: String(MAX_COMPOSER_ATTACHMENTS) }),
+      "error",
+    );
+  } else if (skippedImageCap > 0) {
+    showToast(
+      tr("attach.imageMaxReached", { max: String(MAX_COMPOSER_IMAGES) }),
       "error",
     );
   } else if (skippedDup > 0 && added === 0 && paths.length > 0) {
@@ -7274,6 +7370,7 @@ async function loadMissingImagePreviews(): Promise<void> {
     need.map(async (a) => {
       const res = await inv<{ dataUrl: string }>("files.readDataUrl", {
         path: a.path,
+        sessionId: activeSessionId || undefined,
       });
       if (res.ok && res.data?.dataUrl) {
         a.previewUrl = res.data.dataUrl;
@@ -7284,19 +7381,37 @@ async function loadMissingImagePreviews(): Promise<void> {
   if (changed) renderAttachmentChips();
 }
 
-function openComposerImagePreview(a: ComposerAttachment): void {
-  const src = a.previewUrl;
-  if (!src) {
-    void inv("system.openPath", { path: a.path });
-    return;
-  }
-  openModal(
-    a.name || "图片预览",
-    `<div class="img-lightbox">
-      <img class="img-lightbox-img" src="${src.replace(/"/g, "&quot;")}" alt="${esc(a.name)}" />
-      <div class="img-lightbox-path mono">${esc(a.path)}</div>
+/** P1：工作区路径统一打开（附件 / file-link / 搜索 / 插件） */
+function openPathInWorkspace(
+  opts: OpenWorkspacePathOpts,
+): Promise<"lightbox" | "side-pane" | "system" | "noop"> {
+  return openWorkspacePath(
+    {
+      inv,
+      getSidePane: () => sidePane,
+      getCwd: () => activeCwd ?? selectedProject()?.path ?? null,
+      openImageLightbox: ({ path, name, previewUrl }) => {
+        openModal(
+          name || path.split(/[/\\]/).pop() || "图片预览",
+          `<div class="img-lightbox">
+      <img class="img-lightbox-img" src="${previewUrl.replace(/"/g, "&quot;")}" alt="${esc(name || path)}" />
+      <div class="img-lightbox-path mono">${esc(path)}</div>
     </div>`,
+        );
+      },
+    },
+    opts,
   );
+}
+
+function openComposerImagePreview(a: ComposerAttachment): void {
+  void openPathInWorkspace({
+    path: a.path,
+    kind: "image",
+    previewUrl: a.previewUrl,
+    name: a.name,
+    sessionId: activeSessionId,
+  });
 }
 
 function renderAttachmentChips(): void {
@@ -9804,6 +9919,7 @@ async function startNewChat(prompt?: string): Promise<void> {
   const pr = await inv("turns.prompt", {
     threadId: activeThreadId,
     content: agentContent,
+    attachments: wireAttachmentsForPrompt(attachSnap),
   });
   if (!pr.ok) {
     endTurn({ outcome: "stopped" });
@@ -10513,6 +10629,7 @@ async function sendContinue(): Promise<void> {
   const res = await inv("turns.prompt", {
     threadId,
     content: agentContent,
+    attachments: wireAttachmentsForPrompt(taken.attachSnap),
   });
   if (!res.ok) {
     endTurn({ outcome: "stopped" });
@@ -10690,7 +10807,12 @@ async function showSearchModal(): Promise<void> {
           const pth = el.dataset.path;
           const line = Number(el.dataset.line);
           closeModal();
-          if (pth) void sidePane?.openFile(pth, Number.isFinite(line) ? line : undefined);
+          if (pth) {
+            void openPathInWorkspace({
+              path: pth,
+              line: Number.isFinite(line) ? line : undefined,
+            });
+          }
         }
       };
     }
@@ -10719,7 +10841,8 @@ async function showPluginsPage(): Promise<void> {
         });
       },
       onOpenPath: (path0) => {
-        void inv("system.openPath", { path: path0 });
+        // 插件页路径：统一路由（目录/二进制仍会落到系统打开）
+        void openPathInWorkspace({ path: path0 });
       },
       onToast: (msg) => showToast(msg),
       onClosed: restoreComposerAfterOverlay,
@@ -12221,13 +12344,17 @@ npm start</pre>
         if (!r.ok && r.message) showToast(r.message, "error");
       });
     },
+    // 文件树 / MD 内链与 transcript 同源路由
+    openPath: async (filePath, line) => {
+      await openPathInWorkspace({ path: filePath, line });
+    },
   });
   bindPlanPanel();
   syncPlanRailActivity();
   bindCodeCopyDelegate($("transcript"));
   bindFileLinkDelegate($("transcript"), async (filePath, line) => {
-    // Codex：点路径 → 侧栏预览（非默认外开）
-    await sidePane?.openFile(filePath, line);
+    // Codex：点路径 → 统一路由（图 lightbox / 文侧栏 / 目录系统）
+    await openPathInWorkspace({ path: filePath, line });
   });
   // 对话 + 侧栏 MD：http(s)/mailto 走系统浏览器，避免 Electron 内黑屏
   bindExternalLinkDelegate(document.body, async (url) => {

@@ -5,13 +5,30 @@ import { randomBytes } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import { HostError } from "../shared/errors.js";
-import { desktopDir } from "./paths.js";
+import { desktopDir, findSessionDir } from "./paths.js";
 
 const MAX_READ_BYTES = 1_500_000; // ~1.5MB
-/** 粘贴图上限（与 writePasteImage 一致） */
+/** 粘贴图上限（与 writePasteImage / CLI wrap 20MB 一致） */
 export const MAX_PASTE_IMAGE_BYTES = 20 * 1024 * 1024;
 /** 单次 composer 附件个数上限（文件 + 图 + 文件夹） */
 export const MAX_COMPOSER_ATTACHMENTS = 20;
+/** 图片附件个数上限（对齐 CLI PromptWidget::IMAGE_CAP = 10） */
+export const MAX_COMPOSER_IMAGES = 10;
+
+/** 与 CLI IMAGE_EXTENSIONS 对齐 */
+export const IMAGE_EXTENSIONS = new Set([
+  "png",
+  "jpg",
+  "jpeg",
+  "gif",
+  "webp",
+  "bmp",
+  "tiff",
+  "tif",
+]);
+
+/** ACP Image block 读盘上限（对齐 CLI wrap 入口 20MB；agent 侧再 normalize） */
+export const MAX_PROMPT_IMAGE_BYTES = MAX_PASTE_IMAGE_BYTES;
 
 export type FileReadResult = {
   path: string;
@@ -180,6 +197,54 @@ export function writeProjectFile(opts: {
 }
 
 /**
+ * 解析预览用图片绝对路径。
+ * - 优先 roots / paste-images / session images（历史缩略图）
+ * - 用户经 + 选中的盘符外图片：允许存在的绝对路径 + 图片扩展名（与 preparePromptImages 一致）
+ */
+function resolveImagePreviewPath(opts: {
+  path: string;
+  cwd?: string | null;
+  roots?: string[];
+  home?: string;
+}): string {
+  const raw = opts.path.trim();
+  if (!raw) {
+    throw new HostError("INVALID_ARGUMENT", "empty image path");
+  }
+  const extra = [...(opts.roots ?? [])];
+  if (opts.home) {
+    extra.push(path.join(desktopDir(opts.home), "paste-images"));
+  }
+  try {
+    return resolveUnderRoots(raw, opts.cwd, extra);
+  } catch {
+    /* fall through: 绝对路径图片预览 */
+  }
+  let abs: string;
+  if (raw.startsWith("file://")) {
+    abs = path.resolve(decodeURIComponent(raw.replace(/^file:\/\/\/?/, "")));
+  } else if (path.isAbsolute(raw)) {
+    abs = path.resolve(raw);
+  } else {
+    throw new HostError(
+      "INVALID_ARGUMENT",
+      `Path outside project roots: ${raw}`,
+    );
+  }
+  const ext = path.extname(abs).slice(1).toLowerCase();
+  if (!IMAGE_EXTENSIONS.has(ext)) {
+    throw new HostError(
+      "INVALID_ARGUMENT",
+      `Not an allowed image for preview: ${abs}`,
+    );
+  }
+  if (!fs.existsSync(abs) || !fs.statSync(abs).isFile()) {
+    throw new HostError("IO_ERROR", `Not a file: ${abs}`);
+  }
+  return abs;
+}
+
+/**
  * 读取本地图片为 data URL（输入框缩略图预览；限制大小）。
  */
 export function readFileDataUrl(opts: {
@@ -189,22 +254,19 @@ export function readFileDataUrl(opts: {
   roots?: string[];
   home?: string;
 }): { dataUrl: string; mime: string; bytes: number } {
-  // Must stay under project roots (or paste-images temp) — never arbitrary FS.
-  const extra = [...(opts.roots ?? [])];
-  if (opts.home) {
-    extra.push(path.join(desktopDir(opts.home), "paste-images"));
-  }
-  const abs = resolveUnderRoots(opts.path, opts.cwd, extra);
+  const abs = resolveImagePreviewPath(opts);
   if (!fs.existsSync(abs) || !fs.statSync(abs).isFile()) {
     throw new HostError("IO_ERROR", `Not a file: ${abs}`);
   }
-  const max = opts.maxBytes ?? 8 * 1024 * 1024;
+  // 与粘贴/发送入口一致：默认 20MB，避免「能发送但 composer 无缩略图」
+  const max = opts.maxBytes ?? MAX_PASTE_IMAGE_BYTES;
   const st = fs.statSync(abs);
   if (st.size > max) {
     throw new HostError("IO_ERROR", `file too large for preview (${st.size} bytes)`);
   }
   const buf = fs.readFileSync(abs);
   const ext = path.extname(abs).slice(1).toLowerCase();
+  // 与 CLI IMAGE_EXTENSIONS / allow-list 对齐（无 SVG）
   const mime =
     ext === "jpg" || ext === "jpeg"
       ? "image/jpeg"
@@ -214,8 +276,8 @@ export function readFileDataUrl(opts: {
           ? "image/gif"
           : ext === "bmp"
             ? "image/bmp"
-            : ext === "svg"
-              ? "image/svg+xml"
+            : ext === "tif" || ext === "tiff"
+              ? "image/tiff"
               : "image/png";
   return {
     dataUrl: `data:${mime};base64,${buf.toString("base64")}`,
@@ -262,13 +324,236 @@ export function writePasteImage(opts: {
           ? "gif"
           : mime.includes("bmp")
             ? "bmp"
-            : "png";
+            : mime.includes("tif")
+              ? "tiff"
+              : "png";
   const dir = path.join(desktopDir(opts.home), "paste-images");
   fs.mkdirSync(dir, { recursive: true });
   const name = `paste-${Date.now()}-${randomBytes(3).toString("hex")}.${ext}`;
   const abs = path.join(dir, name);
   fs.writeFileSync(abs, buf);
   return { path: abs, name, bytes: buf.length };
+}
+
+export function mimeFromImageExt(ext: string): string {
+  const e = ext.toLowerCase().replace(/^\./, "");
+  if (e === "jpg" || e === "jpeg") return "image/jpeg";
+  if (e === "webp") return "image/webp";
+  if (e === "gif") return "image/gif";
+  if (e === "bmp") return "image/bmp";
+  if (e === "tif" || e === "tiff") return "image/tiff";
+  return "image/png";
+}
+
+export function extFromImageMime(mime: string): string {
+  const m = mime.toLowerCase();
+  if (m.includes("jpeg") || m.includes("jpg")) return "jpg";
+  if (m.includes("webp")) return "webp";
+  if (m.includes("gif")) return "gif";
+  if (m.includes("bmp")) return "bmp";
+  if (m.includes("tif")) return "tiff";
+  return "png";
+}
+
+function sniffImageMime(buf: Buffer): string | null {
+  if (buf.length >= 8 && buf[0] === 0x89 && buf[1] === 0x50) return "image/png";
+  if (buf.length >= 3 && buf[0] === 0xff && buf[1] === 0xd8 && buf[2] === 0xff)
+    return "image/jpeg";
+  if (
+    buf.length >= 6 &&
+    buf[0] === 0x47 &&
+    buf[1] === 0x49 &&
+    buf[2] === 0x46 &&
+    buf[3] === 0x38
+  )
+    return "image/gif";
+  if (
+    buf.length >= 12 &&
+    buf.toString("ascii", 0, 4) === "RIFF" &&
+    buf.toString("ascii", 8, 12) === "WEBP"
+  )
+    return "image/webp";
+  if (buf.length >= 2 && buf[0] === 0x42 && buf[1] === 0x4d) return "image/bmp";
+  if (
+    buf.length >= 4 &&
+    ((buf[0] === 0x49 && buf[1] === 0x49 && buf[2] === 0x2a && buf[3] === 0x00) ||
+      (buf[0] === 0x4d && buf[1] === 0x4d && buf[2] === 0x00 && buf[3] === 0x2a))
+  )
+    return "image/tiff";
+  return null;
+}
+
+export type PromptImageAttachment = {
+  path: string;
+  kind?: string;
+};
+
+export type PromptImageWireResult = {
+  /** session 内稳定 path（供历史缩略图）；失败项跳过 */
+  resolved: Array<{ originalPath: string; sessionPath: string; mime: string }>;
+  /** ACP ContentBlock::Image（camelCase wire） */
+  imageBlocks: Array<{
+    type: "image";
+    data: string;
+    mimeType: string;
+    uri?: string;
+  }>;
+  skipped: Array<{ path: string; reason: string }>;
+};
+
+/**
+ * 将 composer 图片附件复制到 session/images/，并组装 ACP Image content blocks。
+ * 方案 1+2：wire 多模态 + 历史仍可用 session path 做缩略图。
+ */
+export function preparePromptImages(opts: {
+  attachments: PromptImageAttachment[];
+  sessionId: string;
+  cwd?: string | null;
+  roots?: string[];
+  home?: string;
+}): PromptImageWireResult {
+  const home = opts.home;
+  const sessionId = opts.sessionId?.trim();
+  if (!sessionId) {
+    throw new HostError("INVALID_ARGUMENT", "sessionId required for prompt images");
+  }
+  const sessionDir = findSessionDir(sessionId, home);
+  if (!sessionDir) {
+    throw new HostError(
+      "IO_ERROR",
+      `session directory not found for ${sessionId}`,
+    );
+  }
+  const imagesDir = path.join(sessionDir, "images");
+  fs.mkdirSync(imagesDir, { recursive: true });
+
+  const extra = [...(opts.roots ?? [])];
+  if (home) {
+    extra.push(path.join(desktopDir(home), "paste-images"));
+    extra.push(imagesDir);
+    extra.push(sessionDir);
+  }
+
+  const resolved: PromptImageWireResult["resolved"] = [];
+  const imageBlocks: PromptImageWireResult["imageBlocks"] = [];
+  const skipped: PromptImageWireResult["skipped"] = [];
+
+  const images = opts.attachments
+    .filter((a) => {
+      if (a.kind && a.kind !== "image") return false;
+      const ext = path.extname(a.path || "").slice(1).toLowerCase();
+      return !a.kind ? IMAGE_EXTENSIONS.has(ext) : true;
+    })
+    .slice(0, MAX_COMPOSER_IMAGES);
+
+  for (const att of images) {
+    const rawPath = (att.path || "").trim();
+    if (!rawPath) {
+      skipped.push({ path: rawPath, reason: "empty path" });
+      continue;
+    }
+    // 用户经 +/拖入显式选中的图：允许任意存在的绝对路径读入（写出仍只进 session/images）。
+    // 相对路径或落在 roots 内的仍走 resolveUnderRoots。
+    let abs: string;
+    const candidate = path.isAbsolute(rawPath)
+      ? path.resolve(rawPath)
+      : null;
+    if (candidate && fs.existsSync(candidate) && fs.statSync(candidate).isFile()) {
+      abs = candidate;
+    } else {
+      try {
+        abs = resolveUnderRoots(rawPath, opts.cwd, extra);
+      } catch (err) {
+        skipped.push({
+          path: rawPath,
+          reason: err instanceof Error ? err.message : "path not allowed",
+        });
+        continue;
+      }
+    }
+    if (!fs.existsSync(abs) || !fs.statSync(abs).isFile()) {
+      skipped.push({ path: rawPath, reason: "file not found" });
+      continue;
+    }
+    const st = fs.statSync(abs);
+    if (st.size > MAX_PROMPT_IMAGE_BYTES) {
+      skipped.push({
+        path: rawPath,
+        reason: `too large (max ${Math.floor(MAX_PROMPT_IMAGE_BYTES / (1024 * 1024))}MB)`,
+      });
+      continue;
+    }
+    let buf: Buffer;
+    try {
+      buf = fs.readFileSync(abs);
+    } catch (err) {
+      skipped.push({
+        path: rawPath,
+        reason: err instanceof Error ? err.message : "read failed",
+      });
+      continue;
+    }
+    if (!buf.length) {
+      skipped.push({ path: rawPath, reason: "empty file" });
+      continue;
+    }
+    const sniffed = sniffImageMime(buf);
+    const ext = path.extname(abs).slice(1).toLowerCase();
+    if (!sniffed && !IMAGE_EXTENSIONS.has(ext)) {
+      skipped.push({ path: rawPath, reason: "not a supported image" });
+      continue;
+    }
+    const mime = sniffed ?? mimeFromImageExt(ext);
+    const outExt = extFromImageMime(mime);
+    // 已在本 session images 目录则复用，避免重复拷贝
+    const alreadyInSession =
+      path.resolve(abs).toLowerCase().startsWith(path.resolve(imagesDir).toLowerCase() + path.sep);
+    let sessionPath = abs;
+    if (!alreadyInSession) {
+      const name = `img-${Date.now()}-${randomBytes(3).toString("hex")}.${outExt}`;
+      sessionPath = path.join(imagesDir, name);
+      try {
+        fs.copyFileSync(abs, sessionPath);
+      } catch (err) {
+        skipped.push({
+          path: rawPath,
+          reason: err instanceof Error ? err.message : "copy failed",
+        });
+        continue;
+      }
+    }
+    const data = buf.toString("base64");
+    const uri = `file://${sessionPath.replace(/\\/g, "/")}`;
+    resolved.push({ originalPath: rawPath, sessionPath, mime });
+    imageBlocks.push({
+      type: "image",
+      data,
+      mimeType: mime,
+      uri,
+    });
+  }
+
+  return { resolved, imageBlocks, skipped };
+}
+
+/**
+ * 历史缩略图：允许读 session/images 与 paste-images（在 roots 之外）。
+ */
+export function sessionImageRoots(
+  sessionId: string | null | undefined,
+  home?: string,
+): string[] {
+  const roots: string[] = [];
+  if (home) roots.push(path.join(desktopDir(home), "paste-images"));
+  const sid = sessionId?.trim();
+  if (sid) {
+    const dir = findSessionDir(sid, home);
+    if (dir) {
+      roots.push(dir);
+      roots.push(path.join(dir, "images"));
+    }
+  }
+  return roots;
 }
 
 export type DirEntry = {

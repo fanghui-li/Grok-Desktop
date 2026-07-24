@@ -1,7 +1,7 @@
 /**
  * 对话内文件路径可点击（对齐 Codex / Claude Desktop）
  * - 识别绝对/相对路径 + :line[:col]
- * - 渲染为 .file-link，点击走侧栏 openFile
+ * - 渲染为 .file-link，点击走统一 openWorkspacePath（图 lightbox / 文侧栏 / 目录系统）
  *
  * 规则从紧：只链「像源码/配置文件」的路径，避免把 /sessions/、phase 等
  * 文本误当成路径按钮，点开后侧栏空空。

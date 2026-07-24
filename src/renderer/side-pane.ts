@@ -154,18 +154,25 @@ export class SidePaneController {
   private onFocusModeChange?: (focus: boolean) => void;
   /** 用户点轨上「计划」时加载 plan 内容（由 main 注入，避免循环依赖） */
   private onSelectPlan?: () => void;
+  /**
+   * 工作区路径统一打开（P1）。文件树 / MD 内链优先走此回调；
+   * 未注入时回退 openFile（侧栏预览）。
+   */
+  private openPathRouter?: (path: string, line?: number) => void | Promise<void>;
   constructor(opts: {
     inv: Inv;
     getCwd: () => string | null;
     getSessionId?: () => string | null;
     onFocusModeChange?: (focus: boolean) => void;
     onSelectPlan?: () => void;
+    openPath?: (path: string, line?: number) => void | Promise<void>;
   }) {
     this.inv = opts.inv;
     this.getCwd = opts.getCwd;
     this.getSessionId = opts.getSessionId ?? (() => null);
     this.onFocusModeChange = opts.onFocusModeChange;
     this.onSelectPlan = opts.onSelectPlan;
+    this.openPathRouter = opts.openPath;
     this.restorePrefs();
     this.bindChrome();
     this.applyOpenState(false);
@@ -971,7 +978,7 @@ export class SidePaneController {
       this.renderFileTree();
       return;
     }
-    await this.openFile(ent.path);
+    await this.openPathRouted(ent.path);
   }
 
   private toggleFileTree(): void {
@@ -994,7 +1001,16 @@ export class SidePaneController {
     }
   }
 
-  /** 打开路径到侧栏（聊天点击 / 工具） */
+  /** 经统一路由打开（有 openPath 注入时）；否则侧栏 openFile */
+  private async openPathRouted(path: string, line?: number): Promise<void> {
+    if (this.openPathRouter) {
+      await this.openPathRouter(path, line);
+      return;
+    }
+    await this.openFile(path, line);
+  }
+
+  /** 打开路径到侧栏预览（文本/源码；目录改系统打开） */
   async openFile(path: string, line?: number): Promise<void> {
     this.setCategory("files", true);
     const cwd = this.getCwd();
@@ -1034,6 +1050,8 @@ export class SidePaneController {
     }
     const d = res.data;
     if (d.isDirectory) {
+      // 与 openWorkspacePath 目录语义一致：系统资源管理器
+      await this.inv("system.openPath", { path: d.absPath });
       this.showInfo(tr("side.isDir", { path: d.absPath }));
       return;
     }
@@ -1210,7 +1228,7 @@ export class SidePaneController {
         ) as HTMLElement | null;
         if (!a?.dataset.filePath) return;
         e.preventDefault();
-        void this.openFile(
+        void this.openPathRouted(
           a.dataset.filePath,
           a.dataset.line ? Number(a.dataset.line) : undefined,
         );

@@ -39,14 +39,17 @@ import {
 import { detectEditors, resolveEditorCommand } from "./editors.js";
 import {
   listProjectDir,
+  preparePromptImages,
   readFileDataUrl,
   readProjectFile,
   searchProjectFiles,
+  sessionImageRoots,
   writePasteImage,
   writeProjectFile,
   type DirEntry,
   type FileReadResult,
   type FileSearchHit,
+  type PromptImageAttachment,
 } from "./files.js";
 import {
   authLogout,
@@ -2115,10 +2118,103 @@ export class DesktopHost {
     };
   }
 
-  async turnsPrompt(threadId: string, content: string): Promise<void> {
+  /**
+   * 发送一轮 prompt。
+   * - content：用户文本（含 [Attachments] path 块 → agent 落盘 / 历史缩略图）
+   * - attachments：图片 path 列表 → 复制到 session/images + ACP Image blocks
+   */
+  async turnsPrompt(
+    threadId: string,
+    content: string,
+    opts?: { attachments?: PromptImageAttachment[] },
+  ): Promise<{
+    sent: true;
+    imageCount: number;
+    skippedImages?: Array<{ path: string; reason: string }>;
+    resolvedImages?: Array<{ originalPath: string; sessionPath: string }>;
+  }> {
     const live = this.requireWritable(threadId);
     live.thread.updatedAt = new Date().toISOString();
-    await live.client!.prompt(content);
+    const text = content ?? "";
+    const atts = opts?.attachments ?? [];
+    const imageAtts = atts.filter(
+      (a) => !a.kind || a.kind === "image" || /\.(png|jpe?g|gif|webp|bmp|tiff?)$/i.test(a.path || ""),
+    );
+
+    if (!imageAtts.length) {
+      await live.client!.prompt(text);
+      return { sent: true, imageCount: 0 };
+    }
+
+    const roots = this.projects
+      .list({ includeArchived: true })
+      .map((p) => p.path);
+    if (live.thread.cwd) roots.push(live.thread.cwd);
+
+    let prepared;
+    try {
+      prepared = preparePromptImages({
+        attachments: imageAtts,
+        sessionId: live.thread.sessionId,
+        cwd: live.thread.cwd,
+        roots,
+        home: this.home,
+      });
+    } catch (err) {
+      this.logger.warn("turns.prompt_images_prepare_failed", {
+        threadId,
+        sessionId: live.thread.sessionId,
+        err: err instanceof Error ? err.message : String(err),
+      });
+      // 落盘失败时降级为纯文本（仍带 path 块），避免整轮发送失败
+      await live.client!.prompt(text);
+      return {
+        sent: true,
+        imageCount: 0,
+        skippedImages: imageAtts.map((a) => ({
+          path: a.path,
+          reason: err instanceof Error ? err.message : "prepare failed",
+        })),
+      };
+    }
+
+    // 历史缩略图：把正文里的 original path 换成 session path（parseUserHistoryPayload 仍认 - image:）
+    let historyText = text;
+    for (const r of prepared.resolved) {
+      if (r.originalPath && r.sessionPath && r.originalPath !== r.sessionPath) {
+        historyText = historyText.split(r.originalPath).join(r.sessionPath);
+      }
+    }
+
+    const blocks: Array<Record<string, unknown>> = [
+      { type: "text", text: historyText },
+      ...prepared.imageBlocks,
+    ];
+    await live.client!.prompt(blocks);
+
+    if (prepared.skipped.length) {
+      this.logger.warn("turns.prompt_images_skipped", {
+        threadId,
+        sessionId: live.thread.sessionId,
+        skipped: prepared.skipped,
+      });
+    }
+    this.logger.info("turns.prompt_images", {
+      threadId,
+      sessionId: live.thread.sessionId,
+      imageCount: prepared.imageBlocks.length,
+      skipped: prepared.skipped.length,
+    });
+
+    return {
+      sent: true,
+      imageCount: prepared.imageBlocks.length,
+      skippedImages: prepared.skipped.length ? prepared.skipped : undefined,
+      resolvedImages: prepared.resolved.map((r) => ({
+        originalPath: r.originalPath,
+        sessionPath: r.sessionPath,
+      })),
+    };
   }
 
   async turnsCancel(
@@ -2398,6 +2494,8 @@ export class DesktopHost {
     path: string;
     maxBytes?: number;
     cwd?: string;
+    /** 当前会话 id：允许读 session/images 下的历史图 */
+    sessionId?: string;
   }): {
     dataUrl: string;
     mime: string;
@@ -2406,6 +2504,7 @@ export class DesktopHost {
     const roots = this.projects
       .list({ includeArchived: true })
       .map((p) => p.path);
+    roots.push(...sessionImageRoots(opts.sessionId, this.home));
     return readFileDataUrl({
       path: opts.path,
       cwd: opts.cwd,

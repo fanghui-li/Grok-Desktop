@@ -232,6 +232,7 @@ async function handleHostIpc(
           path: p.path as string,
           maxBytes: p.maxBytes as number | undefined,
           cwd: p.cwd as string | undefined,
+          sessionId: p.sessionId as string | undefined,
         }),
       );
     case "files.list":
@@ -284,11 +285,23 @@ async function handleHostIpc(
           "openFile" as const,
           ...(multi ? (["multiSelections"] as const) : []),
         ],
+        // 默认「所有文件」优先，避免 Windows 停在「图片」过滤器导致只能看到图。
+        // extensions: ['*'] 是 Electron 文档的 All Files 写法。
         filters: (p.filters as Array<{ name: string; extensions: string[] }>) ?? [
-          { name: "全部支持", extensions: ["*"] },
+          { name: "所有文件", extensions: ["*"] },
           {
+            // 与 CLI IMAGE_EXTENSIONS 对齐（无 SVG；含 tiff/tif）
             name: "图片",
-            extensions: ["png", "jpg", "jpeg", "gif", "webp", "bmp", "svg"],
+            extensions: [
+              "png",
+              "jpg",
+              "jpeg",
+              "gif",
+              "webp",
+              "bmp",
+              "tiff",
+              "tif",
+            ],
           },
           {
             name: "代码与文本",
@@ -305,6 +318,24 @@ async function handleHostIpc(
               "go",
               "css",
               "html",
+              "vue",
+              "yaml",
+              "yml",
+              "toml",
+              "xml",
+              "sh",
+              "ps1",
+              "bat",
+              "c",
+              "cpp",
+              "h",
+              "java",
+              "kt",
+              "swift",
+              "rb",
+              "php",
+              "sql",
+              "log",
             ],
           },
         ],
@@ -632,9 +663,22 @@ async function handleHostIpc(
                 : undefined,
         }),
       );
-    case "turns.prompt":
-      await host.turnsPrompt(p.threadId as string, p.content as string);
-      return resultOk({ sent: true });
+    case "turns.prompt": {
+      const atts = Array.isArray(p.attachments)
+        ? (p.attachments as Array<{ path?: string; kind?: string }>).map(
+            (a) => ({
+              path: String(a?.path ?? ""),
+              kind: typeof a?.kind === "string" ? a.kind : undefined,
+            }),
+          )
+        : undefined;
+      const promptRes = await host.turnsPrompt(
+        p.threadId as string,
+        p.content as string,
+        atts?.length ? { attachments: atts } : undefined,
+      );
+      return resultOk(promptRes);
+    }
     case "turns.cancel":
       await host.turnsCancel(p.threadId as string, {
         trigger:
