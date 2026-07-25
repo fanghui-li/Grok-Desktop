@@ -256,11 +256,14 @@ export class SettingsPageController {
     this.open = false;
     this.closeProviderForm(false);
     this.teardownModelMenu();
+    // 登录提示等内嵌 backdrop 若残留会挡主壳点击
+    document.getElementById("auth-notice-backdrop")?.remove();
     // 避免焦点停在即将 display:none 的设置控件上，导致主界面按键失效
     const ae = document.activeElement as HTMLElement | null;
     if (ae && document.getElementById("settings-page")?.contains(ae)) {
       ae.blur();
     }
+    // 先藏设置再揭主壳，减少 visibility 切换闪烁窗口
     document.getElementById("settings-page")?.classList.add("hidden");
     const app = document.getElementById("app");
     app?.classList.remove("settings-open");
@@ -995,7 +998,7 @@ export class SettingsPageController {
           <div class="settings-row">
             <div class="settings-row-text">
               <div class="settings-row-title">${this.cb.esc(tr("settings.defaultModelPick"))}</div>
-              <div class="settings-row-sub">${this.cb.esc(tr("settings.defaultModelCurrent"))} · <span class="mono">${this.cb.esc(currentLabel)}</span></div>
+              <div class="settings-row-sub">${this.cb.esc(tr("settings.defaultModelCurrent"))} · <span class="mono" data-default-model-label>${this.cb.esc(currentLabel)}</span></div>
             </div>
             <div class="settings-row-actions">
               <select id="sel-default-model" class="settings-select settings-select-wide" aria-label="${this.cb.esc(tr("settings.defaultModelPick"))}"${models.length ? "" : " disabled"}>
@@ -1668,6 +1671,7 @@ export class SettingsPageController {
   /**
    * 对齐 CLI Settings `default_model` / `set_default_model`：
    * 全 catalog（官方 + 自定义）均可写入 `[models].default`。
+   * 成功后只局部更新 select/hint，避免 renderContent 整页闪。
    */
   private async setCatalogDefaultModel(
     id: string,
@@ -1692,11 +1696,26 @@ export class SettingsPageController {
     }
     // patch → applyToApp 已推 defaultModel 并触发主界面校准；勿再 applyToApp 连打 models.list
     await this.patch({ defaultModel: id });
+    const applied =
+      (this.cfg.defaultModel ?? "").trim() ||
+      (res.data?.defaultModel ?? "").trim() ||
+      id;
+    const sel = root.querySelector(
+      "#sel-default-model",
+    ) as HTMLSelectElement | null;
+    if (sel && sel.value !== applied) sel.value = applied;
+    const labelEl = root.querySelector(
+      "[data-default-model-label]",
+    ) as HTMLElement | null;
+    if (labelEl) {
+      const opt = sel?.selectedOptions?.[0];
+      labelEl.textContent = (opt?.textContent ?? applied).trim() || applied;
+    }
     if (hint) {
       hint.hidden = false;
-      hint.textContent = tr("settings.defaultModelSetOk", { model: id });
+      hint.textContent = tr("settings.defaultModelSetOk", { model: applied });
     }
-    await this.renderContent();
+    // 不再 renderContent()：整区重建是「闪一下」主因之一
   }
 
   private async pingProvider(id: string): Promise<void> {
@@ -1869,7 +1888,11 @@ export class SettingsPageController {
       message?: string;
     }>("system.auth.logout", {});
     if (!res.ok) {
-      window.alert(res.error?.message ?? tr("prov.logoutFail"));
+      this.showAuthNoticeDialog({
+        kind: "error",
+        title: tr("prov.logoutFail"),
+        body: res.error?.message ?? tr("prov.logoutFail"),
+      });
       return;
     }
     const data = res.data;
@@ -1884,7 +1907,12 @@ export class SettingsPageController {
         msg = tr("prov.logoutOk");
       }
     }
-    window.alert(msg);
+    // 勿用 window.alert：原生对话框会抢走 Electron 焦点，关设置后数秒无法点输入框
+    this.showAuthNoticeDialog({
+      kind: "info",
+      title: tr("settings.logout"),
+      body: msg,
+    });
     // 登出后 Host 已清 modelsListCache；Renderer 须立刻丢掉官方幽灵缓存并校准 chip
     this.cb.onAuthChanged?.();
     await this.renderContent();

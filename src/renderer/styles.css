@@ -449,6 +449,11 @@ svg.nav-ico {
   color: var(--text-3);
   font-size: 11px;
   line-height: 1;
+  transition: transform 0.2s ease;
+  transform-origin: center;
+}
+.project-group.is-expanded .project-item .proj-chev {
+  transform: rotate(90deg);
 }
 .project-item .proj-chev svg,
 svg.proj-chev {
@@ -507,12 +512,44 @@ svg.proj-remove-x {
   color: #b00020;
   opacity: 1;
 }
+/* 项目会话列表：grid 0fr/1fr 高度动画（避免 display:none 打断） */
 .project-threads {
-  display: flex; flex-direction: column; gap: 0;
+  display: grid;
+  grid-template-rows: 1fr;
+  transition: grid-template-rows 0.22s ease;
+}
+.project-group.is-collapsed > .project-threads {
+  grid-template-rows: 0fr;
+}
+.project-threads-inner {
+  display: flex;
+  flex-direction: column;
+  gap: 0;
+  min-height: 0;
+  overflow: hidden;
   padding: 0 0 4px 0;
 }
-.project-threads[hidden] {
-  display: none !important;
+.project-group.is-collapsed > .project-threads {
+  pointer-events: none;
+}
+.project-group.is-collapsed > .project-threads .project-threads-inner {
+  visibility: hidden;
+  transition: visibility 0s linear 0.22s;
+}
+.project-group.is-expanded > .project-threads .project-threads-inner {
+  visibility: visible;
+  transition: visibility 0s;
+}
+@media (prefers-reduced-motion: reduce) {
+  .project-threads,
+  .project-item .proj-chev,
+  .project-archive-body,
+  .project-archive-head .archive-chev {
+    transition: none !important;
+  }
+  .project-group.is-collapsed > .project-threads .project-threads-inner {
+    transition: none;
+  }
 }
 .thread-item {
   display: flex;
@@ -709,6 +746,11 @@ svg.archive-ico {
   justify-content: center;
   flex-shrink: 0;
   color: inherit;
+  transition: transform 0.2s ease;
+  transform-origin: center;
+}
+.project-archive-head.is-open .archive-chev {
+  transform: rotate(90deg);
 }
 .project-archive-head .archive-chev svg,
 svg.archive-chev {
@@ -717,12 +759,38 @@ svg.archive-chev {
   display: block;
 }
 .project-archive-body {
+  display: grid;
+  grid-template-rows: 0fr;
+  transition: grid-template-rows 0.22s ease;
+}
+.project-archive.is-open > .project-archive-body {
+  grid-template-rows: 1fr;
+}
+.project-archive-body-inner {
   display: flex;
   flex-direction: column;
   gap: 0;
+  min-height: 0;
+  overflow: hidden;
+}
+.project-archive:not(.is-open) > .project-archive-body {
+  pointer-events: none;
+}
+.project-archive:not(.is-open) > .project-archive-body .project-archive-body-inner {
+  visibility: hidden;
+  transition: visibility 0s linear 0.22s;
+}
+.project-archive.is-open > .project-archive-body .project-archive-body-inner {
+  visibility: visible;
+  transition: visibility 0s;
 }
 .project-archive-body .thread-item {
   padding-left: 36px;
+}
+@media (prefers-reduced-motion: reduce) {
+  .project-archive:not(.is-open) > .project-archive-body .project-archive-body-inner {
+    transition: none;
+  }
 }
 .archive-empty {
   padding-left: 36px;
@@ -1684,6 +1752,79 @@ html[data-theme="dark"] .btn-dark:hover { filter: brightness(0.92); }
   font-size: 14.5px; line-height: 1.45;
 }
 .composer-card textarea::placeholder { color: #b0b0b0; }
+
+/* ── Composer slash 着色（backdrop 叠在 textarea 下） ── */
+.composer-input-highlight {
+  position: relative;
+  width: 100%;
+  display: block;
+  flex: 1 1 auto;
+  min-height: 0;
+}
+.composer-slash-backdrop {
+  position: absolute;
+  inset: 0;
+  overflow: hidden;
+  pointer-events: none;
+  color: var(--text);
+  background: transparent;
+  z-index: 0;
+  margin: 0;
+  /* 与 textarea 同排版，由 JS 同步 padding/font */
+}
+.composer-input-highlight > textarea.composer-input-ta,
+.composer-card textarea.composer-input-ta {
+  position: relative;
+  z-index: 1;
+  background: transparent !important;
+  /* 有 slash 时文字透明，由 backdrop 上色；caret 保持可见 */
+}
+.composer-input-ta.has-slash-highlight {
+  -webkit-text-fill-color: transparent;
+  color: transparent;
+  caret-color: var(--text);
+}
+.composer-input-ta.has-slash-highlight::placeholder {
+  -webkit-text-fill-color: #b0b0b0;
+  color: #b0b0b0;
+}
+/* 类型色：skill 紫 / agent 青 / builtin 蓝 / 未知灰 */
+.composer-slash {
+  font-weight: 600;
+  border-radius: 3px;
+}
+.composer-slash--skill {
+  color: #7c3aed;
+  background: rgba(124, 58, 237, 0.1);
+}
+.composer-slash--agent {
+  color: #0d9488;
+  background: rgba(13, 148, 136, 0.1);
+}
+.composer-slash--builtin {
+  color: #2563eb;
+  background: rgba(37, 99, 235, 0.1);
+}
+.composer-slash--unknown {
+  color: #64748b;
+  background: rgba(100, 116, 139, 0.08);
+}
+html[data-theme="dark"] .composer-slash--skill {
+  color: #c4b5fd;
+  background: rgba(167, 139, 250, 0.16);
+}
+html[data-theme="dark"] .composer-slash--agent {
+  color: #5eead4;
+  background: rgba(45, 212, 191, 0.14);
+}
+html[data-theme="dark"] .composer-slash--builtin {
+  color: #93c5fd;
+  background: rgba(96, 165, 250, 0.16);
+}
+html[data-theme="dark"] .composer-slash--unknown {
+  color: #94a3b8;
+  background: rgba(148, 163, 184, 0.12);
+}
 .composer-toolbar {
   display: flex;
   align-items: center;
@@ -5855,7 +5996,9 @@ html[data-theme="dark"] .about-hero-banner--warn {
   color: var(--text);
 }
 .slash-item.active .slash-item-desc,
-.slash-item.active .slash-item-badge {
+.slash-item.active .slash-item-badge,
+.slash-item.active .slash-item-hint,
+.slash-item.active .slash-item-affordance {
   color: var(--text-2);
 }
 .slash-item-ico {
@@ -5867,13 +6010,23 @@ html[data-theme="dark"] .about-hero-banner--warn {
   opacity: 0.7;
   font-size: 13px;
 }
+.slash-item-skill .slash-item-ico {
+  opacity: 0.9;
+}
 .slash-item-body {
   min-width: 0;
   flex: 1;
   display: flex;
+  flex-direction: column;
+  align-items: stretch;
+  gap: 2px;
+  overflow: hidden;
+}
+.slash-item-title-row {
+  display: flex;
   align-items: baseline;
-  flex-wrap: nowrap;
   gap: 8px;
+  min-width: 0;
   overflow: hidden;
 }
 .slash-item-title {
@@ -5882,10 +6035,23 @@ html[data-theme="dark"] .about-hero-banner--warn {
   font-weight: 500;
   line-height: 1.35;
   color: var(--text);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+}
+.slash-item-hint {
+  min-width: 0;
+  flex: 1;
+  font-size: 12px;
+  font-weight: 400;
+  color: var(--text-3);
+  line-height: 1.3;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  opacity: 0.85;
 }
 .slash-item-desc {
   min-width: 0;
-  flex: 1;
   font-size: 12.5px;
   font-weight: 400;
   color: var(--text-3);
@@ -5896,10 +6062,36 @@ html[data-theme="dark"] .about-hero-banner--warn {
 }
 .slash-item-badge {
   flex-shrink: 0;
-  margin-left: 8px;
-  font-size: 12px;
+  margin-left: 4px;
+  font-size: 11.5px;
   color: var(--text-3);
   line-height: 1.2;
+}
+/* P3：补全 / 执行 轻量提示（Codex 式可见性，非 chip 协议） */
+.slash-item-affordance {
+  flex-shrink: 0;
+  font-size: 11px;
+  font-weight: 500;
+  color: var(--text-3);
+  line-height: 1;
+  padding: 3px 6px;
+  border-radius: 6px;
+  background: rgba(0, 0, 0, 0.04);
+  letter-spacing: 0.02em;
+  opacity: 0;
+  transition: opacity 0.12s ease;
+}
+.slash-item:hover .slash-item-affordance,
+.slash-item.active .slash-item-affordance {
+  opacity: 1;
+}
+.slash-item-affordance-run {
+  background: transparent;
+  font-weight: 400;
+}
+.slash-item.is-insert .slash-item-title,
+.slash-item-skill .slash-item-title {
+  color: var(--text);
 }
 .slash-empty {
   padding: 14px 12px;

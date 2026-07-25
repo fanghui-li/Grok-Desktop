@@ -1344,6 +1344,14 @@ export const enUS: MessageDict = {
   "slash.skillDefaultDesc": "Use this skill",
   "slash.skillInsert": "Please use skill “{name}”: ",
   "slash.sectionSkills": "Skills",
+  "slash.sectionAgent": "Agent commands",
+  "slash.affordanceInsert": "Complete",
+  "slash.affordanceRun": "Run",
+  "slash.cmdInserted": "Inserted /{name} — add args and send",
+  "slash.forkArgHint": "title (optional)",
+  "slash.btwArgHint": "side question",
+  "slash.interjectArgHint": "message",
+  "slash.rememberArgHint": "what to remember",
 
   // ── generic host ───────────────────────────────────────
   "error.host": "{message}",

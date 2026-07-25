@@ -1,10 +1,18 @@
 /**
  * 斜杠命令中心 —— 仅当前会话相关命令。
  * 导航类（新对话 / 设置 / 项目 / 搜索等）走侧栏与顶栏 UI，不进本列表。
+ *
+ * 选中语义（对齐 Codex Desktop「补全/插入 vs 发送执行」）：
+ * - run：选中即执行（status / export / compact …）
+ * - insert：写入 `/name `（+ 可选 argumentHint），用户补参后再发送
+ * - compose：进入编写态（如 /goal set）
  */
 import { tr } from "../shared/i18n/index.js";
 
 export type SlashPermMode = "always_approve" | "normal" | "plan";
+
+/** Palette 选中时的接受模式 */
+export type SlashAcceptMode = "run" | "insert" | "compose";
 
 export interface SlashCommand {
   /** 触发 id，如 plan、status；skill 为 skill:名称 */
@@ -25,6 +33,16 @@ export interface SlashCommand {
    * 手输 id/关键词仍可匹配执行。
    */
   paletteHidden?: boolean;
+  /**
+   * 选中行为：默认 run。
+   * skill / agent 广告 / 需正文命令用 insert；goal set 用 compose。
+   */
+  acceptMode?: SlashAcceptMode;
+  /**
+   * 插入 `/name ` 后可选的参数占位（CLI argument-hint / agent input.hint）。
+   * 仅 insert 模式使用；写入输入框供用户改写。
+   */
+  argumentHint?: string;
 }
 
 export type SlashEffortLevel = "low" | "medium" | "high" | "xhigh";
@@ -65,6 +83,78 @@ export interface SlashCommandDef extends SlashCommand {
   action: SlashAction;
 }
 
+/** 解析有效 acceptMode（缺省 run） */
+export function resolveAcceptMode(cmd: SlashCommandDef): SlashAcceptMode {
+  if (cmd.acceptMode) return cmd.acceptMode;
+  // 动态 skill / agent 广告：默认 insert（P0）
+  if (cmd.dynamic || cmd.action.kind === "agent-command") return "insert";
+  return "run";
+}
+
+/**
+ * 写入 composer 的 slash 补全文本：`/token ` 或 `/token <hint>`。
+ * token 不含前导 `/`。
+ */
+export function buildSlashInsertText(
+  token: string,
+  argumentHint?: string,
+): string {
+  const name = token.replace(/^\//, "").trim();
+  if (!name) return "/";
+  const hint = argumentHint?.trim();
+  if (hint) return `/${name} ${hint}`;
+  return `/${name} `;
+}
+
+/** 从命令定义得到插入用 token（skill:foo → foo，acp:bar → bar） */
+export function slashInsertToken(cmd: SlashCommandDef): string {
+  if (cmd.action.kind === "agent-command") {
+    return cmd.action.name.replace(/^\//, "").replace(/^skill:/i, "");
+  }
+  if (cmd.id.startsWith("skill:")) return cmd.id.slice(6);
+  if (cmd.id.startsWith("acp:")) return cmd.id.slice(4);
+  return cmd.id;
+}
+
+/** 输入框 slash 着色类型 */
+export type SlashTokenKind = "skill" | "agent" | "builtin" | "unknown";
+
+/** 命令 → 着色类型（供 composer 高亮） */
+export function slashCommandKind(cmd: SlashCommandDef): SlashTokenKind {
+  if (cmd.id.startsWith("skill:")) return "skill";
+  if (cmd.id.startsWith("acp:")) return "agent";
+  // 动态项兜底：无 acp: 前缀的 agent-command 视为 skill 名
+  if (cmd.dynamic) {
+    return cmd.id.startsWith("acp:") ? "agent" : "skill";
+  }
+  return "builtin";
+}
+
+/** kind 优先级：skill > agent > builtin > unknown */
+const KIND_RANK: Record<SlashTokenKind, number> = {
+  unknown: 0,
+  builtin: 1,
+  agent: 2,
+  skill: 3,
+};
+
+/** 构建 token→kind 目录（小写 name） */
+export function buildSlashKindCatalog(
+  commands: SlashCommandDef[],
+): Map<string, SlashTokenKind> {
+  const map = new Map<string, SlashTokenKind>();
+  for (const c of commands) {
+    const token = slashInsertToken(c).toLowerCase();
+    if (!token) continue;
+    const kind = slashCommandKind(c);
+    const prev = map.get(token);
+    if (!prev || KIND_RANK[kind] >= KIND_RANK[prev]) {
+      map.set(token, kind);
+    }
+  }
+  return map;
+}
+
 /** 仅会话命令（对话框 `/` 全部内容）— rebuilt each call so locale applies */
 export function getStaticSlashCommands(): SlashCommandDef[] {
   return [
@@ -76,6 +166,7 @@ export function getStaticSlashCommands(): SlashCommandDef[] {
       icon: "⚡",
       // 主入口：输入栏权限 chip；slash 仍可用但不占默认列表
       paletteHidden: true,
+      acceptMode: "run",
       action: { kind: "set-perm", mode: "always_approve" },
     },
     {
@@ -86,6 +177,7 @@ export function getStaticSlashCommands(): SlashCommandDef[] {
       icon: "≡",
       // 主入口：权限 chip「计划模式」
       paletteHidden: true,
+      acceptMode: "run",
       action: { kind: "set-perm", mode: "plan" },
     },
     {
@@ -96,6 +188,7 @@ export function getStaticSlashCommands(): SlashCommandDef[] {
       icon: "☰",
       // 主入口：侧栏计划面板
       paletteHidden: true,
+      acceptMode: "run",
       action: { kind: "view-plan" },
     },
     {
@@ -104,6 +197,8 @@ export function getStaticSlashCommands(): SlashCommandDef[] {
       description: tr("slash.goalDesc"),
       keywords: "goal objective 目标",
       icon: "◎",
+      // 选中即执行（beginGoalCompose / 发送路径）
+      acceptMode: "run",
       action: { kind: "goal", sub: "set" },
     },
     {
@@ -114,6 +209,7 @@ export function getStaticSlashCommands(): SlashCommandDef[] {
       icon: "ⓘ",
       // 主入口：goal banner
       paletteHidden: true,
+      acceptMode: "run",
       action: { kind: "goal", sub: "status" },
     },
     {
@@ -124,6 +220,7 @@ export function getStaticSlashCommands(): SlashCommandDef[] {
       icon: "✕",
       // 主入口：goal banner / chip ×
       paletteHidden: true,
+      acceptMode: "run",
       action: { kind: "goal", sub: "clear" },
     },
     {
@@ -134,6 +231,7 @@ export function getStaticSlashCommands(): SlashCommandDef[] {
       icon: "⏸",
       // 主入口：goal banner
       paletteHidden: true,
+      acceptMode: "run",
       action: { kind: "goal", sub: "pause" },
     },
     {
@@ -144,6 +242,7 @@ export function getStaticSlashCommands(): SlashCommandDef[] {
       icon: "▶",
       // 主入口：goal banner
       paletteHidden: true,
+      acceptMode: "run",
       action: { kind: "goal", sub: "resume" },
     },
     {
@@ -152,6 +251,7 @@ export function getStaticSlashCommands(): SlashCommandDef[] {
       description: tr("slash.goalBudgetDesc"),
       keywords: "goal budget token 预算",
       icon: "◎",
+      acceptMode: "run",
       action: { kind: "goal", sub: "budget" },
     },
     {
@@ -162,6 +262,7 @@ export function getStaticSlashCommands(): SlashCommandDef[] {
       icon: "◇",
       // 主入口：输入栏模型菜单
       paletteHidden: true,
+      acceptMode: "run",
       action: { kind: "open-model-menu" },
     },
     {
@@ -172,6 +273,7 @@ export function getStaticSlashCommands(): SlashCommandDef[] {
       icon: "◎",
       // 主入口：输入栏模型菜单内推理档
       paletteHidden: true,
+      acceptMode: "run",
       action: { kind: "set-effort" },
     },
     {
@@ -180,6 +282,9 @@ export function getStaticSlashCommands(): SlashCommandDef[] {
       description: tr("slash.maxTurnsDesc"),
       keywords: "max-turns max turns 回合 上限",
       icon: "⟳",
+      // 主入口：设置；不占默认命令中心列表
+      paletteHidden: true,
+      acceptMode: "run",
       action: { kind: "set-max-turns" },
     },
     {
@@ -190,6 +295,7 @@ export function getStaticSlashCommands(): SlashCommandDef[] {
       icon: "▣",
       // 主入口：角上 context chip
       paletteHidden: true,
+      acceptMode: "run",
       action: { kind: "show-context" },
     },
     {
@@ -198,6 +304,7 @@ export function getStaticSlashCommands(): SlashCommandDef[] {
       description: tr("slash.compactDesc"),
       keywords: "compact",
       icon: "▤",
+      acceptMode: "run",
       action: { kind: "compact-session" },
     },
     {
@@ -206,6 +313,9 @@ export function getStaticSlashCommands(): SlashCommandDef[] {
       description: tr("slash.exportDesc"),
       keywords: "export markdown md",
       icon: "⇩",
+      // 主入口：会话菜单；不占默认命令中心列表
+      paletteHidden: true,
+      acceptMode: "run",
       action: { kind: "export-session" },
     },
     {
@@ -214,6 +324,9 @@ export function getStaticSlashCommands(): SlashCommandDef[] {
       description: tr("slash.forkDesc"),
       keywords: "fork",
       icon: "⑂",
+      // 可选标题参数：先插入再发送（或空参直接 fork）
+      acceptMode: "insert",
+      argumentHint: tr("slash.forkArgHint"),
       action: { kind: "fork-session" },
     },
     {
@@ -222,6 +335,9 @@ export function getStaticSlashCommands(): SlashCommandDef[] {
       description: tr("slash.rewindDesc"),
       keywords: "rewind undo 回退 撤销",
       icon: "↩",
+      // 主入口：消息气泡回退；不占默认命令中心列表
+      paletteHidden: true,
+      acceptMode: "run",
       action: { kind: "rewind-session" },
     },
     {
@@ -232,6 +348,7 @@ export function getStaticSlashCommands(): SlashCommandDef[] {
       icon: "☰",
       // 主入口：输入框上方排队条
       paletteHidden: true,
+      acceptMode: "run",
       action: { kind: "show-queue" },
     },
     {
@@ -242,6 +359,7 @@ export function getStaticSlashCommands(): SlashCommandDef[] {
       icon: "✕",
       // 主入口：排队条操作
       paletteHidden: true,
+      acceptMode: "run",
       action: { kind: "clear-queue" },
     },
     {
@@ -250,6 +368,9 @@ export function getStaticSlashCommands(): SlashCommandDef[] {
       description: tr("slash.btwDesc"),
       keywords: "btw side question 旁路 侧问 顺便问 侧边",
       icon: "💬",
+      // 需要问题正文：插入后用户可写；空参发送仍可开侧栏
+      acceptMode: "insert",
+      argumentHint: tr("slash.btwArgHint"),
       action: { kind: "btw" },
     },
     {
@@ -260,6 +381,8 @@ export function getStaticSlashCommands(): SlashCommandDef[] {
       icon: "⚡",
       // 主入口：排队条「插话」/ 行内 /interject；不占默认命令中心列表
       paletteHidden: true,
+      acceptMode: "insert",
+      argumentHint: tr("slash.interjectArgHint"),
       action: { kind: "interject" },
     },
     {
@@ -268,6 +391,7 @@ export function getStaticSlashCommands(): SlashCommandDef[] {
       description: tr("slash.tasksDesc"),
       keywords: "tasks background monitor 后台 任务",
       icon: "⚒",
+      acceptMode: "run",
       action: { kind: "show-tasks" },
     },
     {
@@ -278,6 +402,7 @@ export function getStaticSlashCommands(): SlashCommandDef[] {
       icon: "◷",
       // 主入口：↑ 召回；手输 /history 仍可；不占默认命令中心列表
       paletteHidden: true,
+      acceptMode: "run",
       action: { kind: "show-prompt-history" },
     },
     {
@@ -286,6 +411,7 @@ export function getStaticSlashCommands(): SlashCommandDef[] {
       description: tr("slash.statusDesc"),
       keywords: "status session",
       icon: "ⓘ",
+      acceptMode: "run",
       action: { kind: "status" },
     },
     {
@@ -294,6 +420,7 @@ export function getStaticSlashCommands(): SlashCommandDef[] {
       description: tr("slash.memoryDesc"),
       keywords: "memory remember 记忆 global workspace",
       icon: "◈",
+      acceptMode: "run",
       action: { kind: "memory", sub: "list" },
     },
     {
@@ -302,6 +429,8 @@ export function getStaticSlashCommands(): SlashCommandDef[] {
       description: tr("slash.rememberDesc"),
       keywords: "remember memory add 记住",
       icon: "◈",
+      acceptMode: "insert",
+      argumentHint: tr("slash.rememberArgHint"),
       action: { kind: "memory", sub: "add" },
     },
     {
@@ -310,6 +439,7 @@ export function getStaticSlashCommands(): SlashCommandDef[] {
       description: tr("slash.flushDesc"),
       keywords: "flush memory 刷写 摘要",
       icon: "↓",
+      acceptMode: "run",
       action: { kind: "memory", sub: "flush" },
     },
     {
@@ -318,6 +448,7 @@ export function getStaticSlashCommands(): SlashCommandDef[] {
       description: tr("slash.dreamDesc"),
       keywords: "dream consolidate 整理 记忆",
       icon: "☾",
+      acceptMode: "run",
       action: { kind: "memory", sub: "dream" },
     },
   ];
@@ -351,7 +482,7 @@ export function filterSlashCommands(
   }
   return commands.filter((c) => {
     const hay =
-      `${c.id} ${c.title} ${c.description} ${c.keywords ?? ""}`.toLowerCase();
+      `${c.id} ${c.title} ${c.description} ${c.keywords ?? ""} ${c.argumentHint ?? ""}`.toLowerCase();
     const id = c.id.startsWith("skill:") ? c.id.slice(6) : c.id;
     const hit =
       hay.includes(q) || c.id.startsWith(q) || id.startsWith(q);
@@ -374,7 +505,11 @@ export function resolveSlashCommand(
   const name = raw.split(/\s+/)[0] ?? "";
   if (!name) return undefined;
   return commands.find((c) => {
-    const id = c.id.startsWith("skill:") ? c.id.slice(6) : c.id;
+    const id = c.id.startsWith("skill:")
+      ? c.id.slice(6)
+      : c.id.startsWith("acp:")
+        ? c.id.slice(4)
+        : c.id;
     return c.id.toLowerCase() === name || id.toLowerCase() === name;
   });
 }
@@ -390,6 +525,21 @@ export function stripSlashToken(
   return { text: next, cursor: start };
 }
 
+/**
+ * 将 `/query` 替换为完整 `/token `（+ 可选 hint）。
+ * 用于 insert / Tab 补全。
+ */
+export function replaceSlashToken(
+  text: string,
+  start: number,
+  cursor: number,
+  replacement: string,
+): { text: string; cursor: number } {
+  const next = text.slice(0, start) + replacement + text.slice(cursor);
+  const pos = start + replacement.length;
+  return { text: next, cursor: pos };
+}
+
 function skillScopeBadge(scope?: string): string {
   if (scope === "project") return tr("slash.badge.project");
   if (scope === "user") return tr("slash.badge.user");
@@ -397,22 +547,32 @@ function skillScopeBadge(scope?: string): string {
 }
 
 export function skillCommands(
-  skills: Array<{ name: string; description?: string; scope?: string }>,
+  skills: Array<{
+    name: string;
+    description?: string;
+    scope?: string;
+    argumentHint?: string;
+  }>,
 ): SlashCommandDef[] {
-  return skills.map((s) => ({
-    id: `skill:${s.name}`,
-    title: s.name,
-    description: s.description?.trim() || tr("slash.skillDefaultDesc"),
-    keywords: `skill 技能 ${s.name}`,
-    icon: "⬡",
-    dynamic: true,
-    badge: skillScopeBadge(s.scope),
-    // Host skills.resolve 执行；降级时 insert 提示文案
-    action: {
-      kind: "agent-command" as const,
-      name: s.name,
-    },
-  }));
+  return skills.map((s) => {
+    const hint = s.argumentHint?.trim() || undefined;
+    return {
+      id: `skill:${s.name}`,
+      title: s.name,
+      description: s.description?.trim() || tr("slash.skillDefaultDesc"),
+      keywords: `skill 技能 ${s.name}`,
+      icon: "⬡",
+      dynamic: true,
+      badge: skillScopeBadge(s.scope),
+      acceptMode: "insert" as const,
+      argumentHint: hint,
+      // Host skills.resolve 在发送路径执行；palette 只插入
+      action: {
+        kind: "agent-command" as const,
+        name: s.name,
+      },
+    };
+  });
 }
 
 /**
@@ -450,6 +610,8 @@ export function agentAdvertisedCommands(
       icon: "✦",
       dynamic: true,
       badge: tr("slash.badge.agent"),
+      acceptMode: "insert",
+      argumentHint: hint || undefined,
       action: {
         kind: "agent-command",
         name: id,

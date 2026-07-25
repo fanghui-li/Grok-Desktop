@@ -3210,16 +3210,37 @@ export class DesktopHost {
   /**
    * 列出可用模型（`grok models` + config 自定义；默认缓存 5 分钟）。
    * - 真源：CLI 输出 + `[model.*]` base_url 提供商；**无硬编码幽灵官方表**
-   * - 未官方登录：隐藏 `source=official`，只保留自定义中转
-   * - CLI 异步 spawn；同世代并发单飞；invalidate 后不 join 旧 flight
+   * - 未官方登录：隐藏 `source=official`，只保留自定义中转；**不 spawn CLI**
+   *   （登出后 force 拉表若仍 join 旧 `grok models` 会卡数秒 → 关设置后无法输入）
+   * - 已登录：CLI 异步 spawn；同世代并发单飞；invalidate 后不 join 旧 flight
    */
   async modelsList(opts?: { force?: boolean }): Promise<ModelInfo[]> {
     const authenticated = Boolean(authStatus(this.home).authenticated);
     const ttlMs = 5 * 60_000;
+
+    // 未登录：目录 = 仅自定义提供商。立刻返回，绝不 await 旧 flight / spawn grok models。
+    if (!authenticated) {
+      if (
+        !opts?.force &&
+        this.modelsListCache &&
+        this.modelsListCache.authenticated === false &&
+        Date.now() - this.modelsListCache.at < ttlMs
+      ) {
+        return this.modelsListCache.list;
+      }
+      const list = this.mergeModelsCatalog([], false);
+      this.modelsListCache = {
+        at: Date.now(),
+        list,
+        authenticated: false,
+      };
+      return list;
+    }
+
     if (
       !opts?.force &&
       this.modelsListCache &&
-      this.modelsListCache.authenticated === authenticated &&
+      this.modelsListCache.authenticated === true &&
       Date.now() - this.modelsListCache.at < ttlMs
     ) {
       return this.modelsListCache.list;
@@ -3231,22 +3252,8 @@ export class DesktopHost {
       return flight.promise;
     }
     if (flight && flight.gen !== this.modelsListGeneration) {
-      // 世代已变：等旧进程结束（不采用其 cache 写回），再开新一轮
-      try {
-        await flight.promise;
-      } catch {
-        /* ignore */
-      }
-      // 旧 finally 可能已清 inFlight；再检查一次缓存
-      if (
-        !opts?.force &&
-        this.modelsListCache &&
-        this.modelsListCache.authenticated ===
-          Boolean(authStatus(this.home).authenticated) &&
-        Date.now() - this.modelsListCache.at < ttlMs
-      ) {
-        return this.modelsListCache.list;
-      }
+      // 世代已变：不 await 旧 flight（登出/登录后旧 grok models 可能仍跑数秒）。
+      // 直接开新一轮；旧进程写回会被 gen 校验丢弃。
       if (
         this.modelsListInFlight &&
         this.modelsListInFlight.gen === this.modelsListGeneration
@@ -3260,7 +3267,11 @@ export class DesktopHost {
       const cliModels = await this.modelsListUncachedAsync();
       // 完成时再读登录态：logout 可能与拉目录并发，避免写回官方幽灵表
       const authNow = Boolean(authStatus(this.home).authenticated);
-      const list = this.mergeModelsCatalog(cliModels, authNow);
+      // 登出已发生：只回 custom，勿把 CLI 官方表写入 cache
+      const list = this.mergeModelsCatalog(
+        authNow ? cliModels : [],
+        authNow,
+      );
       if (gen === this.modelsListGeneration) {
         this.modelsListCache = {
           at: Date.now(),

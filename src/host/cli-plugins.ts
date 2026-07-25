@@ -3,6 +3,8 @@
  * 一律在调用方传入的 env（含 GROK_HOME=Desktop profile）下执行。
  */
 import { spawnSync } from "node:child_process";
+import fs from "node:fs";
+import path from "node:path";
 import type {
   McpServerInfo,
   PluginComponentSummary,
@@ -17,6 +19,32 @@ import {
   listSkills as listSkillsFs,
 } from "./extensibility.js";
 import { isVendorCompatPath, isVendorCompatSkill } from "./compat.js";
+
+/** inspect 未带 argument-hint 时，从 SKILL.md frontmatter 补全 */
+function readArgumentHintFromPath(skillPath: string): string | undefined {
+  if (!skillPath) return undefined;
+  const candidates = [
+    skillPath,
+    path.join(skillPath, "SKILL.md"),
+    path.join(skillPath, "skill.md"),
+  ];
+  for (const p of candidates) {
+    try {
+      if (!fs.existsSync(p) || !fs.statSync(p).isFile()) continue;
+      const text = fs.readFileSync(p, "utf8");
+      const fm = /^---\n([\s\S]*?)\n---/.exec(text);
+      if (!fm) continue;
+      const h =
+        /^argument-hint:\s*(.+)$/m.exec(fm[1]) ||
+        /^argumentHint:\s*(.+)$/m.exec(fm[1]) ||
+        /^argument_hint:\s*(.+)$/m.exec(fm[1]);
+      if (h) return h[1].trim().replace(/^["']|["']$/g, "");
+    } catch {
+      /* next */
+    }
+  }
+  return undefined;
+}
 
 export type GrokCliRunner = {
   binary: string;
@@ -88,6 +116,9 @@ export function skillsListCli(
             description?: string;
             source?: { type?: string; path?: string };
             vendor?: string;
+            argumentHint?: string;
+            argument_hint?: string;
+            "argument-hint"?: string;
           }>;
         } | null;
         if (Array.isArray(data?.skills) && data!.skills!.length) {
@@ -129,13 +160,26 @@ export function skillsListCli(
               ) {
                 scope = "user";
               }
+              const hintRaw =
+                s.argumentHint ??
+                s.argument_hint ??
+                s["argument-hint"];
+              const skillPath = s.source?.path ?? "";
+              let argumentHint =
+                typeof hintRaw === "string" && hintRaw.trim()
+                  ? hintRaw.trim()
+                  : undefined;
+              if (!argumentHint && skillPath) {
+                argumentHint = readArgumentHintFromPath(skillPath);
+              }
               return {
                 name: String(s.name ?? "skill"),
-                path: s.source?.path ?? "",
+                path: skillPath,
                 description: s.description,
                 scope,
                 category: s.vendor || srcType,
                 sourceType: srcType,
+                argumentHint,
               };
             });
         }

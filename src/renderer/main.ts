@@ -100,12 +100,18 @@ import {
 } from "./sidebar-icons.js";
 import {
   agentAdvertisedCommands,
+  buildSlashKindCatalog,
   getStaticSlashCommands,
   resolveSlashCommand,
   skillCommands,
   type SlashCommandDef,
 } from "./slash-commands.js";
 import { SlashPaletteController } from "./slash-palette.js";
+import {
+  bindComposerSlashHighlight,
+  refreshComposerSlashHighlight,
+  setSlashHighlightCatalog,
+} from "./composer-slash-highlight.js";
 import {
   AtFilePaletteController,
   type AtFileHit,
@@ -6624,6 +6630,7 @@ function insertComposerText(text: string): void {
   ta.setSelectionRange(pos, pos);
   ta.focus();
   ta.dispatchEvent(new Event("input", { bubbles: true }));
+  refreshComposerSlashHighlight(ta);
 }
 
 /**
@@ -7501,7 +7508,12 @@ function bindSlashPalette(): void {
     getCommands: async () => {
       const path0 = selectedProject()?.path;
       const skills = await inv<
-        Array<{ name: string; description?: string; scope?: string }>
+        Array<{
+          name: string;
+          description?: string;
+          scope?: string;
+          argumentHint?: string;
+        }>
       >("skills.list", { projectPath: path0 });
       const staticCmds = getStaticSlashCommands();
       const staticIds = new Set(staticCmds.map((c) => c.id.toLowerCase()));
@@ -7517,6 +7529,9 @@ function bindSlashPalette(): void {
     onRun: (cmd) => runSlashCommand(cmd),
     onMessage: (text, kind) => showToast(text, kind ?? "info"),
     onOpen: () => atFilePalette?.hide(),
+    onCommandsLoaded: (cmds) => {
+      setSlashHighlightCatalog(buildSlashKindCatalog(cmds));
+    },
   });
   for (const id of [
     "composer-input",
@@ -7527,6 +7542,10 @@ function bindSlashPalette(): void {
     const ta = document.getElementById(id) as HTMLTextAreaElement | null;
     if (ta) slashPalette.attach(ta);
   }
+  // 输入框 slash 着色（skill / agent / builtin）
+  bindComposerSlashHighlight();
+  // 先用静态目录上色；完整 skills 在首次打开 palette 时刷新
+  setSlashHighlightCatalog(buildSlashKindCatalog(getStaticSlashCommands()));
   // 命令中心入口：在输入框键入 `/`（或 Ctrl+/）；不再提供工具栏 `/` 按钮
 }
 
@@ -9575,40 +9594,45 @@ function makeArchiveFolder(
   archivedThreads: ThreadRow[],
 ): HTMLElement {
   const wrap = document.createElement("div");
-  wrap.className = "project-archive";
   const open = expandedArchiveIds.has(projectId);
+  wrap.className = `project-archive${open ? " is-open" : ""}`;
 
   const head = document.createElement("button");
   head.type = "button";
   head.className = `project-archive-head${open ? " is-open" : ""}`;
   head.setAttribute("aria-expanded", open ? "true" : "false");
   const count = archivedThreads.length;
+  // 箭头固定 chevronRight，用 CSS rotate 做展开动画
   head.innerHTML =
     `${sidebarIcon("folder", "archive-ico")}<span class="archive-label">归档</span>${count ? `<span class="archive-count">${count}</span>` : ""}` +
-    `${sidebarIcon(open ? "chevronDown" : "chevronRight", "proj-chev archive-chev")}`;
+    `${sidebarIcon("chevronRight", "proj-chev archive-chev")}`;
   head.onclick = (e) => {
     e.stopPropagation();
-    if (expandedArchiveIds.has(projectId)) expandedArchiveIds.delete(projectId);
-    else expandedArchiveIds.add(projectId);
-    void refreshProjectsAndThreads();
+    const next = !expandedArchiveIds.has(projectId);
+    if (next) expandedArchiveIds.add(projectId);
+    else expandedArchiveIds.delete(projectId);
+    wrap.classList.toggle("is-open", next);
+    head.classList.toggle("is-open", next);
+    head.setAttribute("aria-expanded", next ? "true" : "false");
   };
   wrap.appendChild(head);
 
   const body = document.createElement("div");
   body.className = "project-archive-body";
-  if (!open) {
-    body.hidden = true;
-  } else if (!archivedThreads.length) {
+  const inner = document.createElement("div");
+  inner.className = "project-archive-body-inner";
+  if (!archivedThreads.length) {
     const empty = document.createElement("div");
     empty.className = "empty-threads archive-empty";
     empty.textContent = "暂无归档";
-    body.appendChild(empty);
+    inner.appendChild(empty);
   } else {
     const { flat } = visibleThreadForest(archivedThreads, true, archivedThreads.length);
     for (const { thread, depth } of flat) {
-      body.appendChild(makeThreadRow(thread, projectId, "archived", depth));
+      inner.appendChild(makeThreadRow(thread, projectId, "archived", depth));
     }
   }
+  body.appendChild(inner);
   wrap.appendChild(body);
   return wrap;
 }
@@ -9733,8 +9757,9 @@ async function refreshProjectsAndThreads(): Promise<void> {
     b.type = "button";
     b.className = `project-item${p.id === selectedProjectId ? " active" : ""}`;
     b.setAttribute("aria-expanded", isExpanded ? "true" : "false");
+    // 箭头固定 chevronRight + CSS rotate；文件夹图标随展开态切换
     b.innerHTML =
-      `${sidebarIcon(isExpanded ? "chevronDown" : "chevronRight", "proj-chev")}` +
+      `${sidebarIcon("chevronRight", "proj-chev")}` +
       `${sidebarIcon(isExpanded ? "folderOpen" : "folder", "folder-ico")}` +
       `<span class="proj-title">${esc(p.title)}</span>` +
       `<span class="proj-remove" data-remove-project="${esc(p.id)}" title="从列表移除" aria-label="移除项目">${sidebarIcon("x", "proj-remove-x")}</span>`;
@@ -9746,18 +9771,34 @@ async function refreshProjectsAndThreads(): Promise<void> {
         void removeProjectFromList(p.id, p.title, p.path);
         return;
       }
-      if (expandedProjectIds.has(p.id)) {
-        expandedProjectIds.delete(p.id);
-      } else {
-        expandedProjectIds.add(p.id);
+      const next = !expandedProjectIds.has(p.id);
+      if (next) expandedProjectIds.add(p.id);
+      else expandedProjectIds.delete(p.id);
+
+      // 就地切换展开态，保留 CSS 高度/箭头动画（避免整表重绘打断）
+      group.classList.toggle("is-expanded", next);
+      group.classList.toggle("is-collapsed", !next);
+      b.setAttribute("aria-expanded", next ? "true" : "false");
+      const folderEl = b.querySelector(".folder-ico");
+      if (folderEl) {
+        folderEl.outerHTML = sidebarIcon(next ? "folderOpen" : "folder", "folder-ico");
       }
+
+      const needSelectPaint = selectedProjectId !== p.id;
       selectedProjectId = p.id;
       projectChoiceTouched = true;
       if (!activeThreadId && !activeSessionId) {
         setWelcomeTitle();
         showWelcome(true);
       }
-      void refreshProjectsAndThreads();
+      // 仅选中项高亮变化时才局部更新 active，不整表刷新
+      if (needSelectPaint) {
+        list.querySelectorAll(".project-item").forEach((item) => {
+          const row = item as HTMLElement;
+          const gid = row.closest(".project-group")?.getAttribute("data-project-id");
+          row.classList.toggle("active", gid === p.id);
+        });
+      }
     };
     group.appendChild(b);
 
@@ -9766,52 +9807,51 @@ async function refreshProjectsAndThreads(): Promise<void> {
     const archivedList = related.filter((t) => t.archived);
     const threadBox = document.createElement("div");
     threadBox.className = "project-threads";
-    if (!isExpanded) {
-      threadBox.hidden = true;
+    const threadInner = document.createElement("div");
+    threadInner.className = "project-threads-inner";
+    // 始终渲染内容，收起态由 CSS grid 0fr 裁切并动画
+    threadInner.appendChild(makeArchiveFolder(p.id, archivedList));
+    if (!activeList.length) {
+      const empty = document.createElement("div");
+      empty.className = "empty-threads";
+      empty.textContent = "暂无聊天";
+      threadInner.appendChild(empty);
     } else {
-      // 归档夹置顶
-      threadBox.appendChild(makeArchiveFolder(p.id, archivedList));
-      if (!activeList.length) {
-        const empty = document.createElement("div");
-        empty.className = "empty-threads";
-        empty.textContent = "暂无聊天";
-        threadBox.appendChild(empty);
-      } else {
-        const showAll = projectShowAllThreads.has(p.id);
-        // 按根会话截断预览；fork 子节点始终挂在父会话下
-        const { flat, rootCount } = visibleThreadForest(
-          activeList,
-          showAll,
-          THREADS_PREVIEW_LIMIT,
-        );
-        for (const { thread, depth } of flat) {
-          threadBox.appendChild(makeThreadRow(thread, p.id, "active", depth));
+      const showAll = projectShowAllThreads.has(p.id);
+      // 按根会话截断预览；fork 子节点始终挂在父会话下
+      const { flat, rootCount } = visibleThreadForest(
+        activeList,
+        showAll,
+        THREADS_PREVIEW_LIMIT,
+      );
+      for (const { thread, depth } of flat) {
+        threadInner.appendChild(makeThreadRow(thread, p.id, "active", depth));
+      }
+      if (rootCount > THREADS_PREVIEW_LIMIT) {
+        const more = document.createElement("button");
+        more.type = "button";
+        more.className = "project-threads-more";
+        if (showAll) {
+          more.textContent = "收起";
+          more.onclick = (e) => {
+            e.stopPropagation();
+            projectShowAllThreads.delete(p.id);
+            void refreshProjectsAndThreads();
+          };
+        } else {
+          const rest = rootCount - THREADS_PREVIEW_LIMIT;
+          more.textContent = `展开更多（${rest}）`;
+          more.onclick = (e) => {
+            e.stopPropagation();
+            projectShowAllThreads.add(p.id);
+            expandedProjectIds.add(p.id);
+            void refreshProjectsAndThreads();
+          };
         }
-        if (rootCount > THREADS_PREVIEW_LIMIT) {
-          const more = document.createElement("button");
-          more.type = "button";
-          more.className = "project-threads-more";
-          if (showAll) {
-            more.textContent = "收起";
-            more.onclick = (e) => {
-              e.stopPropagation();
-              projectShowAllThreads.delete(p.id);
-              void refreshProjectsAndThreads();
-            };
-          } else {
-            const rest = rootCount - THREADS_PREVIEW_LIMIT;
-            more.textContent = `展开更多（${rest}）`;
-            more.onclick = (e) => {
-              e.stopPropagation();
-              projectShowAllThreads.add(p.id);
-              expandedProjectIds.add(p.id);
-              void refreshProjectsAndThreads();
-            };
-          }
-          threadBox.appendChild(more);
-        }
+        threadInner.appendChild(more);
       }
     }
+    threadBox.appendChild(threadInner);
     group.appendChild(threadBox);
     list.appendChild(group);
   }
@@ -11714,7 +11754,8 @@ function applyDesktopConfig(cfg: {
   }
   // 供应商列表可能已变，清掉模型菜单缓存并校验当前 chip
   invalidateModelsCache();
-  // 设置仍开着：只校准 chip，禁止 setModel / toast（关页时再补）
+  // 设置仍开着：只后台校准目录/chip，禁止 setModel / toast（关页 restore 再补）
+  // 避免与 inert 恢复、用户返回会话抢同一帧
   void ensureChipModelAvailable({
     toast: Boolean(activeSessionId) && !isMainShellOverlayOpen(),
     allowSetModel: !isMainShellOverlayOpen(),
@@ -11729,6 +11770,8 @@ function applyDesktopConfig(cfg: {
 function forceMainShellInteractive(): void {
   const app = document.getElementById("app");
   if (!app) return;
+  // 设置内嵌弹层若残留，会挡点击/抢焦点
+  document.getElementById("auth-notice-backdrop")?.remove();
   app.classList.remove("settings-open");
   document.getElementById("settings-page")?.classList.add("hidden");
   const plugins = document.getElementById("plugins-page");
@@ -11743,29 +11786,96 @@ function forceMainShellInteractive(): void {
   }
 }
 
-/** 设置/插件关闭后恢复主界面可输入 */
+/** 主壳是否仍被 inert / settings-open 锁住（无法聚焦 composer） */
+function isAppShellLocked(): boolean {
+  const app = document.getElementById("app");
+  if (!app) return true;
+  if (app.classList.contains("settings-open")) return true;
+  if (app.classList.contains("plugins-open")) return true;
+  if ("inert" in app && (app as HTMLElement & { inert: boolean }).inert) {
+    return true;
+  }
+  return false;
+}
+
+/** 尝试把焦点落到当前 composer；成功返回 true */
+function tryFocusActiveComposer(): boolean {
+  if (isMainShellOverlayOpen() || isAppShellLocked()) return false;
+  const ta = activeComposerInput();
+  if (!ta || ta.disabled || ta.readOnly) return false;
+  try {
+    ta.focus({ preventScroll: true });
+    return document.activeElement === ta;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * 设置/插件关闭后恢复主界面可输入。
+ * 顺序：先清 inert/visibility → 重试 focus → 焦点稳定后再做模型校准/setModel。
+ * 避免 models.list / setModel 与 inert 解除抢同一窗口导致「闪一下 + 短期无法输入」。
+ */
+let overlayRestoreGen = 0;
 function restoreComposerAfterOverlay(): void {
+  const gen = ++overlayRestoreGen;
   forceMainShellInteractive();
   hideModelMenu();
   $("perm-menu")?.classList.add("hidden");
-  // 设置期间推迟的模型校验：关页后再 setModel
-  void ensureChipModelAvailable({
-    toast: Boolean(activeSessionId),
-    allowSetModel: true,
-  });
-  // 双 rAF：等 display:none 与 inert 解除后再抢焦点
-  requestAnimationFrame(() => {
-    requestAnimationFrame(() => {
-      try {
-        forceMainShellInteractive();
-        if (isMainShellOverlayOpen()) return;
-        const ta = activeComposerInput();
-        if (!ta || ta.disabled || ta.readOnly) return;
-        ta.focus({ preventScroll: true });
-      } catch {
-        /* ignore */
-      }
+
+  const scheduleDeferredChipCheck = () => {
+    if (gen !== overlayRestoreGen) return;
+    if (isMainShellOverlayOpen() || isAppShellLocked()) return;
+    // 不 force：登录/登出时 onAuthChanged 已拉过目录；此处只补 chip/setModel
+    // 未登录时 Host 侧 list 瞬时返回 custom，不会再卡数秒
+    void ensureChipModelAvailable({
+      toast: Boolean(activeSessionId),
+      allowSetModel: true,
     });
+  };
+
+  const attemptFocus = (n: number) => {
+    if (gen !== overlayRestoreGen) return;
+    forceMainShellInteractive();
+    if (isMainShellOverlayOpen()) return;
+    if (tryFocusActiveComposer()) {
+      // 先可输入，再异步校准模型（让首击/首键不被 list 抢）
+      window.setTimeout(scheduleDeferredChipCheck, 120);
+      return;
+    }
+    // Electron 上 inert/visibility 偶发晚一帧；最多约 ~400ms 重试
+    if (n < 12) {
+      window.setTimeout(() => attemptFocus(n + 1), 20 + n * 10);
+      return;
+    }
+    // 焦点失败仍做校准，避免 chip 与目录长期不一致
+    scheduleDeferredChipCheck();
+  };
+
+  // 用户点主区 composer 附近时再兜底 focus（原生 alert/登出后常见丢焦点）
+  const onPointer = (e: Event) => {
+    if (gen !== overlayRestoreGen) return;
+    if (isMainShellOverlayOpen() || isAppShellLocked()) return;
+    if (document.activeElement === activeComposerInput()) return;
+    const t = e.target as Node | null;
+    if (!t || !(t instanceof Element)) return;
+    // 仅主聊天/欢迎输入区，勿抢侧栏/菜单点击
+    if (
+      !t.closest(
+        "#chat-input, #composer-input, .chat-composer-dock, .composer-card, #chat, #welcome",
+      )
+    ) {
+      return;
+    }
+    tryFocusActiveComposer();
+  };
+  document.addEventListener("pointerdown", onPointer, true);
+  window.setTimeout(() => {
+    document.removeEventListener("pointerdown", onPointer, true);
+  }, 4000);
+
+  requestAnimationFrame(() => {
+    requestAnimationFrame(() => attemptFocus(0));
   });
 }
 
@@ -11780,11 +11890,26 @@ async function showSettingsPage(section?: string): Promise<void> {
       onClosed: restoreComposerAfterOverlay,
       onAuthChanged: () => {
         invalidateModelsCache();
-        // 设置仍开着：只校准 chip；force 拉目录异步不堵主进程，关页后再 setModel/toast
+        // 登出会 detach 全部 live：本地立刻降为 disk_，勿再对僵尸 id setModel
+        if (
+          activeSessionId &&
+          activeThreadId &&
+          !activeThreadId.startsWith("disk_")
+        ) {
+          activeThreadId = `disk_${activeSessionId}`;
+        }
+        if (turnActive) {
+          endTurn({ skipQueueDrain: true, outcome: "stopped" });
+        } else if (activeSessionId) {
+          setComposerBusy(false);
+          markSessionWorking(activeSessionId, false);
+        }
+        // 设置仍开着：只校准 chip 目录；禁止 setModel（关页 restore 再补）
+        // 未登录时 Host models.list 瞬时返回 custom，不会 spawn CLI
         void ensureChipModelAvailable({
-          toast: !isMainShellOverlayOpen(),
+          toast: false,
           force: true,
-          allowSetModel: !isMainShellOverlayOpen(),
+          allowSetModel: false,
         });
       },
       resolveThemeVariant: () => resolveTheme(themePreference),
@@ -12490,6 +12615,22 @@ function onEvent(raw: unknown): void {
       return;
     }
     setAttachUiState(ev.state, ev.lastError);
+    // logout detach / 主动 detach：live id 失效，降为 disk_，避免 setModel/ping 打僵尸 thread
+    const st = String(ev.state || "").toLowerCase();
+    if (
+      (st === "history_only" || st === "failed") &&
+      activeSessionId &&
+      activeThreadId &&
+      !activeThreadId.startsWith("disk_")
+    ) {
+      activeThreadId = `disk_${activeSessionId}`;
+      if (turnActive) {
+        endTurn({ skipQueueDrain: true, outcome: "stopped" });
+      } else {
+        setComposerBusy(false);
+        markSessionWorking(activeSessionId, false);
+      }
+    }
     return;
   }
   if (ev.type === "queue.changed") {

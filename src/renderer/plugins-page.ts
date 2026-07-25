@@ -236,6 +236,7 @@ export class PluginsPageController {
     if (ae && document.getElementById("plugins-page")?.contains(ae)) {
       ae.blur();
     }
+    // 先藏全页再清 inert，与设置 hide 一致，避免主壳闪一下
     document.getElementById("plugins-page")?.classList.add("hidden");
     const app = document.getElementById("app");
     app?.classList.remove("plugins-open");

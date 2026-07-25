@@ -330,6 +330,8 @@ export interface SkillInfo {
   category?: string;
   /** inspect source.type：bundled / user / project / plugin … */
   sourceType?: string;
+  /** SKILL.md `argument-hint`：slash 补全后占位参数 */
+  argumentHint?: string;
 }
 
 export interface PluginComponentSummary {

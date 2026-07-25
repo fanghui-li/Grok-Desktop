@@ -1294,6 +1294,14 @@ export const zhCN = {
   "slash.skillDefaultDesc": "使用此 Skill",
   "slash.skillInsert": "请使用 skill「{name}」：",
   "slash.sectionSkills": "技能",
+  "slash.sectionAgent": "Agent 命令",
+  "slash.affordanceInsert": "补全",
+  "slash.affordanceRun": "执行",
+  "slash.cmdInserted": "已插入 /{name}，补全参数后发送",
+  "slash.forkArgHint": "标题（可选）",
+  "slash.btwArgHint": "侧问内容",
+  "slash.interjectArgHint": "插话内容",
+  "slash.rememberArgHint": "要记住的内容",
 
   // ── generic host ───────────────────────────────────────
   "error.host": "{message}",

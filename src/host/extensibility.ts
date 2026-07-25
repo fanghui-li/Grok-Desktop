@@ -63,6 +63,7 @@ function walkSkills(
         path: full,
         description: meta.description,
         category: meta.category,
+        argumentHint: meta.argumentHint,
         scope,
       });
     } else if (ent.isDirectory()) {
@@ -74,17 +75,25 @@ function walkSkills(
 function readSkillMeta(skillMd: string): {
   description?: string;
   category?: string;
+  argumentHint?: string;
 } {
   try {
     const text = fs.readFileSync(skillMd, "utf8");
     const fm = /^---\n([\s\S]*?)\n---/.exec(text);
     let description: string | undefined;
     let category: string | undefined;
+    let argumentHint: string | undefined;
     if (fm) {
       const d = /^description:\s*(.+)$/m.exec(fm[1]);
       if (d) description = d[1].trim().replace(/^["']|["']$/g, "");
       const c = /^category:\s*(.+)$/m.exec(fm[1]);
       if (c) category = c[1].trim().replace(/^["']|["']$/g, "");
+      // CLI：argument-hint（kebab）；兼容 argumentHint / argument_hint
+      const h =
+        /^argument-hint:\s*(.+)$/m.exec(fm[1]) ||
+        /^argumentHint:\s*(.+)$/m.exec(fm[1]) ||
+        /^argument_hint:\s*(.+)$/m.exec(fm[1]);
+      if (h) argumentHint = h[1].trim().replace(/^["']|["']$/g, "");
     }
     if (!description) {
       const line = text
@@ -92,7 +101,7 @@ function readSkillMeta(skillMd: string): {
         .find((l) => l.trim() && !l.startsWith("#") && !l.startsWith("---"));
       description = line?.trim().slice(0, 160);
     }
-    return { description, category };
+    return { description, category, argumentHint };
   } catch {
     return {};
   }
