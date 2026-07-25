@@ -6150,8 +6150,176 @@ function showToast(text: string, kind: "info" | "error" = "info"): void {
 }
 
 /**
+ * 无 live session 时先 threads.create（与 startNewChat 同源），再供 skill / agent prompt。
+ * 已有 session 则 ensureLiveThread。不发送消息、不 beginTurn。
+ */
+async function ensureSessionForAgentSlash(opts?: {
+  title?: string;
+}): Promise<{ ok: true; threadId: string } | { ok: false; error: string }> {
+  if (activeSessionId && activeCwd) {
+    const tid = await ensureLiveThread();
+    if (tid) return { ok: true, threadId: tid };
+    return { ok: false, error: tr("chat.connectFail") };
+  }
+
+  let p = selectedProject();
+  let cwd: string | undefined;
+  let projectId: string | undefined;
+  let noProject = false;
+  if (p) {
+    if (p.trust !== "trusted") {
+      await inv("projects.update", { id: p.id, patch: { trust: "trusted" } });
+    }
+    cwd = p.path;
+    projectId = p.id;
+  } else {
+    noProject = true;
+    projectId = undefined;
+    cwd = undefined;
+  }
+
+  closePlanPanelOnSessionChange({
+    stashSessionId: activeSessionId,
+    abandonPending: false,
+  });
+
+  // 欢迎页可能仍挂着旧 id 镜像：清掉再 create
+  if (isLiveThreadId(activeThreadId) || activeSessionId) {
+    const prevLive = isLiveThreadId(activeThreadId) ? activeThreadId : null;
+    if (turnActive) await cancelTurn({ clearQueue: true });
+    if (prevLive) {
+      await inv("threads.detach", { threadId: prevLive });
+    }
+    activeThreadId = null;
+    activeSessionId = null;
+  }
+
+  showWelcome(false);
+  clearTranscript();
+  setTurnStatus(tr("chat.connecting") || "正在启动会话…");
+
+  const title =
+    (opts?.title || "").trim().slice(0, 48) || tr("nav.newChat");
+  const res = await inv<{
+    threadId: string;
+    sessionId: string;
+    cwd: string;
+  }>("threads.create", {
+    cwd,
+    projectId,
+    noProject: noProject || undefined,
+    title,
+    model: modelLabel,
+    effort: effortLevel,
+    maxTurns: maxTurnsLimit ?? undefined,
+    alwaysApprove: accessMode === "always_approve",
+    plan: isPlanOn(),
+    mode: isPlanOn()
+      ? "plan"
+      : accessMode === "always_approve"
+        ? "always_approve"
+        : "normal",
+  });
+
+  if (!res.ok || !res.data?.threadId) {
+    return {
+      ok: false,
+      error: res.error?.message ?? tr("chat.connectFail"),
+    };
+  }
+
+  activeThreadId = res.data.threadId;
+  activeSessionId = res.data.sessionId;
+  setActiveCwd(res.data.cwd);
+  if (projectId) selectedProjectId = projectId;
+  else {
+    selectedProjectId = null;
+    projectChoiceTouched = true;
+    expandedProjectIds.add(CHATS_GROUP_ID);
+  }
+  suspendLiveTranscript = false;
+  startContextPolling();
+  void refreshAgentAvailableCommands().then(() => slashPalette?.invalidate());
+  void refreshProjectsAndThreads();
+  return { ok: true, threadId: res.data.threadId };
+}
+
+/**
+ * resolve skill →（必要时先建会话）→ dispatchAgentPrompt。
+ * @returns handled：是否已作为 skill 路径处理（含失败 toast）
+ */
+async function runResolvedSkillSlash(
+  name: string,
+  skillArgs: string,
+  opts?: { path?: string },
+): Promise<{ handled: boolean; ok?: boolean; message?: string }> {
+  const n = name.replace(/^\//, "").toLowerCase();
+  const cachedPath =
+    opts?.path?.trim() || findSkillPathFromPaletteCache(n);
+  const resolved = await inv<{
+    mode: string;
+    prompt?: string;
+    name: string;
+    message?: string;
+  }>("skills.resolve", {
+    name: n,
+    cwd: activeCwd || selectedProject()?.path,
+    args: skillArgs || undefined,
+    path: cachedPath,
+  });
+
+  if (resolved.ok && resolved.data?.mode === "resolved" && resolved.data.prompt) {
+    const display = `/${n}${skillArgs ? " " + skillArgs : ""}`;
+    const body = skillArgs
+      ? `${resolved.data.prompt}\n\nUser request:\n${skillArgs}`
+      : resolved.data.prompt;
+
+    // 无 session（欢迎页）：先 create，再 dispatch
+    if (!activeSessionId || !activeCwd) {
+      const created = await ensureSessionForAgentSlash({ title: display });
+      if (!created.ok) {
+        showWelcome(false);
+        appendLine(created.error, "error");
+        return { handled: true, ok: false, message: created.error };
+      }
+    }
+
+    const sent = await dispatchAgentPrompt(body, display, { force: false });
+    return {
+      handled: true,
+      ok: sent.ok,
+      message: sent.ok
+        ? tr("slash.skillResolved", { name: n })
+        : sent.error,
+    };
+  }
+
+  if (
+    resolved.ok &&
+    resolved.data &&
+    (resolved.data.mode === "ambiguous" ||
+      resolved.data.mode === "read_error" ||
+      (resolved.data.mode === "not_found" && cachedPath))
+  ) {
+    return {
+      handled: true,
+      ok: false,
+      message:
+        resolved.data.message || tr("slash.skillNotFound", { name: n }),
+    };
+  }
+
+  // not_found 且无 path：不当 skill，交给上层当普通文本
+  return { handled: false };
+}
+
+/**
  * 发送路径：若整行是已知 slash（含 paletteHidden 如 /always-approve），本地执行不交 agent。
  * 返回 true 表示已处理并应中止发送。
+ *
+ * 优先级：静态原生命令 > skill resolve（registry / path）> 其它。
+ * 原生命令不走 skills.resolve。
+ * skill / 需 agent 的命令：无 session 时先 threads.create 再 dispatch。
  */
 async function tryRunComposerSlashLine(raw: string): Promise<boolean> {
   const t = raw.trim();
@@ -6161,52 +6329,52 @@ async function tryRunComposerSlashLine(raw: string): Promise<boolean> {
   if (!m) return false;
   const name = (m[1] ?? "").toLowerCase();
   if (!name) return false;
-  // 仅拦截桌面静态命令（skills/agent 广告仍可当 prompt 或走 palette）
-  // 静态 + skill 动态（resolve）均可本地拦截
   const staticCmd = resolveSlashCommand(getStaticSlashCommands(), name);
-  const skillHit =
-    !staticCmd && name.startsWith("skill:")
-      ? null
-      : !staticCmd
-        ? null
-        : staticCmd;
-  // skill:name 或直接 skill 名走 resolve（CLI 式 envelope，args 写入属性）
-  if (!staticCmd && !name.includes(":")) {
+  // 原生静态优先（与 CLI builtins first 一致）
+  if (staticCmd) {
+    const ta = activeComposerInput();
+    if (ta) ta.value = "";
+    slashPalette?.hide();
+    const res = await runSlashCommand(staticCmd, (m[2] ?? "").trim());
+    if (res.message) showToast(res.message, res.ok ? "info" : "error");
+    return true;
+  }
+  // skill：registry path-first resolve（CLI 式 envelope）
+  {
     const skillArgs = (m[2] ?? "").trim();
-    const resolved = await inv<{
-      mode: string;
-      prompt: string;
-      name: string;
-    }>("skills.resolve", {
-      name,
-      cwd: activeCwd || selectedProject()?.path,
-      args: skillArgs || undefined,
-    });
-    if (resolved.ok && resolved.data?.mode === "resolved") {
+    const skillRes = await runResolvedSkillSlash(name, skillArgs);
+    if (skillRes.handled) {
       const ta = activeComposerInput();
       if (ta) ta.value = "";
       slashPalette?.hide();
-      // prompt 已含 skill envelope；有用户附加说明时再拼一段
-      const body = skillArgs
-        ? `${resolved.data.prompt}\n\nUser request:\n${skillArgs}`
-        : resolved.data.prompt;
-      await dispatchAgentPrompt(
-        body,
-        `/${name}${skillArgs ? " " + skillArgs : ""}`,
-        { force: false },
-      );
+      if (skillRes.message && !skillRes.ok) {
+        showToast(skillRes.message, "error");
+      } else if (skillRes.message && skillRes.ok) {
+        // resolve 成功 toast 可选；dispatch 已画气泡，不强制 toast
+      }
       return true;
     }
   }
-  const cmd = skillHit ?? staticCmd;
-  if (!cmd) return false;
-  const ta = activeComposerInput();
-  if (ta) ta.value = "";
-  slashPalette?.hide();
-  const res = await runSlashCommand(cmd, (m[2] ?? "").trim());
-  if (res.message) showToast(res.message, res.ok ? "info" : "error");
-  return true;
+  return false;
 }
+
+/** 从最近一次 palette 加载的 skill 命令中取 path（同名优先） */
+function findSkillPathFromPaletteCache(name: string): string | undefined {
+  const n = name.replace(/^\//, "").toLowerCase();
+  for (const c of lastSlashCommandsCache) {
+    if (c.action.kind !== "agent-command") continue;
+    if (c.action.path && c.action.name.replace(/^\//, "").toLowerCase() === n) {
+      return c.action.path;
+    }
+    if (c.id.toLowerCase() === `skill:${n}` && c.action.path) {
+      return c.action.path;
+    }
+  }
+  return undefined;
+}
+
+/** palette onCommandsLoaded 写入，供手打 /name 发送时绑 path */
+let lastSlashCommandsCache: SlashCommandDef[] = [];
 
 /** 仅处理会话斜杠命令（导航类走侧栏 / 顶栏 UI） */
 async function runSlashCommand(
@@ -6255,38 +6423,18 @@ async function runSlashCommand(
       return promptSetMaxTurns(act.turns);
     case "agent-command": {
       const name = act.name.replace(/^\//, "").replace(/^skill:/i, "");
-      // Skills：Host resolve → CLI 式 <skill> envelope；否则回退插入文案
-      const resolved = await inv<{
-        mode: string;
-        prompt: string;
-        name: string;
-      }>("skills.resolve", {
-        name,
-        cwd: activeCwd || selectedProject()?.path,
-        args: args || undefined,
+      const skillPath =
+        act.path?.trim() || findSkillPathFromPaletteCache(name);
+      const skillRes = await runResolvedSkillSlash(name, args, {
+        path: skillPath,
       });
-      if (resolved.ok && resolved.data) {
-        const body =
-          resolved.data.mode === "resolved"
-            ? args
-              ? `${resolved.data.prompt}\n\nUser request:\n${args}`
-              : resolved.data.prompt
-            : resolved.data.prompt +
-              (args ? `\n\nUser request:\n${args}` : "");
-        const display =
-          resolved.data.mode === "resolved"
-            ? `/${name}${args ? " " + args : ""}`
-            : tr("slash.skillInsert", { name });
-        await dispatchAgentPrompt(body, display, { force: false });
+      if (skillRes.handled) {
         return {
-          ok: true,
-          message:
-            resolved.data.mode === "resolved"
-              ? tr("slash.skillResolved", { name })
-              : tr("slash.skillFallback", { name }),
+          ok: Boolean(skillRes.ok),
+          message: skillRes.message,
         };
       }
-      // agent 广告命令：插入 `/name ` 到输入框
+      // 无 path 且 not_found：当作 agent 广告命令，插入 `/name `
       insertComposerText(`/${name} `);
       return { ok: true, message: tr("slash.agentCmdInserted", { name }) };
     }
@@ -7513,6 +7661,8 @@ function bindSlashPalette(): void {
           description?: string;
           scope?: string;
           argumentHint?: string;
+          path?: string;
+          userInvocable?: boolean;
         }>
       >("skills.list", { projectPath: path0 });
       const staticCmds = getStaticSlashCommands();
@@ -7530,6 +7680,7 @@ function bindSlashPalette(): void {
     onMessage: (text, kind) => showToast(text, kind ?? "info"),
     onOpen: () => atFilePalette?.hide(),
     onCommandsLoaded: (cmds) => {
+      lastSlashCommandsCache = cmds;
       setSlashHighlightCatalog(buildSlashKindCatalog(cmds));
     },
   });
@@ -11535,6 +11686,13 @@ async function showPluginsPage(): Promise<void> {
       inv,
       esc,
       getSelectedProjectPath: () => selectedProject()?.path,
+      getSelectedProjectName: () => {
+        const p = selectedProject();
+        return (
+          p?.title?.trim() ||
+          p?.path?.split(/[/\\]/).filter(Boolean).pop()
+        );
+      },
       onUseSkill: (name) => {
         void runSlashCommand({
           id: `skill:${name}`,
@@ -11546,6 +11704,8 @@ async function showPluginsPage(): Promise<void> {
           },
         });
       },
+      /** 新建技能 → 新对话欢迎页，composer 插入 /create-skill（用户再发） */
+      onCreateSkill: () => void openNewChatWithCreateSkill(),
       onOpenPath: (path0) => {
         // 插件页路径：统一路由（目录/二进制仍会落到系统打开）
         void openPathInWorkspace({ path: path0 });
@@ -11555,6 +11715,25 @@ async function showPluginsPage(): Promise<void> {
     });
   }
   await pluginsPage.show();
+}
+
+/**
+ * 扩展中心「新建技能」：新会话 + 预填 `/create-skill `。
+ * User 落盘路径由 Host skills.resolve 对 create-skill 强制覆盖（~/.grok-desktop/skills），
+ * 不依赖 composer 长文案（发送时会被 skill envelope 替换）。
+ */
+async function openNewChatWithCreateSkill(): Promise<void> {
+  await leaveCurrentSessionToWelcome({ keepBackground: true });
+  const ta = $("composer-input") as HTMLTextAreaElement | null;
+  if (ta) {
+    ta.value = "/create-skill ";
+    ta.focus();
+    const pos = ta.value.length;
+    ta.setSelectionRange(pos, pos);
+    ta.dispatchEvent(new Event("input", { bubbles: true }));
+    refreshComposerSlashHighlight(ta);
+  }
+  showToast(tr("plug.createSkillReady"), "info");
 }
 
 async function showAutomationsModal(): Promise<void> {
@@ -12862,9 +13041,6 @@ function onEvent(raw: unknown): void {
       const hadToolFailures = Boolean(
         (ev as { hadToolFailures?: boolean }).hadToolFailures,
       );
-      const lastToolFailure = String(
-        (ev as { lastToolFailure?: string }).lastToolFailure || "",
-      ).trim();
       const isCancelled =
         stop === "cancelled" ||
         stop === "canceled" ||
@@ -12896,16 +13072,8 @@ function onEvent(raw: unknown): void {
       } else if (errMsg && stop === "error") {
         showTurnErrorOnce(errMsg);
       } else if (hadToolFailures) {
-        // P1/P2：工具失败（如权限 option 被拒）时明确提示，避免「已完成但空白」
-        const detail = lastToolFailure
-          ? lastToolFailure.slice(0, 280)
-          : "";
-        appendLine(
-          detail
-            ? tr("chat.turnToolFailedDetail", { detail })
-            : tr("chat.turnToolFailed"),
-          "system",
-        );
+        // 末尾仅短提示；失败 detail 已在折叠过程块/工具卡，勿再铺长错误
+        appendLine(tr("chat.turnToolFailed"), "system");
         if (!hadText) {
           appendLine(tr("chat.turnToolsOnly"), "system");
         }

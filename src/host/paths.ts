@@ -63,11 +63,22 @@ export function migrateLegacyDesktopData(home = os.homedir()): void {
   }
 }
 
+/** 用户全局 hooks 目录：`~/.grok-desktop/hooks`（agent 发现真源） */
+export function hooksDir(home = os.homedir()): string {
+  return path.join(grokHomeDir(home), "hooks");
+}
+
 export function ensureDesktopDirs(home = os.homedir()): void {
   migrateLegacyDesktopData(home);
   fs.mkdirSync(grokHomeDir(home), { recursive: true });
   fs.mkdirSync(desktopLogsDir(home), { recursive: true });
   fs.mkdirSync(desktopDir(home), { recursive: true });
+  // L0：保证 hooks 目录存在，便于用户/文档放置 JSON
+  try {
+    fs.mkdirSync(hooksDir(home), { recursive: true });
+  } catch {
+    /* ignore */
+  }
   try {
     ensureVendorCompatDisabled(home);
   } catch {

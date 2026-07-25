@@ -679,7 +679,12 @@
         </header>
         <div class="plugins-scroll">
           <div class="plugins-content">
-            <h1 class="plugins-title" id="plugins-title" data-i18n="plugins.title">插件</h1>
+            <div class="plugins-title-row">
+              <h1 class="plugins-title" id="plugins-title" data-i18n="plugins.title">插件</h1>
+              <div class="plugins-footer" id="plugins-footer">
+                <button type="button" class="plugins-link-btn" data-action="open-plugins-dir" data-i18n="plugins.openDir">打开 Plugins 目录</button>
+              </div>
+            </div>
             <div class="plugins-toolbar">
               <div class="plugins-search-wrap">
                 <span class="plugins-search-ico">⌕</span>
@@ -691,9 +696,6 @@
               <button type="button" class="plugins-chip" data-action="scope" data-scope="project" data-i18n="plugins.scopeProject">项目</button>
             </div>
             <div id="plugins-sections"></div>
-            <div class="plugins-footer" id="plugins-footer">
-              <button type="button" class="plugins-link-btn" data-action="open-plugins-dir" data-i18n="plugins.openDir">打开 Plugins 目录</button>
-            </div>
           </div>
         </div>
       </div>

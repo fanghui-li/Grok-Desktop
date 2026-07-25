@@ -28,11 +28,6 @@ import {
 } from "../src/host/fork-session.js";
 import { DesktopHost } from "../src/host/host.js";
 import {
-  listDesktopHooks,
-  loadHooksTrustMap,
-  setHookTrusted,
-} from "../src/host/hooks-trust.js";
-import {
   normalizeSessionNotification,
   normalizeSessionUpdate,
 } from "../src/host/normalize.js";
@@ -477,26 +472,37 @@ describe("P3 skills resolve + hooks", () => {
       "demo-skill",
     );
     fs.mkdirSync(skillDir, { recursive: true });
+    const skillMd = path.join(skillDir, "SKILL.md");
     fs.writeFileSync(
-      path.join(skillDir, "SKILL.md"),
+      skillMd,
       "---\nname: demo-skill\ndescription: Demo skill\n---\n\n# Demo\n\nDo the thing.\n",
       "utf8",
     );
     const host = trackHost(new DesktopHost({ home }));
+    // list 先填充 registry（path-first 与 list 同集合）
+    const listed = host.skillsList();
+    expect(listed.some((s) => s.name === "demo-skill")).toBe(true);
     const r = host.skillsResolve("demo-skill");
     expect(r.mode).toBe("resolved");
     expect(r.prompt).toContain("Do the thing");
     // CLI-aligned envelope
     expect(r.prompt).toContain('<skill name="demo-skill"');
     expect(r.prompt).toContain("<skill_information>");
-    expect(r.prompt).toContain("description=\"Demo skill\"");
+    expect(r.prompt).toContain('description="Demo skill"');
     const withArgs = host.skillsResolve("demo-skill", undefined, {
       args: "fix typo",
     });
     expect(withArgs.mode).toBe("resolved");
     expect(withArgs.prompt).toContain('args="fix typo"');
+    // path-first：显式 path 不依赖 name 扫盘
+    const byPath = host.skillsResolve("demo-skill", undefined, {
+      path: skillMd,
+    });
+    expect(byPath.mode).toBe("resolved");
+    expect(byPath.path).toBe(skillMd);
     const fb = host.skillsResolve("missing-skill-xyz");
-    expect(fb.mode).toBe("prompt_fallback");
+    expect(fb.mode).toBe("not_found");
+    expect(fb.prompt).toBeUndefined();
   });
 
   it("threads.btw and threads.interject via fake agent", async () => {
@@ -555,46 +561,20 @@ describe("P3 skills resolve + hooks", () => {
     await promptP.catch(() => undefined);
   });
 
-  it("hooksList reads hooks-trust.json (default untrusted until trust)", () => {
+  it("hooksList discovers GROK_HOME/hooks json (no fake per-hook trust)", () => {
     const home = tempHome();
-    const cfgDir = path.join(home, ".grok-desktop");
-    fs.mkdirSync(cfgDir, { recursive: true });
+    const hooksPath = path.join(home, ".grok-desktop", "hooks");
+    fs.mkdirSync(hooksPath, { recursive: true });
     fs.writeFileSync(
-      path.join(cfgDir, "config.toml"),
-      "# hooks\n# PreToolUse\n# PostToolUse\n",
+      path.join(hooksPath, "demo.json"),
+      JSON.stringify({ hooks: {} }),
       "utf8",
     );
-    // Pure module: default not trusted
-    const listed0 = listDesktopHooks(home);
-    const pre = listed0.hooks.find((h) => h.event === "PreToolUse");
-    expect(pre).toBeTruthy();
-    expect(pre!.trusted).toBe(false);
-
-    setHookTrusted("config:PreToolUse", true, home);
-    expect(loadHooksTrustMap(home)["config:PreToolUse"]).toBe(true);
-    const listed1 = listDesktopHooks(home);
-    expect(
-      listed1.hooks.find((h) => h.id === "config:PreToolUse")?.trusted,
-    ).toBe(true);
-
-    setHookTrusted("config:PreToolUse", false, home);
-    expect(
-      listDesktopHooks(home).hooks.find((h) => h.id === "config:PreToolUse")
-        ?.trusted,
-    ).toBe(false);
-
-    // Host facade uses same path
     const host = trackHost(new DesktopHost({ home }));
-    host.hooksTrust("config:PostToolUse");
-    expect(
-      host.hooksList().hooks.find((h) => h.id === "config:PostToolUse")
-        ?.trusted,
-    ).toBe(true);
-    host.hooksUntrust("config:PostToolUse");
-    expect(
-      host.hooksList().hooks.find((h) => h.id === "config:PostToolUse")
-        ?.trusted,
-    ).toBe(false);
+    const listed = host.hooksList();
+    expect(listed.hooks.some((h) => h.name === "demo")).toBe(true);
+    expect(listed.hooks.find((h) => h.name === "demo")?.scope).toBe("user");
+    expect(listed.hooks.find((h) => h.name === "demo")?.trusted).toBe(true);
   });
 });
 

@@ -196,7 +196,9 @@ async function handleHostIpc(
       );
       return resultOk({ opened: true });
     case "system.openPath":
-      await host.systemOpenPath(p.path as string);
+      await host.systemOpenPath(p.path as string, {
+        createDir: p.createDir === true,
+      });
       return resultOk({ opened: true });
     case "system.listEditors":
       return resultOk(host.systemListEditors());
@@ -586,13 +588,21 @@ async function handleHostIpc(
         ),
       );
     case "hooks.list":
-      return resultOk(host.hooksList());
-    case "hooks.trust":
-      return resultOk(host.hooksTrust(String(p.id ?? "")));
-    case "hooks.untrust":
-      return resultOk(host.hooksUntrust(String(p.id ?? "")));
+      return resultOk(
+        host.hooksList({
+          projectPath:
+            typeof p.projectPath === "string" ? p.projectPath : undefined,
+        }),
+      );
     case "hooks.reload":
-      return resultOk(host.hooksReload());
+      return resultOk(
+        host.hooksReload({
+          projectPath:
+            typeof p.projectPath === "string" ? p.projectPath : undefined,
+        }),
+      );
+    case "hooks.openDir":
+      return resultOk(await host.hooksOpenDir());
     case "skills.resolve":
       return resultOk(
         host.skillsResolve(
@@ -605,6 +615,10 @@ async function handleHostIpc(
                 : typeof p.arguments === "string"
                   ? p.arguments
                   : undefined,
+            path:
+              typeof p.path === "string" && p.path.trim()
+                ? p.path.trim()
+                : undefined,
           },
         ),
       );
@@ -813,18 +827,28 @@ async function handleHostIpc(
         host.automationsListRuns(p.automationId as string | undefined),
       );
     case "skills.list":
-      return resultOk(host.skillsList(p.projectPath as string | undefined));
-    case "skills.createDraft":
       return resultOk(
-        host.skillsCreateDraft({
-          name: p.name as string,
-          description: p.description as string | undefined,
-          scope: p.scope as "user" | "project" | undefined,
-          projectPath: p.projectPath as string | undefined,
+        host.skillsList(p.projectPath as string | undefined, {
+          force: Boolean(p.force),
         }),
       );
     case "skills.openPath":
       return resultOk(host.skillsOpenPath(p.path as string));
+    case "skills.delete":
+      return resultOk(
+        host.skillsDelete({
+          path: p.path as string,
+          name: p.name as string | undefined,
+          projectPath: p.projectPath as string | undefined,
+        }),
+      );
+    case "skills.importFromDir":
+      return resultOk(
+        host.skillsImportFromDir({
+          sourcePath: p.sourcePath as string,
+          force: p.force === true,
+        }),
+      );
     case "plugins.list":
       return resultOk(
         host.pluginsList(p.projectPath as string | undefined, {

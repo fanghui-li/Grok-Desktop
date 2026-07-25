@@ -18,7 +18,14 @@ export interface PluginsPageCallbacks {
   inv: Inv;
   esc: (s: string) => string;
   getSelectedProjectPath?: () => string | undefined;
+  /** 当前选中项目显示名（项目 skill 分组标题） */
+  getSelectedProjectName?: () => string | undefined;
   onUseSkill: (name: string) => void;
+  /**
+   * 新建技能：关闭扩展中心 → 新对话欢迎页，composer 插入 /create-skill。
+   * 对齐 CLI 对话式 create-skill（无 Host 空壳草稿）。
+   */
+  onCreateSkill?: () => void | Promise<void>;
   onOpenPath: (path: string) => void;
   onToast?: (msg: string) => void;
   /** 关闭插件页后恢复主界面焦点 */
@@ -167,10 +174,64 @@ function avatarHtml(
   </div>`;
 }
 
-function scopeLabel(scope?: string): string {
-  if (scope === "project") return tr("plug.scope.project");
-  if (scope === "user") return tr("plug.scope.user");
-  return tr("plug.scope.local");
+/** skill 展示来源：系统 bundled / 个人 / 项目 / 插件 */
+type SkillKind = "system" | "user" | "project" | "plugin";
+
+function skillKind(s: SkillRow): SkillKind {
+  const st = (s.sourceType || s.category || "").trim().toLowerCase();
+  if (st === "bundled") return "system";
+  if (st === "plugin" || st.startsWith("plugin:")) return "plugin";
+  if (
+    s.scope === "project" ||
+    st === "project" ||
+    st === "repo" ||
+    st === "local"
+  ) {
+    return "project";
+  }
+  return "user";
+}
+
+function skillBadgeLabel(s: SkillRow): string {
+  switch (skillKind(s)) {
+    case "system":
+      return tr("plug.scope.system");
+    case "project":
+      return tr("plug.scope.project");
+    case "plugin":
+      return tr("plug.scope.plugin");
+    default:
+      return tr("plug.scope.user");
+  }
+}
+
+/** inspect sourceType / category 的通用标签，不宜直接当分组标题 */
+function isGenericSkillSourceLabel(label: string): boolean {
+  const x = label.trim().toLowerCase();
+  return (
+    x === "project" ||
+    x === "repo" ||
+    x === "local" ||
+    x === "user" ||
+    x === "bundled" ||
+    x === "plugin" ||
+    x === "unknown" ||
+    x === "config" ||
+    x === "server"
+  );
+}
+
+function isProjectScopedSkill(s: SkillRow): boolean {
+  return skillKind(s) === "project";
+}
+
+/** 从 `…/<project>/.grok/skills/…` 取项目目录名 */
+function projectNameFromSkillPath(skillPath?: string): string | undefined {
+  if (!skillPath) return undefined;
+  const norm = skillPath.replace(/\\/g, "/");
+  const m = norm.match(/\/([^/]+)\/\.grok\/(?:skills|commands)(?:\/|$)/i);
+  if (m?.[1]) return m[1];
+  return undefined;
 }
 
 function statusLabel(p: PluginRow): string {
@@ -194,6 +255,8 @@ export class PluginsPageController {
   private markets: MarketSrc[] = [];
   private bound = false;
   private busy = false;
+  /** 至少成功加载过一次列表（含空列表），刷新时走 soft busy 而非整页闪白 */
+  private listHydrated = false;
   private detailText = "";
   private detailName = "";
 
@@ -222,9 +285,19 @@ export class PluginsPageController {
     }
     this.bindShell();
     this.syncChrome();
-    this.setSectionsHtml(`<div class="plugins-loading">${this.cb.esc(tr("plug.loading"))}</div>`);
-    await this.reload();
-    this.renderBody();
+    // 已 hydrate：保留列表 + 轻量刷新；首次打开才整页 loading
+    if (this.listHydrated) {
+      this.renderBody();
+      await this.withSoftBusy(tr("plug.loadingRefresh"), async () => {
+        await this.reload();
+      });
+    } else {
+      this.setSectionsHtml(
+        `<div class="plugins-loading">${this.cb.esc(tr("plug.loading"))}</div>`,
+      );
+      await this.reload();
+      this.renderBody();
+    }
     requestAnimationFrame(() => {
       (document.getElementById("plugins-search") as HTMLInputElement | null)?.focus();
     });
@@ -247,41 +320,63 @@ export class PluginsPageController {
     this.cb.onClosed?.();
   }
 
-  private async createSkillDraft(): Promise<void> {
-    const nameEl = document.getElementById("skill-create-name") as HTMLInputElement | null;
-    let name = nameEl?.value.trim() || "";
-    if (!name) {
-      // footer 快捷入口：无输入框时用 prompt
-      name = window.prompt(tr("plug.createSkillHint"), "")?.trim() || "";
-    }
-    if (!name) {
-      this.toast(tr("plug.createSkillEmpty"));
+  private async startCreateSkill(): Promise<void> {
+    if (!this.cb.onCreateSkill) {
+      this.toast(tr("plug.createSkillFail"));
       return;
     }
-    const scope = this.scope === "project" ? "project" : "user";
-    const projectPath =
-      scope === "project" ? this.cb.getSelectedProjectPath?.() : undefined;
-    if (scope === "project" && !projectPath) {
-      this.toast(tr("at.needProject"));
+    this.hide();
+    await this.cb.onCreateSkill();
+  }
+
+  /** 选目录 → 复制到 ~/.grok-desktop/skills/<name>/ */
+  private async importSkillFromDir(): Promise<void> {
+    const picked = await this.cb.inv<{ path: string | null; canceled?: boolean }>(
+      "system.pickDirectory",
+      { title: tr("plug.importSkillPick") },
+    );
+    if (!picked.ok) {
+      this.toast(picked.error?.message || tr("plug.importSkillFail"));
       return;
     }
-    this.busy = true;
-    const res = await this.cb.inv<{ name: string; path: string }>("skills.createDraft", {
-      name,
-      scope,
-      projectPath,
+    if (picked.data?.canceled || !picked.data?.path) return;
+
+    const sourcePath = picked.data.path;
+    await this.withSoftBusy(tr("plug.importingSkill"), async () => {
+      let res = await this.cb.inv<{
+        name: string;
+        path: string;
+        overwritten: boolean;
+      }>("skills.importFromDir", { sourcePath, force: false });
+
+      if (
+        !res.ok &&
+        /已存在|already exists|EXISTS/i.test(res.error?.message || "")
+      ) {
+        this.endSoftBusy();
+        this.renderBody();
+        if (!confirm(tr("plug.confirmImportOverwrite", { path: sourcePath }))) {
+          return;
+        }
+        this.beginSoftBusy(tr("plug.importingSkill"));
+        res = await this.cb.inv("skills.importFromDir", {
+          sourcePath,
+          force: true,
+        });
+      }
+
+      if (!res.ok) {
+        this.toast(res.error?.message || tr("plug.importSkillFail"));
+        return;
+      }
+      const name = res.data?.name ?? "";
+      this.toast(
+        res.data?.overwritten
+          ? tr("plug.importSkillOverwritten", { name })
+          : tr("plug.importSkillDone", { name }),
+      );
+      await this.reload(true);
     });
-    this.busy = false;
-    if (!res.ok || !res.data) {
-      this.toast(res.error?.message || tr("plug.createSkillFail"));
-      return;
-    }
-    this.toast(tr("plug.createSkillOk", { name: res.data.name }));
-    if (nameEl) nameEl.value = "";
-    // 打开草稿编辑
-    await this.cb.inv("skills.openPath", { path: res.data.path });
-    await this.reload();
-    this.renderBody();
   }
 
   private toast(msg: string): void {
@@ -334,9 +429,20 @@ export class PluginsPageController {
         this.tab = id;
         this.detailName = "";
         if (id === "market") {
-          this.setSectionsHtml(`<div class="plugins-loading">${this.cb.esc(tr("plug.loadingMarket"))}</div>`);
-          if (!this.markets.length || !this.available.length) {
-            await this.reload(true);
+          const needFetch = !this.markets.length || !this.available.length;
+          if (needFetch) {
+            // 已 hydrate 则保留列表；否则整页 loading
+            if (this.listHydrated) {
+              this.renderBody();
+              await this.withSoftBusy(tr("plug.loadingMarket"), async () => {
+                await this.reload(true);
+              });
+            } else {
+              this.setSectionsHtml(
+                `<div class="plugins-loading">${this.cb.esc(tr("plug.loadingMarket"))}</div>`,
+              );
+              await this.reload(true);
+            }
           }
           // 默认第一个市场源
           this.scope = this.markets[0]?.name || "user";
@@ -420,20 +526,19 @@ export class PluginsPageController {
       return;
     }
     if (action === "details" && t.dataset.name) {
-      this.busy = true;
-      this.setSectionsHtml(`<div class="plugins-loading">${this.cb.esc(tr("plug.loadingDetail"))}</div>`);
-      const res = await this.cb.inv<{ name: string; text: string }>("plugins.details", {
-        name: t.dataset.name,
+      const name = t.dataset.name;
+      await this.withSoftBusy(tr("plug.loadingDetail"), async () => {
+        const res = await this.cb.inv<{ name: string; text: string }>(
+          "plugins.details",
+          { name },
+        );
+        if (!res.ok) {
+          this.toast(res.error?.message || tr("plug.detailFail"));
+          return;
+        }
+        this.detailName = name;
+        this.detailText = res.data?.text || tr("plug.noDetail");
       });
-      this.busy = false;
-      if (!res.ok) {
-        this.toast(res.error?.message || tr("plug.detailFail"));
-        this.renderBody();
-        return;
-      }
-      this.detailName = t.dataset.name;
-      this.detailText = res.data?.text || tr("plug.noDetail");
-      this.renderBody();
       return;
     }
 
@@ -450,22 +555,23 @@ export class PluginsPageController {
       return;
     }
     if (action === "mcp-doctor") {
-      this.busy = true;
-      this.setSectionsHtml(`<div class="plugins-loading">${this.cb.esc(tr("plug.loadingDoctor"))}</div>`);
-      const res = await this.cb.inv<{ text: string; json?: unknown }>("mcp.doctor", {
-        name: t.dataset.name || undefined,
+      const mcpName = t.dataset.name || undefined;
+      await this.withSoftBusy(tr("plug.loadingDoctor"), async () => {
+        const res = await this.cb.inv<{ text: string; json?: unknown }>(
+          "mcp.doctor",
+          { name: mcpName },
+        );
+        if (!res.ok) {
+          this.toast(res.error?.message || tr("plug.doctorFail"));
+          return;
+        }
+        this.detailName = mcpName ? `MCP · ${mcpName}` : "MCP doctor";
+        this.detailText =
+          res.data?.text ||
+          (res.data?.json
+            ? JSON.stringify(res.data.json, null, 2)
+            : tr("plug.noOutput"));
       });
-      this.busy = false;
-      if (!res.ok) {
-        this.toast(res.error?.message || tr("plug.doctorFail"));
-        this.renderBody();
-        return;
-      }
-      this.detailName = t.dataset.name ? `MCP · ${t.dataset.name}` : "MCP doctor";
-      this.detailText =
-        res.data?.text ||
-        (res.data?.json ? JSON.stringify(res.data.json, null, 2) : tr("plug.noOutput"));
-      this.renderBody();
       return;
     }
     if (action === "mcp-add-submit") {
@@ -507,35 +613,123 @@ export class PluginsPageController {
       if (p) this.cb.onOpenPath(p);
       return;
     }
-    if (action === "create-skill" || action === "create-skill-submit") {
-      await this.createSkillDraft();
+    if (action === "create-skill") {
+      await this.startCreateSkill();
       return;
     }
-    if (action === "open-skill" && t.dataset.path) {
-      const res = await this.cb.inv<{ opened: boolean; path: string }>("skills.openPath", {
-        path: t.dataset.path,
-      });
-      if (!res.ok) {
-        this.toast(res.error?.message || tr("plug.createSkillFail"));
+    if (action === "import-skill") {
+      await this.importSkillFromDir();
+      return;
+    }
+    if (action === "delete-skill" && t.dataset.path) {
+      const name = t.dataset.name || "";
+      const path0 = t.dataset.path;
+      if (
+        !confirm(
+          tr("plug.confirmDeleteSkill", { name, path: path0 }),
+        )
+      ) {
         return;
       }
-      this.toast(res.data?.path || t.dataset.path);
+      await this.runMut(
+        "skills.delete",
+        {
+          path: path0,
+          name: name || undefined,
+          projectPath: this.cb.getSelectedProjectPath?.(),
+        },
+        tr("plug.deletingSkill"),
+      );
       return;
     }
     if (action === "open-skills-dir" || action === "open-plugins-dir") {
       const cfg = await this.cb.inv<{ paths?: { grokHome?: string } }>("config.get");
       const home = cfg.data?.paths?.grokHome;
-      if (!home) return;
+      if (!home) {
+        this.toast(tr("plug.openDirFail"));
+        return;
+      }
       const sep = home.includes("\\") ? "\\" : "/";
       const sub = action === "open-skills-dir" ? "skills" : "plugins";
-      this.cb.onOpenPath(`${home}${sep}${sub}`);
+      const dir = `${home}${sep}${sub}`;
+      // 走系统资源管理器（kind=folder）；目录不存在时 createDir，避免「无反应」
+      const res = await this.cb.inv("system.openPath", {
+        path: dir,
+        createDir: true,
+      });
+      if (!res.ok) {
+        this.toast(res.error?.message || tr("plug.openDirFail"));
+      }
       return;
     }
     if (action === "reload") {
-      this.setSectionsHtml(`<div class="plugins-loading">${this.cb.esc(tr("plug.loadingRefresh"))}</div>`);
-      await this.reload(true);
-      this.renderBody();
+      await this.withSoftBusy(tr("plug.loadingRefresh"), async () => {
+        await this.reload(true);
+      });
       return;
+    }
+  }
+
+  /**
+   * 轻量刷新态：保留旧列表（含空态），顶部条 + 略透明，避免整页「刷新中…」闪白。
+   * 尚未 hydrate 时回退为整页 loading。
+   */
+  private beginSoftBusy(label: string): void {
+    const root = document.getElementById("plugins-sections");
+    if (!root) return;
+    const canKeep =
+      this.listHydrated ||
+      Boolean(
+        root.querySelector(
+          ".plugins-card, .plugins-detail, .plugins-section, .plugins-empty",
+        ),
+      );
+    if (!canKeep) {
+      root.innerHTML = `<div class="plugins-loading">${this.cb.esc(label)}</div>`;
+      root.classList.remove("is-refreshing");
+      root.removeAttribute("data-refresh-label");
+      root.setAttribute("aria-busy", "true");
+      return;
+    }
+    root.classList.add("is-refreshing");
+    root.setAttribute("aria-busy", "true");
+    root.setAttribute("data-refresh-label", label);
+    let bar = root.querySelector<HTMLElement>(".plugins-refresh-bar");
+    if (!bar) {
+      bar = document.createElement("div");
+      bar.className = "plugins-refresh-bar";
+      bar.setAttribute("role", "status");
+      root.prepend(bar);
+    }
+    bar.textContent = label;
+  }
+
+  private endSoftBusy(): void {
+    const root = document.getElementById("plugins-sections");
+    if (!root) return;
+    root.classList.remove("is-refreshing");
+    root.removeAttribute("data-refresh-label");
+    root.setAttribute("aria-busy", "false");
+    root.querySelector(".plugins-refresh-bar")?.remove();
+  }
+
+  /**
+   * 异步操作：busy 互斥 + soft busy UI + 结束后 renderBody。
+   * 同类刷新/变更一律走此路径，禁止再 setSectionsHtml 整页 loading。
+   */
+  private async withSoftBusy(
+    label: string,
+    fn: () => Promise<void>,
+  ): Promise<void> {
+    if (this.busy) return;
+    this.busy = true;
+    this.beginSoftBusy(label);
+    try {
+      await fn();
+    } finally {
+      this.busy = false;
+      this.endSoftBusy();
+      if (this.open) this.renderBody();
     }
   }
 
@@ -544,18 +738,15 @@ export class PluginsPageController {
     params: unknown,
     loading: string,
   ): Promise<void> {
-    this.busy = true;
-    this.setSectionsHtml(`<div class="plugins-loading">${this.cb.esc(loading)}</div>`);
-    const res = await this.cb.inv<{ message?: string }>(method, params);
-    this.busy = false;
-    if (!res.ok) {
-      this.toast(res.error?.message || tr("plug.opFail"));
-      this.renderBody();
-      return;
-    }
-    this.toast(res.data?.message || tr("plug.done"));
-    await this.reload(true);
-    this.renderBody();
+    await this.withSoftBusy(loading, async () => {
+      const res = await this.cb.inv<{ message?: string }>(method, params);
+      if (!res.ok) {
+        this.toast(res.error?.message || tr("plug.opFail"));
+        return;
+      }
+      this.toast(res.data?.message || tr("plug.done"));
+      await this.reload(true);
+    });
   }
 
   private async submitMcpAdd(): Promise<void> {
@@ -607,7 +798,11 @@ export class PluginsPageController {
   private async reload(forceAvailable = false): Promise<void> {
     const path0 = this.cb.getSelectedProjectPath?.();
     const [skills, plugins, mcp, markets] = await Promise.all([
-      this.cb.inv<SkillRow[]>("skills.list", { projectPath: path0 }),
+      // force：绕过 Host skill registry TTL（对齐 Codex Refresh）
+      this.cb.inv<SkillRow[]>("skills.list", {
+        projectPath: path0,
+        force: true,
+      }),
       this.cb.inv<PluginRow[]>("plugins.list", { projectPath: path0 }),
       this.cb.inv<McpRow[]>("mcp.list"),
       this.cb.inv<MarketSrc[]>("plugins.marketplace.list").catch(() => ({
@@ -628,6 +823,7 @@ export class PluginsPageController {
         this.scope = this.markets[0].name;
       }
     }
+    this.listHydrated = true;
   }
 
   private async reloadAvailable(): Promise<void> {
@@ -712,13 +908,23 @@ export class PluginsPageController {
       if (search) search.placeholder = tr("plug.searchSkills");
       if (chips) {
         chips.classList.remove("hidden");
+        // 个人 / 系统 / 项目：bundled 单独「系统」，不再混在个人里
+        if (
+          this.scope !== "user" &&
+          this.scope !== "system" &&
+          this.scope !== "project"
+        ) {
+          this.scope = "user";
+        }
         chips.innerHTML = `
           ${this.chip("user", tr("plug.scope.user"))}
+          ${this.chip("system", tr("plug.scope.system"))}
           ${this.chip("project", tr("plug.scope.project"))}`;
       }
       if (footer) {
         footer.innerHTML = `
           <button type="button" class="plugins-link-btn" data-action="create-skill">${this.cb.esc(tr("plug.createSkill"))}</button>
+          <button type="button" class="plugins-link-btn" data-action="import-skill">${this.cb.esc(tr("plug.importSkill"))}</button>
           <button type="button" class="plugins-link-btn" data-action="reload">${this.cb.esc(tr("plug.refresh"))}</button>
           <button type="button" class="plugins-link-btn" data-action="open-skills-dir">${this.cb.esc(tr("plug.openSkillsDir"))}</button>`;
       }
@@ -782,6 +988,13 @@ export class PluginsPageController {
   }
 
   private renderBody(): void {
+    // 重绘前记下刷新条文案，避免 search/scope 重绘冲掉 soft busy
+    const root = document.getElementById("plugins-sections");
+    const refreshLabel =
+      this.busy && root?.classList.contains("is-refreshing")
+        ? root.getAttribute("data-refresh-label") || tr("plug.loadingRefresh")
+        : null;
+
     if (this.detailName) {
       this.setSectionsHtml(`
         <div class="plugins-detail">
@@ -791,12 +1004,17 @@ export class PluginsPageController {
           </div>
           <pre class="plugins-detail-pre">${this.cb.esc(this.detailText)}</pre>
         </div>`);
-      return;
+    } else if (this.tab === "skills") {
+      this.setSectionsHtml(this.skillsSections());
+    } else if (this.tab === "market") {
+      this.setSectionsHtml(this.marketSections());
+    } else if (this.tab === "mcp") {
+      this.setSectionsHtml(this.mcpSections());
+    } else {
+      this.setSectionsHtml(this.pluginsSections());
     }
-    if (this.tab === "skills") this.setSectionsHtml(this.skillsSections());
-    else if (this.tab === "market") this.setSectionsHtml(this.marketSections());
-    else if (this.tab === "mcp") this.setSectionsHtml(this.mcpSections());
-    else this.setSectionsHtml(this.pluginsSections());
+
+    if (refreshLabel) this.beginSoftBusy(refreshLabel);
   }
 
   private matchQuery(hay: string): boolean {
@@ -822,28 +1040,18 @@ export class PluginsPageController {
           `${s.name} ${s.description ?? ""} ${s.category ?? ""} ${s.sourceType ?? ""}`,
         ),
     );
-    const createForm = `<section class="plugins-section">
-      <h2 class="plugins-section-title">${this.cb.esc(tr("plug.createSkillTitle"))}</h2>
-      <div class="plugins-form-row">
-        <input id="skill-create-name" class="plugins-input" placeholder="${this.cb.esc(tr("plug.createSkillPh"))}" />
-        <button type="button" class="plugins-card-btn primary" data-action="create-skill-submit">${this.cb.esc(tr("plug.createSkill"))}</button>
-      </div>
-      <p class="plugins-form-hint">${this.cb.esc(tr("plug.createSkillHint"))} · scope=${this.cb.esc(this.scope === "project" ? "project" : "user")}</p>
-    </section>`;
+    // 新建/导入在标题行右上角；个人真源 ~/.grok-desktop/skills
     if (!list.length) {
-      return createForm + `<div class="plugins-empty">${this.cb.esc(tr("plug.noSkills"))}</div>`;
+      return `<div class="plugins-empty">${this.cb.esc(tr("plug.noSkills"))}</div>`;
     }
     const groups = new Map<string, SkillRow[]>();
     for (const s of list) {
-      const g =
-        s.category?.trim() ||
-        s.sourceType ||
-        (s.scope === "project" ? tr("plug.skillsProject") : tr("plug.skillsUser"));
+      const g = this.skillGroupLabel(s);
       const arr = groups.get(g) ?? [];
       arr.push(s);
       groups.set(g, arr);
     }
-    let html = createForm;
+    let html = "";
     for (const [g, items] of groups) {
       html += `<section class="plugins-section">
         <h2 class="plugins-section-title">${this.cb.esc(g)} · ${items.length}</h2>
@@ -855,10 +1063,40 @@ export class PluginsPageController {
     return html;
   }
 
+  /**
+   * 分组标题：
+   * - 系统 →「系统内置」
+   * - 项目 → 当前项目名
+   * - 个人 / 插件 → 对应文案（勿用 sourceType 字面量）
+   */
+  private skillGroupLabel(s: SkillRow): string {
+    const kind = skillKind(s);
+    if (kind === "system") return tr("plug.skillsSystem");
+    if (kind === "plugin") {
+      const cat = s.category?.trim();
+      if (cat && !isGenericSkillSourceLabel(cat)) return cat;
+      return tr("plug.skillsPlugin");
+    }
+    if (kind === "project") {
+      const name = this.cb.getSelectedProjectName?.()?.trim();
+      if (name) return name;
+      const fromPath = projectNameFromSkillPath(s.path);
+      if (fromPath) return fromPath;
+      return tr("plug.skillsProject");
+    }
+    const cat = s.category?.trim();
+    if (cat && !isGenericSkillSourceLabel(cat)) return cat;
+    const st = s.sourceType?.trim();
+    if (st && !isGenericSkillSourceLabel(st)) return st;
+    return tr("plug.skillsUser");
+  }
+
   private scopeOkSkill(s: SkillRow): boolean {
     if (this.scope === "all") return true;
-    if (this.scope === "user") return s.scope !== "project";
-    if (this.scope === "project") return s.scope === "project";
+    const kind = skillKind(s);
+    if (this.scope === "system") return kind === "system";
+    if (this.scope === "user") return kind === "user" || kind === "plugin";
+    if (this.scope === "project") return kind === "project";
     return true;
   }
 
@@ -973,6 +1211,14 @@ export class PluginsPageController {
   }
 
   private skillCard(s: SkillRow): string {
+    const kind = skillKind(s);
+    const badge = skillBadgeLabel(s);
+    const badgeClass =
+      kind === "system"
+        ? "plugins-card-badge plugins-card-badge-system"
+        : kind === "plugin"
+          ? "plugins-card-badge plugins-card-badge-plugin"
+          : "plugins-card-badge";
     return `
       <article class="plugins-card">
         <div class="plugins-card-main">
@@ -980,7 +1226,7 @@ export class PluginsPageController {
           <div class="plugins-card-text">
             <div class="plugins-card-title-row">
               <span class="plugins-card-name">${this.cb.esc(s.name)}</span>
-              <span class="plugins-card-badge">${this.cb.esc(scopeLabel(s.scope))}</span>
+              <span class="${badgeClass}">${this.cb.esc(badge)}</span>
             </div>
             <div class="plugins-card-desc">${this.cb.esc(s.description || "Skill")}</div>
           </div>
@@ -988,8 +1234,9 @@ export class PluginsPageController {
         <div class="plugins-card-actions">
           <button type="button" class="plugins-card-btn primary" data-action="use-skill" data-name="${this.cb.esc(s.name)}">${this.cb.esc(tr("plug.use"))}</button>
           ${
-            s.path
-              ? `<button type="button" class="plugins-card-btn" data-action="open-skill" data-path="${this.cb.esc(s.path)}">${this.cb.esc(tr("plug.openSkill"))}</button>`
+            // 系统内置不可删；插件 skill 也不在此删（走卸载插件）
+            s.path && kind !== "system" && kind !== "plugin"
+              ? `<button type="button" class="plugins-card-btn" data-action="delete-skill" data-name="${this.cb.esc(s.name)}" data-path="${this.cb.esc(s.path)}">${this.cb.esc(tr("plug.deleteSkill"))}</button>`
               : ""
           }
         </div>

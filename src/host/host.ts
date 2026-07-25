@@ -188,7 +188,12 @@ import {
   pickLruDetachTargets,
   type LiveAttachSnapshot,
 } from "./attach-policy.js";
-import { listDesktopHooks, setHookTrusted } from "./hooks-trust.js";
+import { listDesktopHooks } from "./hooks-discover.js";
+import {
+  grantFolderTrust,
+  revokeFolderTrust,
+} from "./folder-trust.js";
+import { hooksDir } from "./paths.js";
 import {
   clearQueue,
   completeSending,
@@ -211,6 +216,10 @@ import {
   writeForkSummary,
 } from "./fork-session.js";
 import { aggregateTasksLoose } from "./tasks-aggregate.js";
+import {
+  SkillRegistry,
+  type SkillsResolveResult,
+} from "./skill-registry.js";
 
 export interface DesktopHostOptions {
   home?: string;
@@ -287,6 +296,8 @@ export class DesktopHost {
   readonly worktrees: WorktreeService;
   readonly automations: AutomationStore;
   readonly threadMeta: ThreadMetaStore;
+  /** list/resolve 同集合（path-first；inspect → FS） */
+  private readonly skillRegistry: SkillRegistry;
 
   constructor(opts: DesktopHostOptions = {}) {
     this.home = opts.home;
@@ -315,6 +326,9 @@ export class DesktopHost {
     this.worktrees = new WorktreeService(opts.home);
     this.automations = new AutomationStore(opts.home);
     this.threadMeta = new ThreadMetaStore(opts.home);
+    this.skillRegistry = new SkillRegistry({
+      list: (projectPath) => skillsListCli(this.grokCliRunner(), projectPath),
+    });
     this.startIdleDetachLoop();
   }
 
@@ -634,14 +648,27 @@ export class DesktopHost {
   }
 
   projectsAdd(input: { path: string; title?: string; trust?: boolean }): Project {
-    return this.projects.add(input);
+    const p = this.projects.add(input);
+    // L1：Desktop 项目信任 → agent folder-trust（项目 hooks / 项目 MCP 闸门）
+    if (p.trust === "trusted") {
+      grantFolderTrust(p.path, this.home);
+    }
+    return p;
   }
 
   projectsUpdate(
     id: string,
     patch: Partial<Pick<Project, "title" | "pinned" | "archived" | "trust">>,
   ): Project {
-    return this.projects.update(id, patch);
+    const p = this.projects.update(id, patch);
+    if (patch.trust !== undefined) {
+      if (p.trust === "trusted") {
+        grantFolderTrust(p.path, this.home);
+      } else if (p.trust === "untrusted") {
+        revokeFolderTrust(p.path, this.home);
+      }
+    }
+    return p;
   }
 
   projectsRemove(id: string): void {
@@ -2431,8 +2458,11 @@ export class DesktopHost {
     openInEditor(filePath, line, cmd);
   }
 
-  async systemOpenPath(targetPath: string): Promise<void> {
-    await openPath(targetPath);
+  async systemOpenPath(
+    targetPath: string,
+    opts?: { createDir?: boolean },
+  ): Promise<void> {
+    await openPath(targetPath, opts);
   }
 
   /** 探测本机编辑器，供设置「打开位置」下拉 */
@@ -2880,50 +2910,12 @@ export class DesktopHost {
     return r;
   }
 
-  skillsList(projectPath?: string) {
-    return skillsListCli(this.grokCliRunner(), projectPath);
-  }
-
-  /** 在 Desktop GROK_HOME（或项目 .grok/skills）创建 skill 草稿目录 */
-  skillsCreateDraft(params: {
-    name: string;
-    description?: string;
-    scope?: "user" | "project";
-    projectPath?: string;
-  }): { name: string; path: string } {
-    const raw = (params.name || "").trim();
-    if (!raw) throw new HostError("INVALID_ARGUMENT", "skill name required");
-    // 安全名：字母数字 _ -
-    const name = raw
-      .replace(/[^a-zA-Z0-9._-]+/g, "-")
-      .replace(/^-+|-+$/g, "")
-      .slice(0, 64);
-    if (!name) throw new HostError("INVALID_ARGUMENT", "invalid skill name");
-    const scope = params.scope === "project" ? "project" : "user";
-    let base: string;
-    if (scope === "project") {
-      const proj = (params.projectPath || "").trim();
-      if (!proj) {
-        throw new HostError(
-          "INVALID_ARGUMENT",
-          "projectPath required for project skill",
-        );
-      }
-      base = path.join(proj, ".grok", "skills", name);
-    } else {
-      base = path.join(grokHomeDir(this.home), "skills", name);
-    }
-    fs.mkdirSync(base, { recursive: true });
-    const skillMd = path.join(base, "SKILL.md");
-    if (!fs.existsSync(skillMd)) {
-      const desc = (params.description || "").trim() || name;
-      const body =
-        `---\nname: ${name}\ndescription: ${desc}\n---\n\n# ${name}\n\n` +
-        `（在此编写 skill 说明与步骤。保存后可在 / 菜单或插件页使用。）\n`;
-      fs.writeFileSync(skillMd, body, "utf8");
-    }
-    this.logger.info("skills.createDraft", { name, path: base, scope });
-    return { name, path: base };
+  /**
+   * 列出 skills（单源 registry；与 resolve 同集合）。
+   * force：绕过 TTL（插件页 Refresh / 创建后）。
+   */
+  skillsList(projectPath?: string, opts?: { force?: boolean }) {
+    return this.skillRegistry.list(projectPath, Boolean(opts?.force));
   }
 
   skillsOpenPath(skillPath: string): { opened: boolean; path: string } {
@@ -2968,6 +2960,180 @@ export class DesktopHost {
     return { opened: true, path: openTarget };
   }
 
+  /**
+   * 删除磁盘上的 skill 目录（个人 / 项目）。
+   * 系统内置（bundled）与插件 skill 拒绝删除。
+   */
+  skillsDelete(params: {
+    path: string;
+    name?: string;
+    projectPath?: string;
+  }): { deleted: boolean; path: string; name: string } {
+    const raw = (params.path || "").trim();
+    if (!raw) {
+      throw new HostError("INVALID_ARGUMENT", "skill path required");
+    }
+    const resolved = path.resolve(raw);
+    if (!fs.existsSync(resolved)) {
+      throw new HostError("IO_ERROR", `Skill path not found: ${resolved}`);
+    }
+
+    // 解析 skill 根目录：path 可能是 SKILL.md 或目录
+    let skillDir = resolved;
+    const st = fs.statSync(resolved);
+    if (st.isFile()) {
+      if (path.basename(resolved).toLowerCase() !== "skill.md") {
+        throw new HostError("INVALID_ARGUMENT", "not a skill path");
+      }
+      skillDir = path.dirname(resolved);
+    } else if (!st.isDirectory()) {
+      throw new HostError("INVALID_ARGUMENT", "not a skill path");
+    }
+
+    const skillMd = path.join(skillDir, "SKILL.md");
+    if (!fs.existsSync(skillMd)) {
+      throw new HostError("IO_ERROR", `SKILL.md not found under ${skillDir}`);
+    }
+
+    const norm = (p: string) => path.resolve(p).replace(/\\/g, "/").toLowerCase();
+    const dirN = norm(skillDir);
+    const under = (root: string) => {
+      const r = norm(root).replace(/\/+$/, "");
+      return dirN === r || dirN.startsWith(`${r}/`);
+    };
+
+    // 系统内置：bundled / 安装包 skills
+    if (
+      under(path.join(grokHomeDir(this.home), "bundled")) ||
+      dirN.includes("/bundled/skills/") ||
+      dirN.includes("/resources/skills/")
+    ) {
+      throw new HostError(
+        "PERMISSION_DENIED",
+        "系统内置技能不可删除",
+      );
+    }
+
+    const desktopSkills = path.join(grokHomeDir(this.home), "skills");
+    const projectSkills = params.projectPath
+      ? path.join(params.projectPath, ".grok", "skills")
+      : null;
+
+    // 个人真源仅 Desktop GROK_HOME/skills；~/.grok 不在此删
+    const inUser = under(desktopSkills);
+    const inProject =
+      (projectSkills && under(projectSkills)) ||
+      /[/\\]\.grok[/\\]skills([/\\]|$)/i.test(skillDir);
+
+    if (!inUser && !inProject) {
+      throw new HostError(
+        "PERMISSION_DENIED",
+        "仅可删除 Desktop 个人技能（~/.grok-desktop/skills）或项目技能，系统内置与插件技能不可删除",
+      );
+    }
+
+    // 只删 skills 下一层目录，防止误删整个 skills 根
+    const parent = path.dirname(skillDir);
+    const parentN = norm(parent);
+    const allowedParents = [
+      desktopSkills,
+      ...(projectSkills ? [projectSkills] : []),
+    ].map((p) => norm(p));
+    const parentIsSkillsRoot =
+      allowedParents.includes(parentN) ||
+      /[/\\]\.grok[/\\]skills$/i.test(parent.replace(/\\/g, "/"));
+    if (!parentIsSkillsRoot) {
+      throw new HostError(
+        "PERMISSION_DENIED",
+        "skill path is not a direct skills/<name> directory",
+      );
+    }
+
+    const name = (params.name || path.basename(skillDir)).trim();
+    fs.rmSync(skillDir, { recursive: true, force: true });
+    this.skillRegistry.invalidate(params.projectPath);
+    this.skillRegistry.invalidate();
+    this.logger.info("skills.delete", { name, path: skillDir });
+    return { deleted: true, path: skillDir, name };
+  }
+
+  /**
+   * 从本地目录导入 skill → ~/.grok-desktop/skills/<name>/（复制，不移动）。
+   * source 可为 skill 根目录（含 SKILL.md）或 SKILL.md 文件路径。
+   */
+  skillsImportFromDir(params: {
+    sourcePath: string;
+    force?: boolean;
+  }): { name: string; path: string; overwritten: boolean } {
+    const raw = (params.sourcePath || "").trim();
+    if (!raw) {
+      throw new HostError("INVALID_ARGUMENT", "sourcePath required");
+    }
+    const resolved = path.resolve(raw);
+    if (!fs.existsSync(resolved)) {
+      throw new HostError("IO_ERROR", `Path not found: ${resolved}`);
+    }
+
+    let skillDir = resolved;
+    const st = fs.statSync(resolved);
+    if (st.isFile()) {
+      if (path.basename(resolved).toLowerCase() !== "skill.md") {
+        throw new HostError(
+          "INVALID_ARGUMENT",
+          "请选择含 SKILL.md 的技能目录",
+        );
+      }
+      skillDir = path.dirname(resolved);
+    } else if (!st.isDirectory()) {
+      throw new HostError("INVALID_ARGUMENT", "请选择技能目录");
+    }
+
+    const skillMd = path.join(skillDir, "SKILL.md");
+    if (!fs.existsSync(skillMd)) {
+      throw new HostError(
+        "INVALID_ARGUMENT",
+        `目录内未找到 SKILL.md：${skillDir}`,
+      );
+    }
+
+    const name = path.basename(skillDir).trim();
+    if (!name || name === "." || name === "..") {
+      throw new HostError("INVALID_ARGUMENT", "invalid skill name");
+    }
+
+    const destRoot = path.join(grokHomeDir(this.home), "skills");
+    fs.mkdirSync(destRoot, { recursive: true });
+    const dest = path.join(destRoot, name);
+
+    const norm = (p: string) => path.resolve(p).replace(/\\/g, "/").toLowerCase();
+    if (norm(skillDir) === norm(dest)) {
+      throw new HostError(
+        "INVALID_ARGUMENT",
+        "源目录已是 Desktop 个人技能目录",
+      );
+    }
+
+    const overwritten = fs.existsSync(dest);
+    if (overwritten && !params.force) {
+      throw new HostError(
+        "INVALID_ARGUMENT",
+        `技能「${name}」已存在，确认覆盖后再导入`,
+        { code: "EXISTS", name, path: dest },
+      );
+    }
+    if (overwritten) {
+      fs.rmSync(dest, { recursive: true, force: true });
+    }
+    fs.cpSync(skillDir, dest, { recursive: true });
+    this.skillRegistry.invalidate();
+    this.logger.info("skills.import", {
+      name,
+      from: skillDir,
+      to: dest,
+      overwritten,
+    });
+    return { name, path: dest, overwritten };
+  }
 
   pluginsList(projectPath?: string, opts?: { available?: boolean }) {
     return pluginsListCli(this.grokCliRunner(), {
@@ -4029,105 +4195,88 @@ export class DesktopHost {
     return { sessionId, items };
   }
 
-  // ── Hooks (P3-B) ─────────────────────────────────────────
+  // ── Hooks（运行时归 agent；Host 只做发现列表 + 目录入口 + folder-trust 桥）──
 
-  hooksList(): {
+  hooksList(opts?: { projectPath?: string }): {
     hooks: Array<{
       id: string;
-      source: string;
-      event?: string;
-      command?: string;
+      name: string;
+      path: string;
+      scope: "user" | "project";
       trusted: boolean;
-      path?: string;
+      source: string;
     }>;
+    hooksDir: string;
     note?: string;
   } {
-    return listDesktopHooks(this.home);
+    return listDesktopHooks(this.home, {
+      projectPath: opts?.projectPath,
+    });
   }
 
-  hooksTrust(id: string): { ok: true; id: string } {
-    setHookTrusted(id, true, this.home);
-    return { ok: true, id };
+  hooksReload(opts?: { projectPath?: string }): {
+    ok: true;
+    hooks: ReturnType<DesktopHost["hooksList"]>["hooks"];
+    hooksDir: string;
+  } {
+    const list = this.hooksList(opts);
+    return { ok: true, hooks: list.hooks, hooksDir: list.hooksDir };
   }
 
-  hooksUntrust(id: string): { ok: true; id: string } {
-    setHookTrusted(id, false, this.home);
-    return { ok: true, id };
+  /** 打开/创建 Desktop GROK_HOME/hooks */
+  async hooksOpenDir(): Promise<{ ok: boolean; path: string }> {
+    const dir = hooksDir(this.home);
+    fs.mkdirSync(dir, { recursive: true });
+    try {
+      await openPath(dir, { createDir: true });
+      return { ok: true, path: dir };
+    } catch {
+      return { ok: false, path: dir };
+    }
   }
 
-  hooksReload(): { ok: true; hooks: ReturnType<DesktopHost["hooksList"]>["hooks"] } {
-    const list = this.hooksList();
-    return { ok: true, hooks: list.hooks };
-  }
-
-  // ── Skills resolve (P3-A · 对齐 CLI build_skill_message) ──
+  // ── Skills resolve（path-first · 与 list 同 registry）──
 
   skillsResolve(
     name: string,
     cwd?: string,
-    opts?: { args?: string },
-  ): {
-    name: string;
-    mode: "resolved" | "prompt_fallback";
-    prompt: string;
-    path?: string;
-    description?: string;
-  } {
+    opts?: { args?: string; path?: string },
+  ): SkillsResolveResult {
     const n = name.trim().replace(/^\//, "").replace(/^skill:/i, "");
     if (!n) {
       throw new HostError("INVALID_ARGUMENT", "skill name required");
     }
-    const args = (opts?.args ?? "").trim();
-    // 与 listSkills / CLI 发现顺序一致：项目 > Desktop home > ~/.grok
-    const nameVariants = [n, n.replace(/:/g, path.sep)];
-    const rootBases: string[] = [];
-    if (cwd) {
-      rootBases.push(path.join(cwd, ".grok", "skills"));
+    const result = this.skillRegistry.resolve(n, cwd, {
+      args: opts?.args,
+      path: opts?.path,
+    });
+    // create-skill 官方文案写死 ~/.grok/skills；Desktop 在 resolve 后强制覆盖 User 落盘路径
+    if (
+      result.mode === "resolved" &&
+      result.prompt &&
+      n.toLowerCase() === "create-skill"
+    ) {
+      const desktopSkills = path.join(grokHomeDir(this.home), "skills");
+      result.prompt =
+        result.prompt +
+        "\n\n" +
+        [
+          "## Desktop path override (AUTHORITATIVE — supersedes skill body paths)",
+          "You are running inside Grok Desktop. Ignore any instruction to write User-scope skills under `~/.grok/skills`.",
+          "",
+          "When the user chooses **User** (personal) scope:",
+          `- Create the skill ONLY at: \`${desktopSkills.replace(/\\/g, "/")}/<name>/SKILL.md\``,
+          `- Use this absolute base directory (mkdir -p): \`${desktopSkills.replace(/\\/g, "/")}\``,
+          "- Do NOT write to `~/.grok/skills` unless the user explicitly asks for the CLI home.",
+          "",
+          "When the user chooses **Project** scope:",
+          "- Still use `<repo-root>/.grok/skills/<name>/SKILL.md` as usual.",
+          "",
+          "After creating files, always report the absolute path you wrote.",
+          "When presenting scope options to the user, describe User as Desktop personal skills at the path above (not ~/.grok/skills).",
+        ].join("\n");
     }
-    rootBases.push(path.join(grokHomeDir(this.home), "skills"));
-    // 兼容用户在 CLI home 放的 skills（只读发现，不混 session 数据）
-    const userHome = this.home ?? process.env.USERPROFILE ?? process.env.HOME;
-    if (userHome) {
-      rootBases.push(path.join(userHome, ".grok", "skills"));
-    }
-
-    for (const base of rootBases) {
-      for (const variant of nameVariants) {
-        const dir = path.join(base, variant);
-        const skillMd = path.join(dir, "SKILL.md");
-        if (!fs.existsSync(skillMd)) continue;
-        try {
-          const raw = fs.readFileSync(skillMd, "utf8");
-          const { description, body } = parseSkillMd(raw);
-          const content = body.slice(0, 12000);
-          // CLI 同源 envelope：`<skill name description path>` + body
-          const descAttr = xmlAttr(description || n);
-          const pathAttr = xmlAttr(skillMd);
-          const nameAttr = xmlAttr(n);
-          const argsAttr = args ? ` args="${xmlAttr(args)}"` : "";
-          const envelope =
-            `<skill name="${nameAttr}" description="${descAttr}" path="${pathAttr}"${argsAttr}>\n` +
-            `${content}\n` +
-            `</skill>`;
-          // 用户 slash → 直接注入 prompt（对齐 CLI skill_information 零往返路径）
-          const prompt = buildSkillInformationPrompt(n, skillMd, envelope);
-          return {
-            name: n,
-            mode: "resolved",
-            path: skillMd,
-            description: description || undefined,
-            prompt,
-          };
-        } catch {
-          /* continue */
-        }
-      }
-    }
-    return {
-      name: n,
-      mode: "prompt_fallback",
-      prompt: `Please run the skill named "${n}" if available.`,
-    };
+    return result;
   }
 
   private onClientEvent(threadId: string, ev: NormalizedEvent): void {
@@ -4411,47 +4560,4 @@ function legacyModeToPatch(mode: SessionMode): {
   return { alwaysApprove: false, plan: false };
 }
 
-/** SKILL.md frontmatter + body（对齐 CLI skill 加载） */
-function parseSkillMd(raw: string): { description: string; body: string } {
-  const text = raw.replace(/^\uFEFF/, "");
-  const fm = /^---\r?\n([\s\S]*?)\r?\n---\r?\n?([\s\S]*)$/.exec(text);
-  if (!fm) {
-    return { description: "", body: text.trim() };
-  }
-  const head = fm[1] ?? "";
-  const body = (fm[2] ?? "").trim();
-  const d = /^description:\s*(.+)$/m.exec(head);
-  let description = d?.[1]?.trim().replace(/^["']|["']$/g, "") ?? "";
-  if (!description) {
-    const n = /^name:\s*(.+)$/m.exec(head);
-    description = n?.[1]?.trim().replace(/^["']|["']$/g, "") ?? "";
-  }
-  return { description, body };
-}
 
-function xmlAttr(s: string): string {
-  return s
-    .replace(/&/g, "&amp;")
-    .replace(/"/g, "&quot;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;");
-}
-
-/**
- * 用户 slash 带参数时：CLI 式 skill_information 索引 + envelope。
- * 无参数时仅发 `<skill>` 块即可（agent skill tool 同源）。
- */
-function buildSkillInformationPrompt(
-  name: string,
-  skillPath: string,
-  skillEnvelope: string,
-): string {
-  return (
-    `<skill_information>\n` +
-    `<skills_referenced>\n` +
-    `- name="${xmlAttr(name)}" path="${xmlAttr(skillPath)}"\n` +
-    `</skills_referenced>\n` +
-    `${skillEnvelope}\n` +
-    `</skill_information>`
-  );
-}

@@ -276,7 +276,7 @@ grok agent stdio（agent-bin / 安装包 / PATH）
 | X4 | availableCommands 合并 | agent 广告 | Host 缓存 + slash 合并 | ✅ | |
 | X5 | Plugins / 市场 | `/plugins` | 插件页 | ✅ | |
 | X6 | MCP | `/mcps` 等 | 设置 + session 透传 | ✅ | |
-| X7 | Hooks | hooks-* + `/hooks` | 设置扫描 + 本地 trust | 🟡 | 非 shell 全量子命令 |
+| X7 | Hooks | hooks-* + `/hooks` | **运行时**：agent + `GROK_HOME/hooks`；**闸门**：项目 trust→`trusted_folders.toml`；设置页只读发现+打开目录 | 🟡 | 无全量管理台/无 ClientHooks；2026-07-26 L0–L2 |
 
 ---
 

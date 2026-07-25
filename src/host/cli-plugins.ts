@@ -119,6 +119,9 @@ export function skillsListCli(
             argumentHint?: string;
             argument_hint?: string;
             "argument-hint"?: string;
+            userInvocable?: boolean;
+            user_invocable?: boolean;
+            "user-invocable"?: boolean;
           }>;
         } | null;
         if (Array.isArray(data?.skills) && data!.skills!.length) {
@@ -172,6 +175,10 @@ export function skillsListCli(
               if (!argumentHint && skillPath) {
                 argumentHint = readArgumentHintFromPath(skillPath);
               }
+              const invRaw =
+                s.userInvocable ?? s.user_invocable ?? s["user-invocable"];
+              const userInvocable =
+                typeof invRaw === "boolean" ? invRaw : undefined;
               return {
                 name: String(s.name ?? "skill"),
                 path: skillPath,
@@ -180,6 +187,7 @@ export function skillsListCli(
                 category: s.vendor || srcType,
                 sourceType: srcType,
                 argumentHint,
+                userInvocable,
               };
             });
         }

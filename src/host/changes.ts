@@ -110,10 +110,24 @@ export function openInEditor(
 }
 
 /** 在资源管理器 / Finder 中打开路径（目录或文件所在位置） */
-export async function openPath(targetPath: string): Promise<void> {
+export async function openPath(
+  targetPath: string,
+  opts?: { /** 不存在时先 mkdir（仅目录入口，如 Skills/Plugins） */ createDir?: boolean },
+): Promise<void> {
   const resolved = path.resolve(targetPath);
   if (!fs.existsSync(resolved)) {
-    throw new HostError("IO_ERROR", `Path not found: ${resolved}`);
+    if (opts?.createDir) {
+      try {
+        fs.mkdirSync(resolved, { recursive: true });
+      } catch (e) {
+        throw new HostError(
+          "IO_ERROR",
+          `Failed to create directory: ${e instanceof Error ? e.message : String(e)}`,
+        );
+      }
+    } else {
+      throw new HostError("IO_ERROR", `Path not found: ${resolved}`);
+    }
   }
   // Electron 主进程：优先 shell.openPath（Windows 比 spawn explorer 更稳）
   try {

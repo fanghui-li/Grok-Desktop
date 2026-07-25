@@ -2485,38 +2485,39 @@ export class SettingsPageController {
     }
   }
 
-  // ── Hooks（P3-B）──────────────────────────────────────
+  // ── Hooks（运行时归 agent；设置页只读发现 + 打开目录）──
 
   private async htmlHooks(): Promise<string> {
+    const projectPath = this.cb.getSelectedProjectPath?.();
     const res = await this.cb.inv<{
       hooks: Array<{
         id: string;
-        source: string;
-        event?: string;
+        name: string;
+        path: string;
+        scope: "user" | "project";
         trusted: boolean;
-        path?: string;
+        source: string;
       }>;
+      hooksDir?: string;
       note?: string;
-    }>("hooks.list");
+    }>("hooks.list", { projectPath });
     const hooks = res.data?.hooks ?? [];
-    const note = res.data?.note;
+    const hooksDirPath = res.data?.hooksDir ?? "";
     const rows =
       hooks.length === 0
-        ? `<p class="settings-muted">${this.cb.esc(tr("settings.hooksEmpty"))}</p>
-           ${note ? `<p class="settings-desc">${this.cb.esc(note)}</p>` : ""}`
+        ? `<p class="settings-muted">${this.cb.esc(tr("settings.hooksEmpty"))}</p>`
         : hooks
             .map((h) => {
-              const trustLabel = h.trusted
-                ? tr("settings.hooksTrusted")
-                : tr("settings.hooksUntrusted");
+              const scopeLabel =
+                h.scope === "project"
+                  ? h.trusted
+                    ? tr("settings.hooksScopeProjectTrusted")
+                    : tr("settings.hooksScopeProjectUntrusted")
+                  : tr("settings.hooksScopeUser");
               return `<div class="settings-row" data-hook-id="${this.cb.esc(h.id)}">
                 <div class="settings-row-text">
-                  <div class="settings-row-title">${this.cb.esc(h.event || h.id)}</div>
-                  <div class="settings-row-sub">${this.cb.esc(h.source)} · ${this.cb.esc(trustLabel)}</div>
-                </div>
-                <div class="settings-row-actions">
-                  <button type="button" class="btn-ghost sm" data-hook-trust="${this.cb.esc(h.id)}">${this.cb.esc(tr("settings.hooksTrust"))}</button>
-                  <button type="button" class="btn-ghost sm" data-hook-untrust="${this.cb.esc(h.id)}">${this.cb.esc(tr("settings.hooksUntrust"))}</button>
+                  <div class="settings-row-title">${this.cb.esc(h.name)}</div>
+                  <div class="settings-row-sub">${this.cb.esc(scopeLabel)} · ${this.cb.esc(h.path)}</div>
                 </div>
               </div>`;
             })
@@ -2524,34 +2525,31 @@ export class SettingsPageController {
     return `
       <h1 class="settings-title">${this.cb.esc(tr("settings.hooksTitle"))}</h1>
       <p class="settings-desc">${this.cb.esc(tr("settings.hooksDesc"))}</p>
+      ${
+        hooksDirPath
+          ? `<p class="settings-desc mono">${this.cb.esc(hooksDirPath)}</p>`
+          : ""
+      }
       <div class="settings-card">${rows}</div>
-      <div class="settings-row" style="margin-top:12px">
-        <button type="button" class="btn-dark sm" id="hooks-reload">${this.cb.esc(tr("settings.hooksReload"))}</button>
+      <div class="settings-row" style="margin-top:12px;gap:8px;flex-wrap:wrap">
+        <button type="button" class="btn-dark sm" id="hooks-open-dir">${this.cb.esc(tr("settings.hooksOpenDir"))}</button>
+        <button type="button" class="btn-ghost sm" id="hooks-reload">${this.cb.esc(tr("settings.hooksReload"))}</button>
       </div>
     `;
   }
 
   private bindHooks(root: HTMLElement): void {
+    const projectPath = this.cb.getSelectedProjectPath?.();
     const reload = root.querySelector("#hooks-reload") as HTMLElement | null;
     reload?.addEventListener("click", () => {
-      void this.cb.inv("hooks.reload").then(() => this.renderContent());
+      void this.cb
+        .inv("hooks.reload", { projectPath })
+        .then(() => this.renderContent());
     });
-    for (const btn of Array.from(root.querySelectorAll("[data-hook-trust]"))) {
-      (btn as HTMLElement).addEventListener("click", () => {
-        const id = (btn as HTMLElement).dataset.hookTrust ?? "";
-        if (!id) return;
-        void this.cb.inv("hooks.trust", { id }).then(() => this.renderContent());
-      });
-    }
-    for (const btn of Array.from(root.querySelectorAll("[data-hook-untrust]"))) {
-      (btn as HTMLElement).addEventListener("click", () => {
-        const id = (btn as HTMLElement).dataset.hookUntrust ?? "";
-        if (!id) return;
-        void this.cb
-          .inv("hooks.untrust", { id })
-          .then(() => this.renderContent());
-      });
-    }
+    const openDir = root.querySelector("#hooks-open-dir") as HTMLElement | null;
+    openDir?.addEventListener("click", () => {
+      void this.cb.inv("hooks.openDir");
+    });
   }
 
   // ── 快捷键 ─────────────────────────────────────────────

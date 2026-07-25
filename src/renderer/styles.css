@@ -6421,7 +6421,7 @@ html[data-theme="dark"] .about-hero-banner--warn {
 .plugins-tabs {
   display: inline-flex;
   padding: 3px;
-  background: #eee;
+  background: var(--bg-muted);
   border-radius: 999px;
   gap: 2px;
 }
@@ -6431,12 +6431,22 @@ html[data-theme="dark"] .about-hero-banner--warn {
   font-size: 13px;
   color: var(--text-2);
   font-weight: 500;
+  background: transparent;
+  border: 0;
+  cursor: pointer;
 }
-.plugins-tab:hover { color: var(--text); }
+.plugins-tab:hover {
+  color: var(--text);
+  background: var(--bg-hover);
+}
 .plugins-tab.active {
   background: var(--bg-card);
   color: var(--text);
-  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.06);
+  box-shadow: 0 1px 2px color-mix(in srgb, var(--text) 8%, transparent);
+}
+.plugins-tab.active:hover {
+  background: var(--bg-card);
+  color: var(--text);
 }
 
 .plugins-scroll {
@@ -6450,11 +6460,27 @@ html[data-theme="dark"] .about-hero-banner--warn {
   margin: 0 auto;
   padding: 12px 28px 24px;
 }
-.plugins-title {
+.plugins-title-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
   margin: 0 0 16px;
+  min-width: 0;
+}
+.plugins-title {
+  margin: 0;
   font-size: 28px;
   font-weight: 600;
   letter-spacing: -0.02em;
+  min-width: 0;
+  flex: 1 1 auto;
+}
+.plugins-title-row .plugins-footer {
+  flex: 0 0 auto;
+  margin: 0;
+  padding: 0;
+  justify-content: flex-end;
 }
 
 .plugins-toolbar {
@@ -6501,11 +6527,18 @@ html[data-theme="dark"] .about-hero-banner--warn {
   cursor: pointer;
   -webkit-app-region: no-drag;
 }
-.plugins-chip:hover { background: rgba(0, 0, 0, 0.04); color: var(--text); }
+.plugins-chip:hover {
+  background: var(--bg-hover);
+  color: var(--text);
+}
 .plugins-chip.active {
-  background: #1a1a1a;
-  color: #fff;
-  border-color: #1a1a1a;
+  background: var(--text);
+  color: var(--bg-card);
+  border-color: var(--text);
+}
+.plugins-chip.active:hover {
+  background: var(--text);
+  color: var(--bg-card);
 }
 
 .plugins-section { margin-bottom: 28px; }
@@ -6614,6 +6647,27 @@ html[data-theme="dark"] .about-hero-banner--warn {
   font-weight: 400;
   text-transform: none;
 }
+/* 系统内置 skill：与个人/项目区分 */
+.plugins-card-badge-system {
+  color: #5b4fcf;
+  background: #efeefc;
+}
+.plugins-card-badge-plugin {
+  color: #0d7377;
+  background: #e6f5f5;
+}
+html[data-theme="dark"] .plugins-card-badge {
+  background: rgba(255, 255, 255, 0.08);
+  color: var(--text-3);
+}
+html[data-theme="dark"] .plugins-card-badge-system {
+  color: #b4a7ff;
+  background: rgba(120, 100, 255, 0.18);
+}
+html[data-theme="dark"] .plugins-card-badge-plugin {
+  color: #7ed4d8;
+  background: rgba(13, 115, 119, 0.22);
+}
 .plugins-card-desc {
   font-size: 12.5px;
   color: var(--text-3);
@@ -6660,9 +6714,8 @@ html[data-theme="dark"] .about-hero-banner--warn {
 .plugins-footer {
   display: flex;
   flex-wrap: wrap;
-  gap: 10px;
-  margin-top: 8px;
-  padding-top: 16px;
+  gap: 8px;
+  align-items: center;
 }
 .plugins-link-btn {
   padding: 7px 12px;
@@ -6682,6 +6735,46 @@ html[data-theme="dark"] .about-hero-banner--warn {
   text-align: center;
   color: var(--text-3);
   font-size: 13.5px;
+}
+/* stale-while-revalidate：刷新时保留旧列表，不整页闪白 */
+#plugins-sections.is-refreshing {
+  position: relative;
+  pointer-events: none;
+}
+#plugins-sections.is-refreshing > :not(.plugins-refresh-bar) {
+  opacity: 0.72;
+  transition: opacity 0.15s ease;
+}
+.plugins-refresh-bar {
+  position: sticky;
+  top: 0;
+  z-index: 2;
+  margin: 0 0 10px;
+  padding: 8px 12px;
+  text-align: center;
+  font-size: 12.5px;
+  color: var(--text-2);
+  background: var(--bg-muted);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  box-shadow: 0 1px 0 rgba(0, 0, 0, 0.04);
+}
+.plugins-refresh-bar::before {
+  content: "";
+  display: inline-block;
+  width: 12px;
+  height: 12px;
+  margin-right: 8px;
+  vertical-align: -2px;
+  border: 2px solid var(--border);
+  border-top-color: var(--text-2);
+  border-radius: 50%;
+  animation: plugins-spin 0.7s linear infinite;
+}
+@keyframes plugins-spin {
+  to {
+    transform: rotate(360deg);
+  }
 }
 .plugins-form-row {
   display: flex;
@@ -6706,6 +6799,16 @@ html[data-theme="dark"] .about-hero-banner--warn {
   margin: 8px 0 0;
   font-size: 12px;
   color: var(--text-3);
+}
+.plugins-skills-note {
+  margin: 0 0 16px;
+  padding: 10px 12px;
+  font-size: 12px;
+  line-height: 1.55;
+  color: var(--text-3);
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-radius: 10px;
 }
 .plugins-form-card {
   padding: 12px;

@@ -45,7 +45,7 @@ function tempRepo(): string {
   return dir;
 }
 
-describe("P1 rest: @! hidden / skills draft / threads.fork", () => {
+describe("P1 rest: @! hidden / threads.fork", () => {
   it("searchProjectFiles skips dotfiles by default; includeHidden and !query show them", () => {
     const repo = tempRepo();
     const normal = searchProjectFiles({ cwd: repo, query: "env", limit: 50 });
@@ -61,32 +61,6 @@ describe("P1 rest: @! hidden / skills draft / threads.fork", () => {
 
     const bang = searchProjectFiles({ cwd: repo, query: "!env", limit: 50 });
     expect(bang.hits.some((h) => h.name.includes(".env"))).toBe(true);
-  });
-
-  it("skillsCreateDraft writes SKILL.md under user skills", () => {
-    const host = makeHost();
-    const r = host.skillsCreateDraft({
-      name: "My Cool Skill!",
-      description: "demo",
-    });
-    expect(r.name).toBe("My-Cool-Skill");
-    expect(fs.existsSync(path.join(r.path, "SKILL.md"))).toBe(true);
-    const body = fs.readFileSync(path.join(r.path, "SKILL.md"), "utf8");
-    expect(body).toContain("name: My-Cool-Skill");
-    expect(body).toContain("demo");
-  });
-
-  it("skillsCreateDraft project scope uses .grok/skills", () => {
-    const host = makeHost();
-    const repo = tempRepo();
-    const r = host.skillsCreateDraft({
-      name: "proj-skill",
-      scope: "project",
-      projectPath: repo,
-    });
-    const norm = r.path.replace(/\\/g, "/");
-    expect(norm).toContain(".grok/skills/proj-skill");
-    expect(fs.existsSync(path.join(r.path, "SKILL.md"))).toBe(true);
   });
 
   it("threadsFork copies chat_history and marks parent", async () => {

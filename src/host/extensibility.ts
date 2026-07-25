@@ -16,9 +16,9 @@ export function listSkills(opts?: {
   projectPath?: string;
 }): SkillInfo[] {
   const home = opts?.home ?? os.homedir();
+  // Desktop 个人真源：仅 ~/.grok-desktop/skills（不再合并 ~/.grok/skills；互通走导入）
   const roots: { dir: string; scope: SkillInfo["scope"] }[] = [
     { dir: path.join(grokHomeDir(home), "skills"), scope: "user" },
-    { dir: path.join(home, ".grok", "skills"), scope: "user" },
   ];
   if (opts?.projectPath) {
     roots.push({
@@ -64,6 +64,7 @@ function walkSkills(
         description: meta.description,
         category: meta.category,
         argumentHint: meta.argumentHint,
+        userInvocable: meta.userInvocable,
         scope,
       });
     } else if (ent.isDirectory()) {
@@ -76,6 +77,7 @@ function readSkillMeta(skillMd: string): {
   description?: string;
   category?: string;
   argumentHint?: string;
+  userInvocable?: boolean;
 } {
   try {
     const text = fs.readFileSync(skillMd, "utf8");
@@ -83,6 +85,7 @@ function readSkillMeta(skillMd: string): {
     let description: string | undefined;
     let category: string | undefined;
     let argumentHint: string | undefined;
+    let userInvocable: boolean | undefined;
     if (fm) {
       const d = /^description:\s*(.+)$/m.exec(fm[1]);
       if (d) description = d[1].trim().replace(/^["']|["']$/g, "");
@@ -94,6 +97,16 @@ function readSkillMeta(skillMd: string): {
         /^argumentHint:\s*(.+)$/m.exec(fm[1]) ||
         /^argument_hint:\s*(.+)$/m.exec(fm[1]);
       if (h) argumentHint = h[1].trim().replace(/^["']|["']$/g, "");
+      // CLI：user-invocable（缺省 true；仅字面 false 为 false）
+      const ui =
+        /^user-invocable:\s*(.+)$/m.exec(fm[1]) ||
+        /^userInvocable:\s*(.+)$/m.exec(fm[1]) ||
+        /^user_invocable:\s*(.+)$/m.exec(fm[1]);
+      if (ui) {
+        const v = ui[1].trim().replace(/^["']|["']$/g, "").toLowerCase();
+        if (v === "false" || v === "0" || v === "no") userInvocable = false;
+        else if (v === "true" || v === "1" || v === "yes") userInvocable = true;
+      }
     }
     if (!description) {
       const line = text
@@ -101,7 +114,7 @@ function readSkillMeta(skillMd: string): {
         .find((l) => l.trim() && !l.startsWith("#") && !l.startsWith("---"));
       description = line?.trim().slice(0, 160);
     }
-    return { description, category, argumentHint };
+    return { description, category, argumentHint, userInvocable };
   } catch {
     return {};
   }

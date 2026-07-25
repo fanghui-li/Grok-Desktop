@@ -71,8 +71,8 @@ export type SlashAction =
   | { kind: "interject"; text?: string }
   /** 本会话 / 新会话最大回合数（写入偏好；新会话 _meta 透传） */
   | { kind: "set-max-turns"; turns?: number }
-  /** agent 广告的 slash：作为 insert-text 或透传 */
-  | { kind: "agent-command"; name: string }
+  /** agent 广告 / skill：作为 insert 或 resolve；skill 带 path 时 path-first */
+  | { kind: "agent-command"; name: string; path?: string }
   /** CLI 对齐 Memory：浏览 / 记住 / flush / dream / status */
   | {
       kind: "memory";
@@ -552,27 +552,35 @@ export function skillCommands(
     description?: string;
     scope?: string;
     argumentHint?: string;
+    path?: string;
+    /** CLI user-invocable；false 不进 slash（缺省 true） */
+    userInvocable?: boolean;
   }>,
 ): SlashCommandDef[] {
-  return skills.map((s) => {
-    const hint = s.argumentHint?.trim() || undefined;
-    return {
-      id: `skill:${s.name}`,
-      title: s.name,
-      description: s.description?.trim() || tr("slash.skillDefaultDesc"),
-      keywords: `skill 技能 ${s.name}`,
-      icon: "⬡",
-      dynamic: true,
-      badge: skillScopeBadge(s.scope),
-      acceptMode: "insert" as const,
-      argumentHint: hint,
-      // Host skills.resolve 在发送路径执行；palette 只插入
-      action: {
-        kind: "agent-command" as const,
-        name: s.name,
-      },
-    };
-  });
+  return skills
+    .filter((s) => s.userInvocable !== false)
+    .filter((s) => (s.name || "").trim())
+    .map((s) => {
+      const hint = s.argumentHint?.trim() || undefined;
+      const skillPath = s.path?.trim() || undefined;
+      return {
+        id: `skill:${s.name}`,
+        title: s.name,
+        description: s.description?.trim() || tr("slash.skillDefaultDesc"),
+        keywords: `skill 技能 ${s.name}`,
+        icon: "⬡",
+        dynamic: true,
+        badge: skillScopeBadge(s.scope),
+        acceptMode: "insert" as const,
+        argumentHint: hint,
+        // Host skills.resolve path-first；palette 只插入 `/name `
+        action: {
+          kind: "agent-command" as const,
+          name: s.name,
+          path: skillPath,
+        },
+      };
+    });
 }
 
 /**

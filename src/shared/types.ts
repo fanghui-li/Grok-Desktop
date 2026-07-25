@@ -323,6 +323,7 @@ export interface AutomationRun {
 
 export interface SkillInfo {
   name: string;
+  /** SKILL.md 或 skill 目录绝对路径（list/resolve 绑定键） */
   path: string;
   description?: string;
   scope: "user" | "project" | "unknown";
@@ -332,6 +333,11 @@ export interface SkillInfo {
   sourceType?: string;
   /** SKILL.md `argument-hint`：slash 补全后占位参数 */
   argumentHint?: string;
+  /**
+   * 是否可作为用户 slash（CLI user-invocable）。
+   * 缺省 true；false 时不进 Desktop `/` 菜单，仍可被模型侧使用。
+   */
+  userInvocable?: boolean;
 }
 
 export interface PluginComponentSummary {
