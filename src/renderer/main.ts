@@ -90,6 +90,7 @@ import type { ThemeVariant, VariantAppearance } from "../shared/theme/types.js";
 import {
   applyChromeTheme,
   defaultAppearance,
+  deriveChromeCssTokens,
   formatCodexThemeV1,
 } from "../shared/theme/index.js";
 import { PluginsPageController } from "./plugins-page.js";
@@ -489,6 +490,28 @@ function setWelcomeTitle(): void {
     ? tr("welcome.askProject", { title: p.title })
     : tr("welcome.askGeneric");
   $("project-chip-label").textContent = p?.title ?? tr("picker.usingNone");
+  syncChatTopTitle();
+}
+
+/** Codex 式会话列顶栏标题：当前线程名 / 欢迎态文案 */
+function syncChatTopTitle(): void {
+  const el = document.getElementById("chat-top-title");
+  if (!el) return;
+  const row =
+    threads.find((t) => t.sessionId === activeSessionId) ??
+    threads.find((t) => t.id === activeThreadId);
+  if (row || activeSessionId) {
+    const title = threadDisplayTitle(row, activeSessionId ?? undefined);
+    el.textContent = title;
+    el.title = title;
+    return;
+  }
+  const p = selectedProject();
+  const fallback = p
+    ? tr("welcome.askProject", { title: p.title })
+    : tr("chat.topTitleEmpty");
+  el.textContent = fallback;
+  el.title = fallback;
 }
 
 function closeProjectPicker(): void {
@@ -559,6 +582,7 @@ function openProjectPicker(): void {
 function showWelcome(show: boolean): void {
   $("welcome").classList.toggle("hidden", !show);
   $("chat").classList.toggle("hidden", show);
+  syncChatTopTitle();
   if (!show) {
     requestAnimationFrame(() => {
       syncChatComposerReserve();
@@ -4296,6 +4320,7 @@ async function startFreshSessionWithModel(
 
   activeThreadId = res.data!.threadId;
   activeSessionId = res.data!.sessionId;
+  syncChatTopTitle();
   setActiveCwd(res.data!.cwd);
   sidePane?.onSessionChanged();
   if (p?.id) selectedProjectId = p.id;
@@ -9795,6 +9820,8 @@ async function refreshProjectsAndThreads(): Promise<void> {
   ]);
   projects = pRes.data ?? [];
   threads = tRes.data ?? [];
+  // 列表刷新后同步会话顶栏标题（agent 可能改写 title）
+  syncChatTopTitle();
 
   if (!projectChoiceTouched && !selectedProjectId && projects.length) {
     selectedProjectId = projects[0].id;
@@ -10115,6 +10142,7 @@ async function openThread(t: ThreadRow): Promise<void> {
   }
   activeThreadId = t.id;
   activeSessionId = t.sessionId;
+  syncChatTopTitle();
   // 先套上目标会话的 plan 投影（避免全局 planPhase 残留导致误 surface）
   if (!sameSession) {
     const planProj = getSessionPlan(t.sessionId);
@@ -11798,11 +11826,15 @@ function appearanceForVariant(v: ThemeVariant): VariantAppearance {
   return v === "light" ? appearanceLight : appearanceDark;
 }
 
-function paintResolvedTheme(resolved: ThemeVariant): void {
+function paintResolvedTheme(
+  resolved: ThemeVariant,
+  opts?: { animate?: boolean },
+): void {
   const app = appearanceForVariant(resolved);
   const isDefault = app.codeThemeId === "default" || app.codeThemeId === "codex";
+  // 始终 derive（含默认预设），与设置页 chrome 编辑同一管道
   applyChromeTheme(app.chromeTheme, resolved, {
-    isDefaultPreset: isDefault,
+    animate: opts?.animate === true,
   });
   // 冷启动缓存（theme-boot 可读）
   try {
@@ -11819,7 +11851,11 @@ function paintResolvedTheme(resolved: ThemeVariant): void {
   } catch {
     /* ignore */
   }
-  void inv("ui.setChromeTheme", { theme: resolved }).catch(() => {
+  // Windows titleBarOverlay 必须与 CSS shell 同色，否则右上角系统按钮区会跳色
+  const tokens = deriveChromeCssTokens(app.chromeTheme, resolved);
+  const bg = tokens["--bg"] ?? tokens["--bg-sidebar"];
+  const symbol = tokens["--text"];
+  void inv("ui.setChromeTheme", { theme: resolved, bg, symbol }).catch(() => {
     /* older shell */
   });
 }
@@ -11856,7 +11892,7 @@ function applyThemePreference(pref: SettingsThemePreference): void {
   } catch {
     /* ignore */
   }
-  paintResolvedTheme(resolveTheme(pref));
+  paintResolvedTheme(resolveTheme(pref), { animate: true });
   bindSystemThemeListener();
 }
 
@@ -13460,6 +13496,14 @@ npm start</pre>
   const SIDEBAR_W_DEFAULT = 220;
   const SIDEBAR_W_MIN = 160;
   const SIDEBAR_W_MAX = 480;
+  /**
+   * 窄窗自动收起左右栏，只留主会话（对齐 Codex 响应式）。
+   * 加宽后恢复进入窄窗前的展开状态；不写入「用户偏好」以免污染 LS。
+   */
+  const LAYOUT_COMPACT_MAX = 960;
+  let layoutCompact = false;
+  let preCompactLeftCollapsed = false;
+  let preCompactRightOpen = false;
   const applySidebarWidth = (px: number, persist = true) => {
     const maxByViewport = Math.floor(window.innerWidth * 0.45);
     const w = Math.min(
@@ -13484,16 +13528,18 @@ npm start</pre>
   } catch {
     /* keep CSS default */
   }
-  const applyLeftSidebar = (collapsed: boolean) => {
+  const applyLeftSidebar = (collapsed: boolean, persist = true) => {
     const app = document.getElementById("app");
     const expandBtn = document.getElementById("btn-sidebar-expand");
     app?.classList.toggle("sidebar-collapsed", collapsed);
     expandBtn?.classList.toggle("hidden", !collapsed);
     expandBtn?.setAttribute("aria-expanded", collapsed ? "false" : "true");
-    try {
-      localStorage.setItem(LS_SIDEBAR, collapsed ? "1" : "0");
-    } catch {
-      /* ignore */
+    if (persist) {
+      try {
+        localStorage.setItem(LS_SIDEBAR, collapsed ? "1" : "0");
+      } catch {
+        /* ignore */
+      }
     }
   };
   const toggleLeftSidebar = () => {
@@ -13510,6 +13556,53 @@ npm start</pre>
     applyLeftSidebar(true);
   document.getElementById("btn-sidebar-expand")!.onclick = () =>
     applyLeftSidebar(false);
+
+  /**
+   * 进入/离开窄窗：自动收起或恢复左右栏。
+   * 仅在跨越阈值时动作；窄窗内用户可临时展开，不反复强制关、不改 preCompact。
+   * 全屏 focusMode 不强制关右栏。
+   */
+  const syncLayoutCompact = () => {
+    const want = window.innerWidth <= LAYOUT_COMPACT_MAX;
+    const app = document.getElementById("app");
+    app?.classList.toggle("layout-compact", want);
+    if (want === layoutCompact) return;
+
+    if (want) {
+      layoutCompact = true;
+      preCompactLeftCollapsed =
+        app?.classList.contains("sidebar-collapsed") ?? false;
+      preCompactRightOpen =
+        (sidePane?.isOpen() ?? false) && !(sidePane?.isFocusMode() ?? false);
+      applyLeftSidebar(true, false);
+      if (sidePane?.isOpen() && !sidePane.isFocusMode()) {
+        sidePane.setOpen(false);
+      }
+    } else {
+      layoutCompact = false;
+      applyLeftSidebar(preCompactLeftCollapsed, true);
+      if (preCompactRightOpen && sidePane && !sidePane.isOpen()) {
+        sidePane.setOpen(true);
+      }
+      preCompactLeftCollapsed = false;
+      preCompactRightOpen = false;
+    }
+  };
+  syncLayoutCompact();
+  window.addEventListener("resize", () => {
+    syncLayoutCompact();
+    try {
+      const cur =
+        parseFloat(
+          getComputedStyle(document.documentElement).getPropertyValue(
+            "--sidebar-w",
+          ),
+        ) || SIDEBAR_W_DEFAULT;
+      applySidebarWidth(cur, false);
+    } catch {
+      /* ignore */
+    }
+  });
 
   // 左栏右缘拖动改宽
   const sidebarResizer = document.getElementById("sidebar-resizer");
@@ -13602,7 +13695,7 @@ npm start</pre>
     }
   });
 
-  $("btn-open-location").onclick = async () => {
+  const openProjectLocation = async () => {
     const p = selectedProject();
     if (!p) {
       showToast("请先选择或添加项目", "error");
@@ -13626,6 +13719,7 @@ npm start</pre>
       );
     }
   };
+  $("btn-open-location").onclick = () => void openProjectLocation();
 
   $("btn-sandbox-setup").onclick = () => {
     showPermMenu($("btn-sandbox-setup"));

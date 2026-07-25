@@ -12,9 +12,12 @@ import {
   appearanceFromPreset,
   assertVariantMatch,
   isKnownCodeThemeId,
+  isLowContrastChrome,
+  mergeChromeTheme,
   parseCodexThemeV1,
   presetsForVariant,
 } from "../shared/theme/index.js";
+import type { ChromeTheme } from "../shared/theme/types.js";
 
 type Inv = <T>(method: HostIpcMethod, params?: unknown) => Promise<{
   ok: boolean;
@@ -514,7 +517,13 @@ export class SettingsPageController {
       !presets.some((p) => p.id === app.codeThemeId) && app.codeThemeId
         ? `<option value="${this.cb.esc(app.codeThemeId)}" selected>${this.cb.esc(app.codeThemeId)}</option>`
         : "";
-    const swatchStyle = `background:${this.cb.esc(app.chromeTheme.surface)};color:${this.cb.esc(app.chromeTheme.accent)};border-color:color-mix(in srgb, ${this.cb.esc(app.chromeTheme.ink)} 16%, ${this.cb.esc(app.chromeTheme.surface)})`;
+    const chrome = app.chromeTheme;
+    const swatchStyle = `background:${this.cb.esc(chrome.surface)};color:${this.cb.esc(chrome.accent)};border-color:color-mix(in srgb, ${this.cb.esc(chrome.ink)} 16%, ${this.cb.esc(chrome.surface)})`;
+    const aaPreviewStyle = `background:${this.cb.esc(chrome.surface)};border-color:color-mix(in srgb, ${this.cb.esc(chrome.ink)} 18%, ${this.cb.esc(chrome.surface)})`;
+    const lowContrast = isLowContrastChrome(chrome, variant);
+    const fontUi = chrome.fonts.ui ?? "";
+    const fontCode = chrome.fonts.code ?? "";
+    const translucentOn = !chrome.opaqueWindows;
 
     return `
       <h1 class="settings-title">${this.cb.esc(tr("settings.section.appearance"))}</h1>
@@ -543,7 +552,46 @@ export class SettingsPageController {
             </div>
           </div>
         </div>
-        <p class="settings-muted settings-theme-chrome-hint" id="theme-chrome-hint"></p>
+
+        <div class="settings-form-card settings-theme-chrome-card" id="theme-chrome-editor">
+          ${this.chromeColorRow("accent", tr("settings.theme.accent"), chrome.accent)}
+          ${this.chromeColorRow("surface", tr("settings.theme.background"), chrome.surface)}
+          ${this.chromeColorRow("ink", tr("settings.theme.foreground"), chrome.ink)}
+          <div class="settings-row">
+            <div class="settings-row-text">
+              <div class="settings-row-title">${this.cb.esc(tr("settings.theme.fontUi"))}</div>
+            </div>
+            <input type="text" class="settings-input settings-theme-font-input" id="chrome-font-ui" value="${this.cb.esc(fontUi)}" placeholder="Inter" spellcheck="false" autocomplete="off" />
+          </div>
+          <div class="settings-row">
+            <div class="settings-row-text">
+              <div class="settings-row-title">${this.cb.esc(tr("settings.theme.fontCode"))}</div>
+            </div>
+            <input type="text" class="settings-input settings-theme-font-input" id="chrome-font-code" value="${this.cb.esc(fontCode)}" placeholder="ui-monospace" spellcheck="false" autocomplete="off" />
+          </div>
+          <div class="settings-row">
+            <div class="settings-row-text">
+              <div class="settings-row-title">${this.cb.esc(tr("settings.theme.translucentSidebar"))}</div>
+            </div>
+            <button type="button" class="settings-toggle${translucentOn ? " on" : ""}" id="chrome-translucent" role="switch" aria-checked="${translucentOn}" title="${this.cb.esc(tr("settings.theme.translucentSidebar"))}"></button>
+          </div>
+          <div class="settings-row settings-theme-contrast-row">
+            <div class="settings-row-text">
+              <div class="settings-row-title">${this.cb.esc(tr("settings.theme.contrast"))}</div>
+            </div>
+            <div class="settings-theme-contrast-ctl">
+              <input type="range" class="settings-theme-contrast-range" id="chrome-contrast" min="0" max="100" step="1" value="${chrome.contrast}" aria-label="${this.cb.esc(tr("settings.theme.contrast"))}" />
+              <span class="settings-theme-contrast-val" id="chrome-contrast-val">${chrome.contrast}</span>
+            </div>
+          </div>
+          <div class="settings-theme-aa-preview" id="theme-aa-preview" style="${aaPreviewStyle}" aria-hidden="true">
+            <span class="aa-primary" style="color:${this.cb.esc(chrome.ink)}">${this.cb.esc(tr("settings.theme.aaPrimary"))}</span>
+            <span class="aa-secondary" style="color:color-mix(in srgb, ${this.cb.esc(chrome.ink)} 72%, ${this.cb.esc(chrome.surface)})">${this.cb.esc(tr("settings.theme.aaSecondary"))}</span>
+            <span class="aa-tertiary" style="color:color-mix(in srgb, ${this.cb.esc(chrome.ink)} 52%, ${this.cb.esc(chrome.surface)})">${this.cb.esc(tr("settings.theme.aaTertiary"))}</span>
+            <span class="aa-accent" style="color:${this.cb.esc(chrome.accent)}">${this.cb.esc(tr("settings.theme.aaAccent"))}</span>
+          </div>
+        </div>
+        <p class="settings-muted settings-theme-chrome-hint" id="theme-chrome-hint">${lowContrast ? this.cb.esc(tr("settings.theme.lowContrast")) : ""}</p>
       </section>
 
       <div id="theme-import-dlg" class="settings-theme-import-dlg hidden" role="dialog" aria-modal="true" aria-labelledby="theme-import-title">
@@ -559,6 +607,24 @@ export class SettingsPageController {
         </div>
       </div>
     `;
+  }
+
+  private chromeColorRow(
+    field: "accent" | "surface" | "ink",
+    label: string,
+    hex: string,
+  ): string {
+    const safe = this.cb.esc(hex);
+    return `
+      <div class="settings-row">
+        <div class="settings-row-text">
+          <div class="settings-row-title">${this.cb.esc(label)}</div>
+        </div>
+        <div class="settings-theme-color-ctl">
+          <input type="color" class="settings-theme-color-swatch" id="chrome-color-${field}" value="${safe}" aria-label="${this.cb.esc(label)}" />
+          <input type="text" class="settings-input settings-theme-color-hex" id="chrome-hex-${field}" value="${safe}" spellcheck="false" maxlength="7" autocomplete="off" />
+        </div>
+      </div>`;
   }
 
   private bindAppearance(root: HTMLElement): void {
@@ -597,6 +663,162 @@ export class SettingsPageController {
     root.querySelector("#btn-theme-import-ok")?.addEventListener("click", () => {
       void this.submitThemeImport(root);
     });
+
+    this.bindChromeEditor(root);
+  }
+
+  /** 强调色 / 背景 / 前景 / 字体 / 半透明 / 对比度 */
+  private bindChromeEditor(root: HTMLElement): void {
+    const fields: Array<"accent" | "surface" | "ink"> = [
+      "accent",
+      "surface",
+      "ink",
+    ];
+    for (const field of fields) {
+      const colorEl = root.querySelector(
+        `#chrome-color-${field}`,
+      ) as HTMLInputElement | null;
+      const hexEl = root.querySelector(
+        `#chrome-hex-${field}`,
+      ) as HTMLInputElement | null;
+      colorEl?.addEventListener("input", () => {
+        const v = colorEl.value.toLowerCase();
+        if (hexEl) hexEl.value = v;
+        void this.patchChromeField({ [field]: v });
+      });
+      hexEl?.addEventListener("change", () => {
+        const raw = hexEl.value.trim();
+        const norm = this.normalizeHexInput(raw);
+        if (!norm) {
+          const variant = this.cb.resolveThemeVariant();
+          hexEl.value = this.cb.getAppearance(variant).chromeTheme[field];
+          return;
+        }
+        hexEl.value = norm;
+        if (colorEl) colorEl.value = norm;
+        void this.patchChromeField({ [field]: norm });
+      });
+    }
+
+    const fontUi = root.querySelector(
+      "#chrome-font-ui",
+    ) as HTMLInputElement | null;
+    const fontCode = root.querySelector(
+      "#chrome-font-code",
+    ) as HTMLInputElement | null;
+    const commitFonts = () => {
+      const ui = fontUi?.value.trim() || null;
+      const code = fontCode?.value.trim() || null;
+      void this.patchChromeField({ fonts: { ui, code } });
+    };
+    fontUi?.addEventListener("change", commitFonts);
+    fontCode?.addEventListener("change", commitFonts);
+
+    const translucent = root.querySelector(
+      "#chrome-translucent",
+    ) as HTMLButtonElement | null;
+    translucent?.addEventListener("click", () => {
+      const on = !translucent.classList.contains("on");
+      translucent.classList.toggle("on", on);
+      translucent.setAttribute("aria-checked", on ? "true" : "false");
+      // on = 半透明 = opaqueWindows false
+      void this.patchChromeField({ opaqueWindows: !on });
+    });
+
+    const range = root.querySelector(
+      "#chrome-contrast",
+    ) as HTMLInputElement | null;
+    const valEl = root.querySelector("#chrome-contrast-val");
+    let contrastTimer: ReturnType<typeof setTimeout> | null = null;
+    range?.addEventListener("input", () => {
+      const n = Math.min(100, Math.max(0, Number(range.value) || 0));
+      if (valEl) valEl.textContent = String(n);
+      this.updateAaPreviewLive(root, n);
+      if (contrastTimer) clearTimeout(contrastTimer);
+      contrastTimer = setTimeout(() => {
+        void this.patchChromeField({ contrast: n }, { softHint: true });
+      }, 80);
+    });
+  }
+
+  private normalizeHexInput(raw: string): string | null {
+    let s = raw.trim();
+    if (!s.startsWith("#")) s = `#${s}`;
+    if (/^#[0-9a-fA-F]{6}$/.test(s)) return s.toLowerCase();
+    if (/^#[0-9a-fA-F]{3}$/.test(s)) {
+      const r = s[1];
+      const g = s[2];
+      const b = s[3];
+      return `#${r}${r}${g}${g}${b}${b}`.toLowerCase();
+    }
+    return null;
+  }
+
+  /** 拖对比度时本地更新 Aa 预览（不等 patch 回写） */
+  private updateAaPreviewLive(root: HTMLElement, contrast: number): void {
+    const variant = this.cb.resolveThemeVariant();
+    const app = this.cb.getAppearance(variant);
+    const ink = app.chromeTheme.ink;
+    const surface = app.chromeTheme.surface;
+    // 粗略：与 derive floor 同量级
+    const c = Math.min(1, Math.max(0, contrast / 100));
+    const sec = Math.round(Math.max(58, (0.65 + c * 0.1) * 100));
+    const ter = Math.round(Math.max(48, (0.45 + c * 0.1) * 100));
+    const secEl = root.querySelector(".aa-secondary") as HTMLElement | null;
+    const terEl = root.querySelector(".aa-tertiary") as HTMLElement | null;
+    if (secEl) {
+      secEl.style.color = `color-mix(in srgb, ${ink} ${sec}%, ${surface})`;
+    }
+    if (terEl) {
+      terEl.style.color = `color-mix(in srgb, ${ink} ${ter}%, ${surface})`;
+    }
+  }
+
+  private async patchChromeField(
+    patch: Partial<ChromeTheme>,
+    opts?: { softHint?: boolean },
+  ): Promise<void> {
+    const variant = this.cb.resolveThemeVariant();
+    const cur = this.cb.getAppearance(variant);
+    const nextChrome = mergeChromeTheme(cur.chromeTheme, patch);
+    const next: VariantAppearance = {
+      codeThemeId: cur.codeThemeId,
+      chromeTheme: nextChrome,
+    };
+    const payload: Partial<DesktopConfigData> =
+      variant === "light"
+        ? { appearanceLight: next }
+        : { appearanceDark: next };
+    await this.patchAppearance(payload);
+    // 轻量刷新提示 + 预览，避免整页闪烁：仅更新 hint / Aa 区
+    const root = document.getElementById("settings-content");
+    if (!root) return;
+    const hint = root.querySelector("#theme-chrome-hint");
+    if (hint) {
+      hint.textContent = isLowContrastChrome(nextChrome, variant)
+        ? tr("settings.theme.lowContrast")
+        : opts?.softHint
+          ? ""
+          : "";
+    }
+    const aa = root.querySelector("#theme-aa-preview") as HTMLElement | null;
+    if (aa) {
+      aa.style.background = nextChrome.surface;
+      aa.style.borderColor = `color-mix(in srgb, ${nextChrome.ink} 18%, ${nextChrome.surface})`;
+      const p = aa.querySelector(".aa-primary") as HTMLElement | null;
+      const s = aa.querySelector(".aa-secondary") as HTMLElement | null;
+      const t = aa.querySelector(".aa-tertiary") as HTMLElement | null;
+      const a = aa.querySelector(".aa-accent") as HTMLElement | null;
+      if (p) p.style.color = nextChrome.ink;
+      if (a) a.style.color = nextChrome.accent;
+      if (s || t) this.updateAaPreviewLive(root, nextChrome.contrast);
+    }
+    const swatch = root.querySelector(".settings-theme-aa") as HTMLElement | null;
+    if (swatch) {
+      swatch.style.background = nextChrome.surface;
+      swatch.style.color = nextChrome.accent;
+      swatch.style.borderColor = `color-mix(in srgb, ${nextChrome.ink} 16%, ${nextChrome.surface})`;
+    }
   }
 
   private async applyThemePreset(codeThemeId: string): Promise<string> {

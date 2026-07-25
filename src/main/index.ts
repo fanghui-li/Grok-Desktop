@@ -43,10 +43,13 @@ const APP_ROOT = path.resolve(__dirname, "../..");
 
 type ChromeTheme = "light" | "dark";
 
+/** 冷启动兜底（renderer 上色后会用 derive 的 shell 色覆盖） */
 const CHROME = {
-  light: { bg: "#f5f5f5", symbol: "#1a1a1a" },
-  dark: { bg: "#121212", symbol: "#e8e8e8" },
+  light: { bg: "#f0f0f0", symbol: "#1a1a1a" },
+  dark: { bg: "#111111", symbol: "#e8e8e8" },
 } as const;
+
+type WindowChromeColors = { bg: string; symbol: string };
 
 /** 启动时解析窗口 chrome（settings.theme + OS） */
 function resolveStartupChromeTheme(): ChromeTheme {
@@ -67,18 +70,38 @@ function applyNativeThemeSource(pref: "system" | "light" | "dark"): void {
   }
 }
 
-function applyWindowChrome(win: BrowserWindow, theme: ChromeTheme): void {
-  const c = CHROME[theme];
+/** 接受 #rgb / #rrggbb / rgb() / rgba()；非法则 null */
+function sanitizeCssColor(raw: unknown): string | null {
+  if (typeof raw !== "string") return null;
+  const s = raw.trim();
+  if (!s || s.length > 64) return null;
+  if (/^#([0-9a-fA-F]{3}|[0-9a-fA-F]{6}|[0-9a-fA-F]{8})$/.test(s)) return s;
+  if (
+    /^rgba?\(\s*[\d.]+\s*,\s*[\d.]+\s*,\s*[\d.]+\s*(,\s*[\d.]+\s*)?\)$/.test(s)
+  ) {
+    return s;
+  }
+  return null;
+}
+
+function applyWindowChrome(
+  win: BrowserWindow,
+  theme: ChromeTheme,
+  colors?: Partial<WindowChromeColors>,
+): void {
+  const fallback = CHROME[theme];
+  const bg = sanitizeCssColor(colors?.bg) ?? fallback.bg;
+  const symbol = sanitizeCssColor(colors?.symbol) ?? fallback.symbol;
   try {
-    win.setBackgroundColor(c.bg);
+    win.setBackgroundColor(bg);
   } catch {
     /* ignore */
   }
   if (process.platform === "win32") {
     try {
       win.setTitleBarOverlay({
-        color: c.bg,
-        symbolColor: c.symbol,
+        color: bg,
+        symbolColor: symbol,
         height: 36,
       });
     } catch {
@@ -376,11 +399,17 @@ async function handleHostIpc(
       return resultOk(view);
     }
     case "ui.setChromeTheme": {
+      // theme = light|dark；bg/symbol 为 renderer derive 的 shell 色（与侧栏/顶栏同色）
       const theme = p.theme === "dark" ? "dark" : "light";
       const win = windowAlive()
         ? mainWindow!
         : BrowserWindow.getFocusedWindow();
-      if (win && !win.isDestroyed()) applyWindowChrome(win, theme);
+      if (win && !win.isDestroyed()) {
+        applyWindowChrome(win, theme, {
+          bg: p.bg as string | undefined,
+          symbol: p.symbol as string | undefined,
+        });
+      }
       return resultOk({ theme });
     }
     case "projects.list":

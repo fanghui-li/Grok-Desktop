@@ -35,6 +35,8 @@ export type FileTab = {
 const LS_OPEN = "grok.desktop.sidePaneOpen";
 const LS_WIDTH = "grok.desktop.sidePaneWidth";
 const LS_CAT = "grok.desktop.sidePaneCat";
+/** 顶栏文件 tabs 上限；超出时替换第 2 个（保留第 1 个） */
+const MAX_FILE_TABS = 2;
 
 export type SideCategory =
   | "files"
@@ -125,10 +127,15 @@ type TreeEntry = {
 
 export class SidePaneController {
   private open = false;
+  /** 有预览内容时的侧栏总宽（预览+树+轨） */
   private width = 680;
+  /** 仅文件树时的侧栏宽（树+轨，对齐 Codex 未开文件） */
+  private treeOnlyWidth = 300;
   private category: SideCategory = "files";
   private tabs: FileTab[] = [];
   private activeId: string | null = null;
+  /** 临时 info 面板（无 tab 时也占预览列，如读失败提示） */
+  private previewInfoActive = false;
   private inv: Inv;
   private getCwd: () => string | null;
   private resizing = false;
@@ -209,15 +216,20 @@ export class SidePaneController {
     else void this.syncFileWatch();
   }
 
-  /** 全屏展开 / 退出（对齐 Codex 文件沉浸布局） */
+  /**
+   * 全屏展开 / 退出：隐藏会话列，侧栏占满主区。
+   * 保持当前分类（计划/文件/侧问…），不再强制切到文件。
+   */
   setFocusMode(next: boolean): void {
     this.focusMode = next;
     if (next) {
       this.open = true;
-      this.category = "files";
-      this.applyCategory();
-      void this.refreshFileTree();
-    } else {
+      // 进入全屏时刷新当前分类所需数据，不改 category
+      if (this.category === "files") void this.refreshFileTree();
+      else if (this.category === "agents") void this.refreshAgentsTree();
+      else if (this.category === "terminal") this.refreshTerminalCwd();
+      else if (this.category === "plan") this.onSelectPlan?.();
+    } else if (this.category === "files") {
       void this.syncFileWatch();
     }
     this.applyOpenState(true);
@@ -236,6 +248,8 @@ export class SidePaneController {
     if (openPane) this.open = true;
     this.applyCategory();
     this.applyOpenState(true);
+    // 全屏态下切换分类：保持全屏，仅更新悬浮输入等 chrome
+    this.applyFocusMode();
     this.persist();
     if (cat === "terminal") this.refreshTerminalCwd();
     if (cat === "files") void this.refreshFileTree();
@@ -285,6 +299,7 @@ export class SidePaneController {
     this.open = true;
     this.applyCategory();
     this.applyOpenState(true);
+    this.applyFocusMode();
     this.persist();
     void this.syncFileWatch();
   }
@@ -308,6 +323,7 @@ export class SidePaneController {
     this.open = true;
     this.applyCategory();
     this.applyOpenState(true);
+    this.applyFocusMode();
     this.persist();
     void this.syncFileWatch();
     void this.refreshAgentsTree();
@@ -325,14 +341,10 @@ export class SidePaneController {
     }
     this.category = "btw";
     this.open = true;
-    // 侧问面板不需要全屏文件沉浸
-    if (this.focusMode) {
-      this.focusMode = false;
-      this.applyFocusMode();
-      this.onFocusModeChange?.(false);
-    }
+    // 保持当前全屏态（若已全屏则继续展开 btw，不再强制退出）
     this.applyCategory();
     this.applyOpenState(true);
+    this.applyFocusMode();
     this.persist();
     void this.syncFileWatch();
     if (focusInput) {
@@ -529,19 +541,62 @@ export class SidePaneController {
   private applyOpenState(updateBtn: boolean): void {
     const pane = $("side-pane");
     const resizer = $("split-resizer");
-    const btn = $("btn-panel");
     pane.classList.toggle("hidden", !this.open);
     // 全屏时不显示拖拽条
     resizer.classList.toggle("hidden", !this.open || this.focusMode);
     if (this.open && !this.focusMode) {
-      pane.style.width = `${this.width}px`;
+      pane.style.width = `${this.currentPaneWidth()}px`;
     } else if (this.focusMode) {
       pane.style.width = "";
     }
+    this.applyFilesLayout();
     if (updateBtn) {
-      btn.classList.toggle("active", this.open);
-      btn.setAttribute("aria-pressed", this.open ? "true" : "false");
+      for (const id of ["btn-panel", "btn-panel-chat"] as const) {
+        const btn = document.getElementById(id);
+        if (!btn) continue;
+        btn.classList.toggle("active", this.open);
+        btn.setAttribute("aria-pressed", this.open ? "true" : "false");
+      }
     }
+  }
+
+  /** 是否展示预览列：仅已打开文件 tab（临时 info 也算有内容，避免空白列） */
+  private hasPreviewSurface(): boolean {
+    return this.tabs.length > 0 || this.previewInfoActive;
+  }
+
+  /**
+   * Codex 布局：无打开文件时隐藏预览列，只留文件树（+ 分类轨）；
+   * 有文件时 预览 | 树 | 轨。
+   */
+  private applyFilesLayout(): void {
+    const split =
+      document.getElementById("side-files-split") ??
+      document.querySelector(".side-files-split");
+    const pane = document.getElementById("side-pane");
+    const hasPreview = this.hasPreviewSurface();
+    split?.classList.toggle("no-preview", !hasPreview);
+    pane?.classList.toggle("has-file-preview", hasPreview);
+    // 无预览时只剩树：若树被收起则自动展开，避免整栏空白
+    if (!hasPreview && !this.treeVisible) {
+      this.treeVisible = true;
+      this.applyTreeVisible();
+    }
+    // 共用路径栏显隐随预览表面变化
+    this.applyWorkspaceChrome();
+  }
+
+  /** 拖宽 / 持久化用的当前侧栏宽度 */
+  private currentPaneWidth(): number {
+    if (this.category === "files" && !this.hasPreviewSurface() && !this.focusMode) {
+      return this.treeOnlyWidth;
+    }
+    return this.width;
+  }
+
+  /** 打开首个文件时保证预览列有足够宽度 */
+  private ensurePreviewWidth(): void {
+    if (this.width < 560) this.width = 640;
   }
 
   private applyFocusMode(): void {
@@ -562,8 +617,12 @@ export class SidePaneController {
         this.focusMode ? tr("side.focusExit") : tr("nav.fullscreen"),
       );
     }
+    // 底部悬浮输入仅文件全屏有意义；其它分类全屏不显示
     if (dock) {
-      dock.classList.toggle("hidden", !(this.focusMode && this.open));
+      dock.classList.toggle(
+        "hidden",
+        !(this.focusMode && this.open && this.category === "files"),
+      );
     }
   }
 
@@ -583,6 +642,55 @@ export class SidePaneController {
       ) as HTMLElement | null;
       btn?.classList.toggle("active", cat === this.category);
     }
+    this.applyWorkspaceChrome();
+  }
+
+  /**
+   * 工作区 chrome（对齐 Codex 文件侧栏）：
+   * - 顶栏：有 tab 时文档 tabs；否则分类名。右侧仅全屏/关栏
+   * - 次级共用栏（横跨预览+树）：有预览时显示 breadcrumb + ⋯/收起树
+   */
+  private applyWorkspaceChrome(): void {
+    const top = document.getElementById("side-workspace-top");
+    const label = document.getElementById("side-workspace-label");
+    const tabs = document.getElementById("side-pane-tabs");
+    const toolbar = document.getElementById("side-pane-toolbar");
+    const showFileTabs =
+      this.category === "files" && this.tabs.length > 0;
+    // 共用路径栏：文件分类且有预览表面（tab 或 info）
+    const showSharedToolbar =
+      this.category === "files" && this.hasPreviewSurface();
+
+    top?.classList.toggle("has-file-tabs", showFileTabs);
+
+    if (label) {
+      if (showFileTabs) {
+        label.hidden = true;
+      } else {
+        label.hidden = false;
+        const key =
+          this.category === "files"
+            ? "side.files"
+            : this.category === "plan"
+              ? "side.plan"
+              : this.category === "btw"
+                ? "side.btw"
+                : this.category === "agents"
+                  ? "side.agents"
+                  : this.category === "browser"
+                    ? "side.browser"
+                    : this.category === "terminal"
+                      ? "side.terminal"
+                      : "side.workspaceLabel";
+        label.textContent = tr(key as "side.files");
+      }
+    }
+    if (tabs) {
+      tabs.hidden = !showFileTabs;
+    }
+    if (toolbar) {
+      toolbar.hidden = !showSharedToolbar;
+    }
   }
 
   private refreshTerminalCwd(): void {
@@ -594,8 +702,12 @@ export class SidePaneController {
   }
 
   private bindChrome(): void {
-    $("btn-panel").onclick = () => this.toggle();
-    // 顶栏全屏按钮（原历史按钮位置）
+    // 会话顶 / 工作区顶 各有一枚右侧栏开关
+    for (const id of ["btn-panel", "btn-panel-chat"] as const) {
+      const el = document.getElementById(id);
+      if (el) el.onclick = () => this.toggle();
+    }
+    // 工作区顶栏全屏按钮
     const focusBtn = document.getElementById("btn-side-focus");
     if (focusBtn) {
       focusBtn.onclick = () => this.toggleFocusMode();
@@ -626,7 +738,7 @@ export class SidePaneController {
       }
     });
 
-    // ⋯ 更多菜单
+    // ⋯ 更多菜单（顶栏文件动作）
     const moreBtn = $("btn-side-more");
     const moreMenu = $("side-more-menu");
     moreBtn.onclick = (e) => {
@@ -680,15 +792,22 @@ export class SidePaneController {
       resizer.classList.add("dragging");
       resizer.setPointerCapture((e as PointerEvent).pointerId);
       const startX = (e as PointerEvent).clientX;
-      const startW = this.width;
+      const startW = this.currentPaneWidth();
+      const treeOnly = this.category === "files" && !this.hasPreviewSurface();
       const onMove = (ev: PointerEvent) => {
         if (!this.resizing) return;
         // 向左拖 → 侧栏变宽
         const dx = startX - ev.clientX;
         const split = $("main-split");
         const max = Math.floor(split.clientWidth * 0.75);
-        this.width = Math.min(max, Math.max(320, startW + dx));
-        $("side-pane").style.width = `${this.width}px`;
+        const minW = treeOnly ? 220 : 320;
+        const next = Math.min(max, Math.max(minW, startW + dx));
+        if (treeOnly) {
+          this.treeOnlyWidth = next;
+        } else {
+          this.width = next;
+        }
+        $("side-pane").style.width = `${next}px`;
       };
       const onUp = (ev: PointerEvent) => {
         this.resizing = false;
@@ -1025,7 +1144,10 @@ export class SidePaneController {
     if (existing) {
       if (line) existing.line = line;
       this.activeId = existing.id;
+      this.previewInfoActive = false;
+      this.ensurePreviewWidth();
       this.renderAll();
+      this.applyOpenState(true);
       this.scrollToLine(existing.line);
       return;
     }
@@ -1068,9 +1190,17 @@ export class SidePaneController {
       binary: d.binary,
       isDirectory: false,
     };
-    this.tabs.push(tab);
+    // 最多 2 个：第 3 个起替换第二个槽位（第一个保持）
+    if (this.tabs.length >= MAX_FILE_TABS) {
+      this.tabs[MAX_FILE_TABS - 1] = tab;
+    } else {
+      this.tabs.push(tab);
+    }
     this.activeId = tab.id;
+    this.previewInfoActive = false;
+    this.ensurePreviewWidth();
     this.renderAll();
+    this.applyOpenState(true);
     this.scrollToLine(line);
   }
 
@@ -1078,6 +1208,8 @@ export class SidePaneController {
     // 不重复 setCategory，避免无 tab 时被 renderActive 刷回 empty
     this.category = "files";
     this.open = true;
+    this.previewInfoActive = true;
+    this.ensurePreviewWidth();
     this.applyCategory();
     this.applyOpenState(true);
     this.persist();
@@ -1087,6 +1219,7 @@ export class SidePaneController {
     const info = $("side-pane-info");
     info.classList.remove("hidden");
     info.textContent = text;
+    this.applyFilesLayout();
   }
 
   /** 显示工作树变更摘要（文件分类下） */
@@ -1139,6 +1272,8 @@ export class SidePaneController {
       };
       box.appendChild(b);
     }
+    // tabs 进出顶栏时同步 chrome（有/无 tab）
+    this.applyWorkspaceChrome();
   }
 
   private closeTab(id: string): void {
@@ -1151,16 +1286,19 @@ export class SidePaneController {
     }
     if (!this.tabs.length) {
       this.activeId = null;
+      this.previewInfoActive = false;
       $("file-preview").classList.add("hidden");
       $("md-preview").classList.add("hidden");
       $("side-pane-info").classList.add("hidden");
-      $("side-pane-empty").classList.remove("hidden");
+      $("side-pane-empty").classList.add("hidden");
       $("side-breadcrumb").innerHTML = "";
       this.renderTabs();
       this.syncSaveBtn();
+      this.applyOpenState(true);
       return;
     }
     this.renderAll();
+    this.applyOpenState(true);
   }
 
   private renderActive(): void {
@@ -1173,14 +1311,19 @@ export class SidePaneController {
     const gutter = $("file-preview-gutter");
 
     if (!tab) {
-      empty.classList.remove("hidden");
+      // 无 tab：隐藏空态文案（预览列整列收起，树占满）
+      empty.classList.add("hidden");
       preview.classList.add("hidden");
       mdPrev.classList.add("hidden");
-      info.classList.add("hidden");
+      if (!this.previewInfoActive) {
+        info.classList.add("hidden");
+      }
       $("side-breadcrumb").innerHTML = "";
+      this.applyFilesLayout();
       return;
     }
 
+    this.previewInfoActive = false;
     empty.classList.add("hidden");
     $("side-breadcrumb").innerHTML = breadcrumbHtml(tab.absPath, this.getCwd());
 
@@ -1189,10 +1332,12 @@ export class SidePaneController {
       mdPrev.classList.add("hidden");
       info.classList.remove("hidden");
       info.textContent = tr("side.binary", { path: tab.absPath });
+      this.applyFilesLayout();
       return;
     }
 
     info.classList.add("hidden");
+    this.applyFilesLayout();
 
     // Markdown：Codex 式富文本预览
     if (this.isMarkdownTab(tab)) {

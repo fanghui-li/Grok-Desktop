@@ -103,76 +103,50 @@
         ></div>
       </aside>
 
-      <!-- 中间主工作区：顶栏 + 可分屏 -->
+      <!-- 中间主工作区：Codex 式分栏顶栏（会话顶 | 文件工作区顶）+ 可分屏 -->
       <main class="main">
-        <header class="main-top">
-          <div class="main-top-left">
-            <button
-              type="button"
-              class="icon-ghost top-icon-btn hidden"
-              id="btn-sidebar-expand"
-              data-i18n-title="nav.expandSidebarTitle" title="展开侧栏（Ctrl+B）"
-              data-i18n-aria-label="nav.expandSidebar" aria-label="展开侧栏"
-            >
-              <svg class="top-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-                <rect x="3" y="5" width="18" height="14" rx="2.5"/>
-                <path d="M9 5v14"/>
-                <path d="M7 12h7"/>
-                <path d="M11.5 9.5 14 12l-2.5 2.5"/>
-              </svg>
-            </button>
-          </div>
-          <button type="button" class="pill-btn" id="btn-open-location">
-            <span class="nav-ico">📁</span> <span data-i18n="nav.openLocation">打开位置 ▾</span>
-          </button>
-          <div class="main-top-right">
-            <!-- 对齐 Codex 顶栏：四角展开 · 单窗横线 · 重叠双窗 -->
-            <button
-              type="button"
-              class="icon-ghost top-icon-btn"
-              id="btn-side-focus"
-              data-i18n-title="nav.fullscreenTitle" title="全屏展开侧栏"
-              aria-pressed="false"
-              data-i18n-aria-label="nav.fullscreen" aria-label="全屏"
-            >
-              <!-- Codex expand：进入全屏侧栏 -->
-              <svg class="top-icon" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="none" aria-hidden="true" focusable="false">
-                <path d="M4.33496 11C4.33496 10.6327 4.63273 10.335 5 10.335C5.36727 10.335 5.66504 10.6327 5.66504 11V14.335H9L9.13379 14.3486C9.43692 14.4106 9.66504 14.6786 9.66504 15C9.66504 15.3214 9.43692 15.5894 9.13379 15.6514L9 15.665H5C4.63273 15.665 4.33496 15.3673 4.33496 15V11ZM14.335 9V5.66504H11C10.6327 5.66504 10.335 5.36727 10.335 5C10.335 4.63273 10.6327 4.33496 11 4.33496H15L15.1338 4.34863C15.4369 4.41057 15.665 4.67857 15.665 5V9C15.665 9.36727 15.3673 9.66504 15 9.66504C14.6327 9.66504 14.335 9.36727 14.335 9Z" fill="currentColor"/>
-              </svg>
-            </button>
-            <button
-              type="button"
-              class="icon-ghost top-icon-btn hidden"
-              id="btn-layout"
-              data-i18n-title="nav.layout" title="布局"
-              data-i18n-aria-label="nav.layout" aria-label="布局"
-              aria-hidden="true"
-              tabindex="-1"
-            >
-              <svg class="top-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-                <rect x="4" y="4" width="16" height="16" rx="2"/>
-                <path d="M8 12h8"/>
-              </svg>
-            </button>
-            <button
-              type="button"
-              class="icon-ghost top-icon-btn"
-              id="btn-panel"
-              data-i18n-title="nav.sidePanelTitle" title="展开 / 收起右侧栏"
-              aria-pressed="false"
-              data-i18n-aria-label="nav.sidePanel" aria-label="右侧栏"
-            >
-              <svg class="top-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-                <rect x="4" y="4" width="16" height="16" rx="2"/>
-                <path d="M15 4v16"/>
-              </svg>
-            </button>
-          </div>
-        </header>
-
         <div class="main-split" id="main-split">
           <!-- 左：对话 / 欢迎 -->
           <div class="chat-pane" id="chat-pane">
+            <!-- 会话列顶栏（对齐 Codex 线程标题行） -->
+            <header class="chat-top" id="chat-top">
+              <div class="chat-top-left">
+                <button
+                  type="button"
+                  class="icon-ghost top-icon-btn hidden"
+                  id="btn-sidebar-expand"
+                  data-i18n-title="nav.expandSidebarTitle" title="展开侧栏（Ctrl+B）"
+                  data-i18n-aria-label="nav.expandSidebar" aria-label="展开侧栏"
+                >
+                  <svg class="top-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                    <rect x="3" y="5" width="18" height="14" rx="2.5"/>
+                    <path d="M9 5v14"/>
+                    <path d="M7 12h7"/>
+                    <path d="M11.5 9.5 14 12l-2.5 2.5"/>
+                  </svg>
+                </button>
+                <h2 class="chat-top-title" id="chat-top-title" data-i18n="chat.topTitleEmpty">新对话</h2>
+              </div>
+              <!-- 打开位置固定在会话顶栏右侧；右栏收起时另显「右侧栏」开关 -->
+              <div class="chat-top-right" id="chat-top-right">
+                <button type="button" class="pill-btn" id="btn-open-location">
+                  <span class="nav-ico">📁</span> <span data-i18n="nav.openLocation">打开位置 ▾</span>
+                </button>
+                <button
+                  type="button"
+                  class="icon-ghost top-icon-btn"
+                  id="btn-panel-chat"
+                  data-i18n-title="nav.sidePanelTitle" title="展开 / 收起右侧栏"
+                  aria-pressed="false"
+                  data-i18n-aria-label="nav.sidePanel" aria-label="右侧栏"
+                >
+                  <svg class="top-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                    <rect x="4" y="4" width="16" height="16" rx="2"/>
+                    <path d="M15 4v16"/>
+                  </svg>
+                </button>
+              </div>
+            </header>
             <section id="welcome" class="welcome">
               <div class="welcome-logo" aria-hidden="true">
                 <svg width="420" height="84" viewBox="0 0 149 33" fill="none" xmlns="http://www.w3.org/2000/svg" fill-rule="evenodd" clip-rule="evenodd">
@@ -382,35 +356,94 @@
             data-i18n-title="side.resize" title="拖动调整宽度"
           ></div>
 
-          <!-- 右：Codex 式可展开侧栏 = 内容区 + 内置分类轨 -->
+          <!-- 右：Codex 式可展开侧栏 = 工作区顶栏 + 内容区 + 分类轨 -->
           <aside class="side-pane hidden" id="side-pane" data-i18n-aria-label="side.aria" aria-label="侧栏面板">
-            <div class="side-pane-main">
-              <!-- 文件类：对齐 Codex — 左预览 + 右文件树 -->
+            <div class="side-pane-col">
+              <!--
+                工作区顶栏（对齐 Codex 文件侧栏）：
+                - 文件分类 + 有 tab：左侧文档 tabs，右侧 ⋯ / 打开 / 全屏 / 收起
+                - 其它分类或无 tab：左侧分类名，右侧全屏 / 收起
+              -->
+              <header class="side-workspace-top" id="side-workspace-top">
+                <div class="side-workspace-top-left">
+                  <span class="side-workspace-label" id="side-workspace-label" data-i18n="side.workspaceLabel">工作区</span>
+                  <div class="side-pane-tabs" id="side-pane-tabs" hidden></div>
+                </div>
+                <div class="side-workspace-top-right">
+                  <button
+                    type="button"
+                    class="icon-ghost top-icon-btn"
+                    id="btn-side-focus"
+                    data-i18n-title="nav.fullscreenTitle" title="全屏展开侧栏"
+                    aria-pressed="false"
+                    data-i18n-aria-label="nav.fullscreen" aria-label="全屏"
+                  >
+                    <svg class="top-icon" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="none" aria-hidden="true" focusable="false">
+                      <path d="M4.33496 11C4.33496 10.6327 4.63273 10.335 5 10.335C5.36727 10.335 5.66504 10.6327 5.66504 11V14.335H9L9.13379 14.3486C9.43692 14.4106 9.66504 14.6786 9.66504 15C9.66504 15.3214 9.43692 15.5894 9.13379 15.6514L9 15.665H5C4.63273 15.665 4.33496 15.3673 4.33496 15V11ZM14.335 9V5.66504H11C10.6327 5.66504 10.335 5.36727 10.335 5C10.335 4.63273 10.6327 4.33496 11 4.33496H15L15.1338 4.34863C15.4369 4.41057 15.665 4.67857 15.665 5V9C15.665 9.36727 15.3673 9.66504 15 9.66504C14.6327 9.66504 14.335 9.36727 14.335 9Z" fill="currentColor"/>
+                    </svg>
+                  </button>
+                  <button
+                    type="button"
+                    class="icon-ghost top-icon-btn hidden"
+                    id="btn-layout"
+                    data-i18n-title="nav.layout" title="布局"
+                    data-i18n-aria-label="nav.layout" aria-label="布局"
+                    aria-hidden="true"
+                    tabindex="-1"
+                  >
+                    <svg class="top-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                      <rect x="4" y="4" width="16" height="16" rx="2"/>
+                      <path d="M8 12h8"/>
+                    </svg>
+                  </button>
+                  <button
+                    type="button"
+                    class="icon-ghost top-icon-btn"
+                    id="btn-panel"
+                    data-i18n-title="nav.sidePanelTitle" title="展开 / 收起右侧栏"
+                    aria-pressed="false"
+                    data-i18n-aria-label="nav.sidePanel" aria-label="右侧栏"
+                  >
+                    <svg class="top-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                      <rect x="4" y="4" width="16" height="16" rx="2"/>
+                      <path d="M15 4v16"/>
+                    </svg>
+                  </button>
+                </div>
+              </header>
+              <div class="side-pane-main">
+              <!-- 文件类：对齐 Codex — 顶栏 tabs；共用路径栏横跨预览+树；下为 预览 | 树 -->
               <div class="side-cat-view" id="side-cat-files" data-cat="files">
-                <div class="side-files-split">
-                  <!-- 左：tabs + 面包屑工具栏 + 内容 -->
-                  <div class="side-files-preview-col">
-                    <div class="side-pane-tabs-row">
-                      <div class="side-pane-tabs" id="side-pane-tabs"></div>
-                      <button type="button" class="icon-ghost sm" id="btn-tree-toggle" data-i18n-title="side.collapseTree" title="收起文件目录" aria-pressed="false">⟩</button>
-                    </div>
-                    <div class="side-pane-toolbar">
-                      <div class="side-breadcrumb" id="side-breadcrumb"></div>
-                      <div class="side-pane-actions">
-                        <div class="side-more-wrap">
-                          <button type="button" class="icon-ghost sm" id="btn-side-more" data-i18n-title="side.more" title="更多">⋯</button>
-                          <div id="side-more-menu" class="side-more-menu hidden">
-                            <button type="button" class="side-more-item" data-act="open-editor" data-i18n="side.openInEditor">在编辑器中打开</button>
-                            <button type="button" class="side-more-item" data-act="copy-path" data-i18n="side.copyPath">复制路径</button>
-                            <button type="button" class="side-more-item" data-act="copy-content" data-i18n="side.copyContent">复制文件内容</button>
-                            <button type="button" class="side-more-item" data-act="save" id="menu-side-save" data-i18n="side.save">保存</button>
-                            <button type="button" class="side-more-item" data-act="reveal" data-i18n="side.reveal">在资源管理器中显示</button>
-                          </div>
-                        </div>
+                <!-- 共用次级标题：breadcrumb 左 + ⋯/收起树 右（横跨两列） -->
+                <div class="side-pane-toolbar" id="side-pane-toolbar" hidden>
+                  <div class="side-breadcrumb" id="side-breadcrumb"></div>
+                  <div class="side-file-actions" id="side-file-actions">
+                    <div class="side-more-wrap">
+                      <button type="button" class="icon-ghost sm" id="btn-side-more" data-i18n-title="side.more" title="更多" aria-haspopup="menu">⋯</button>
+                      <div id="side-more-menu" class="side-more-menu hidden" role="menu">
+                        <button type="button" class="side-more-item" data-act="open-editor" data-i18n="side.openInEditor">在编辑器中打开</button>
+                        <button type="button" class="side-more-item" data-act="copy-path" data-i18n="side.copyPath">复制路径</button>
+                        <button type="button" class="side-more-item" data-act="copy-content" data-i18n="side.copyContent">复制文件内容</button>
+                        <button type="button" class="side-more-item" data-act="save" id="menu-side-save" data-i18n="side.save">保存</button>
+                        <button type="button" class="side-more-item" data-act="reveal" data-i18n="side.reveal">在资源管理器中显示</button>
                       </div>
                     </div>
+                    <button
+                      type="button"
+                      class="icon-ghost sm"
+                      id="btn-tree-toggle"
+                      data-i18n-title="side.collapseTree"
+                      title="收起文件目录"
+                      aria-pressed="false"
+                    >⟩</button>
+                  </div>
+                </div>
+                <div class="side-files-split" id="side-files-split">
+                  <!-- 左：仅预览正文（无打开文件时由 .no-preview 整列隐藏） -->
+                  <div class="side-files-preview-col" id="side-files-preview-col">
                     <div class="side-pane-body" id="side-pane-body">
-                      <div class="side-pane-empty" id="side-pane-empty" data-i18n="side.emptyFiles">
+                      <!-- 无 tab 时预览列整列收起（见 .side-files-split.no-preview）；此 empty 仅作兜底 -->
+                      <div class="side-pane-empty hidden" id="side-pane-empty" data-i18n="side.emptyFiles">
                         从右侧文件树选择文件，或在对话中点击路径
                       </div>
                       <div class="file-preview hidden" id="file-preview">
@@ -577,8 +610,9 @@
                 </div>
               </div>
             </div>
+            </div><!-- /.side-pane-col：顶栏 + 内容 -->
 
-            <!-- 侧栏内分类轨（文件 / 计划 / 浏览器 / 终端） -->
+            <!-- 侧栏内分类轨（文件 / 计划 / 浏览器 / 终端）——与 side-pane-col 并列 -->
             <nav class="side-cat-rail" id="side-cat-rail" data-i18n-aria-label="side.cats" aria-label="侧栏分类">
               <button type="button" class="side-cat-btn active" data-cat="files" id="btn-cat-files" data-i18n-title="side.files" title="文件" data-i18n-aria-label="side.files" aria-label="文件">
                 <span class="side-cat-ico" data-sidebar-icon="file" aria-hidden="true"></span>

@@ -34,3 +34,12 @@ export {
   clearChromeThemeOverrides,
   type ThemeBootSnapshot,
 } from "./apply.js";
+export {
+  DERIVED_CSS_KEYS,
+  contrastRatio,
+  deriveChromeCssTokens,
+  isLowContrastChrome,
+  normalizeContrast,
+  relativeLuminance,
+  type ThemeCssTokens,
+} from "./derive.js";
