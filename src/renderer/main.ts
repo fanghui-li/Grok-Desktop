@@ -16,15 +16,11 @@ import {
 } from "../shared/history-resync-policy.js";
 import {
   resolveBusySendWhileCancelling,
-  shouldIgnoreCancelledTurnCompleted,
-  shouldIgnoreLateSessionWorking,
-  shouldIgnoreLateTurnStarted,
   shouldJoinInFlightCancel,
   shouldPaintStoppedPhase,
   type TurnUiPhase,
 } from "../shared/turn-ui-state.js";
 import {
-  appendBackgroundAssistantDelta,
   getSessionTurn,
   idleProjection,
   markSessionTurnIdle,
@@ -32,33 +28,45 @@ import {
   setSessionTurn,
   shouldRehydrateBusy,
   type SessionTurnProjection,
-} from "./session-turn-store.js";
+} from "./session/turn-store.js";
+import {
+  eventBelongsToActiveSession as eventBelongsToActiveSessionPure,
+  isTranscriptScopedEvent as isTranscriptScopedEventPure,
+} from "./session/event-scope.js";
+import {
+  applyBackgroundTranscriptEvent,
+  applySuspendedLiveTranscriptEvent,
+} from "./session/bg-turn-events.js";
+import { PlanEventHandlers } from "./plan/event-handlers.js";
+import { TranscriptEventHandlers } from "./session/transcript-handlers.js";
+import { BusEventHandlers } from "./session/bus-event-handlers.js";
+import {
+  paintHistoryEntries,
+  resolveThreadIdAfterAttachState,
+} from "./session/history-replay.js";
+import {
+  bindPlanProjectionForOpen,
+  planOpenThreadLeave,
+  shouldApplyAttachUiState,
+  shouldForceBackgroundTurnActive,
+} from "./session/open-thread-phases.js";
+import { SubagentTaskEventHandlers } from "./tasks/event-handlers.js";
 import {
   deriveSessionActivity,
   sessionActivityIsDraining,
   type SessionActivity,
-} from "./session-activity.js";
+} from "./session/activity.js";
 import {
   clearSessionPlan,
   getSessionPlan,
   patchSessionPlan,
-  setSessionPlan,
   type PlanPhase,
   type SessionPlanPendingApproval,
-} from "./session-plan-store.js";
+} from "./session/plan-store.js";
 import {
-  beginBtwFlight,
   cancelSessionBtwFlight,
-  clearSessionBtw,
-  getOrCreateSessionBtw,
-  isBtwFlightCurrent,
-  isBtwInFlight,
-  listSessionBtw,
-  replaceSessionBtwFromDisk,
-  upsertBtwExchange,
   type BtwExchange,
-  type BtwExchangeState,
-} from "./session-btw-store.js";
+} from "./session/btw-store.js";
 import {
   applyDomI18n,
   onLocaleChange,
@@ -87,64 +95,133 @@ import {
   type SettingsThemePreference,
 } from "./settings-page.js";
 import type { ThemeVariant, VariantAppearance } from "../shared/theme/types.js";
-import {
-  applyChromeTheme,
-  defaultAppearance,
-  deriveChromeCssTokens,
-  formatCodexThemeV1,
-} from "../shared/theme/index.js";
+import { defaultAppearance } from "../shared/theme/index.js";
+import { ThemeController } from "./lib/theme-controller.js";
+import { PermPromptUi } from "./perm/prompt-ui.js";
 import { PluginsPageController } from "./plugins-page.js";
 import {
   sendButtonIconHtml,
   sidebarIcon,
   type SidebarIconName,
-} from "./sidebar-icons.js";
+} from "./sidebar/icons.js";
 import {
   agentAdvertisedCommands,
   buildSlashKindCatalog,
   getStaticSlashCommands,
-  resolveSlashCommand,
   skillCommands,
   type SlashCommandDef,
-} from "./slash-commands.js";
-import { SlashPaletteController } from "./slash-palette.js";
+} from "./slash/commands.js";
+import { SlashPaletteController } from "./slash/palette.js";
 import {
   bindComposerSlashHighlight,
   refreshComposerSlashHighlight,
   setSlashHighlightCatalog,
-} from "./composer-slash-highlight.js";
+} from "./composer/slash-highlight.js";
 import {
   AtFilePaletteController,
   type AtFileHit,
-} from "./at-file-palette.js";
+} from "./slash/at-file-palette.js";
 import {
   buildToolCardHtml,
-  extractToolMeta,
   updateToolCardDone,
 } from "./agent-blocks.js";
-import { syncAttachPillDom } from "./attach-pill-dom.js";
+import { syncAttachPillDom } from "./attach/pill-dom.js";
+import { PromptQueueController } from "./prompt-queue/controller.js";
 import {
-  buildForkDialogHtml,
-  parseForkSlashArgs,
-  readForkDialogResult,
-} from "./fork-session-ui.js";
+  formatAge,
+  formatElapsedCompact,
+  formatTurnElapsed,
+  formatTurnStopped,
+  formatUserMsgTime,
+} from "./lib/format-utils.js";
+import { looksLikeGoalProcessText } from "./goal/process.js";
+import { formatTurnErrorMessage } from "./lib/turn-error-format.js";
+import { effortOptions, parseEffort, type EffortLevel } from "./model/effort.js";
 import {
-  hostClearQueue,
-  hostCompleteSending,
-  hostEnqueue,
-  hostRemoveItem,
-  hostReorder,
-  hostSetQueueFlags,
-  hostTakeNext,
-  hostUpdateItem,
-  loadSessionQueue,
-  mirrorQueueToLocal,
-} from "./prompt-queue-store.js";
+  parseGoalBudget,
+  parseGoalInput as parseGoalInputPure,
+} from "./goal/input.js";
 import {
-  buildPromptQueueBarHtml,
-  buildPromptQueueEmptyModalHtml,
-  buildPromptQueueModalBodyHtml,
-} from "./prompt-queue-ui.js";
+  MAX_COMPOSER_ATTACHMENTS,
+  MAX_COMPOSER_IMAGES,
+  MAX_PASTE_IMAGE_BYTES_UI,
+  arrayBufferToBase64,
+  attachIcon,
+  planAddAttachments,
+  resolveLocalFilePath as resolveLocalFilePathPure,
+  type ComposerAttachment,
+} from "./composer/attachments.js";
+import {
+  CHATS_GROUP_ID,
+  isLiveThreadId,
+  isThreadOpen as isThreadOpenPure,
+  parentThreadTitle as parentThreadTitlePure,
+  projectIdOfThread,
+  threadDisplayTitle as threadDisplayTitlePure,
+  threadsForChatsGroup as threadsForChatsGroupPure,
+  threadsForProject as threadsForProjectPure,
+  type Project,
+  type ThreadRow,
+} from "./thread/model.js";
+import { SidebarListController } from "./sidebar/list.js";
+import { ComposerAttachUi } from "./composer/attach-ui.js";
+import { ComposerBindUi } from "./composer/bind-ui.js";
+import { ModelMenuController } from "./model/menu-ui.js";
+import { BtwSideUi } from "./btw/side-ui.js";
+import { BtwActions } from "./btw/actions.js";
+import { ChatScrollLayout } from "./chat/scroll-layout.js";
+import { GoalBannerUi, type GoalUiProjection as GoalUiProjectionMod } from "./goal/banner-ui.js";
+import { GoalRuntimeActions } from "./goal/runtime-actions.js";
+import { GoalSlashActions } from "./goal/slash-actions.js";
+import { SkillActions } from "./slash/skill-actions.js";
+import { SlashDispatch } from "./slash/dispatch.js";
+import { ShellNavActions } from "./shell/nav-actions.js";
+import { ContextUi, type ContextUsageRow } from "./context/ui.js";
+import { PermMenuUi } from "./perm/menu-ui.js";
+import { PlanPanelUi } from "./plan/panel-ui.js";
+import { TasksPanelUi } from "./tasks/panel-ui.js";
+import { MemoryBrowserUi } from "./memory/browser-ui.js";
+import { PromptHistoryUi } from "./composer/prompt-history-ui.js";
+import { CrashBannerUi } from "./lib/crash-banner-ui.js";
+import { PlusMenuUi } from "./composer/plus-menu-ui.js";
+import { ProjectPickerUi } from "./sidebar/project-picker-ui.js";
+import { ProjectActions } from "./sidebar/project-actions.js";
+import { AvailableCommandsCache } from "./slash/available-commands.js";
+import { AutomationsModalUi } from "./automations/modal-ui.js";
+import { SessionSearchUi } from "./session/search-ui.js";
+import { ForkActions } from "./session/fork-actions.js";
+import { RewindActions } from "./session/rewind-actions.js";
+import { SessionOpsActions } from "./session/ops-actions.js";
+import { ModelSessionActions } from "./model/session-actions.js";
+import {
+  type SessionModeChipFocus as SessionModeChipFocusMod,
+} from "./session/mode-chips.js";
+import { SessionPolicyActions } from "./session/policy-actions.js";
+import {
+  closeModal as closeModalDlg,
+  confirmText as confirmTextDlg,
+  openModal as openModalDlg,
+  promptText as promptTextDlg,
+  showToast as showToastDlg,
+} from "./lib/dialogs.js";
+import {
+  syncAppUpdateTopButton as syncAppUpdateTopButtonPure,
+  type AppUpdateUiSnap,
+} from "./lib/app-update-ui.js";
+import { type AgentGoalEvent } from "./goal/apply.js";
+import { parseInlineBtwOrInterject } from "./composer/inline.js";
+import {
+  goalStatusKicker,
+  parseGoalUiStatus,
+  type GoalUiStatus,
+} from "./goal/status.js";
+import { type ModelRow } from "./model/display.js";
+import { type SessionInfoRow } from "./session/info-format.js";
+import {
+  assistantTextsRoughlyEqual,
+  looksLikeGluedNewAssistantReply,
+  normalizeAssistantForDedupe,
+} from "./lib/assistant-dedupe.js";
 import type { AttachState } from "../shared/types.js";
 
 interface Bridge {
@@ -166,77 +243,9 @@ interface HostRes<T> {
   error?: { code: string; message: string; details?: unknown };
 }
 
-type Project = { id: string; path: string; title: string; trust: string };
-type ThreadRow = {
-  id: string;
-  sessionId: string;
-  projectId?: string;
-  title: string;
-  cwd: string;
-  status: string;
-  updatedAt?: string;
-  archived?: boolean;
-  /** 该会话使用的模型（list 自 Host / thread-meta） */
-  model?: string;
-  /** 该会话推理力度 */
-  effort?: string;
-  /** 磁盘 summary：fork 等 */
-  sessionKind?: string;
-  /** fork 来源会话 id */
-  parentSessionId?: string;
-};
 
-/** Codex-style relative age (e.g. 1 周 / 3 天). */
-function formatAge(iso?: string): string {
-  if (!iso) return "";
-  const ms = Date.parse(iso);
-  if (!Number.isFinite(ms)) return "";
-  const sec = Math.max(0, (Date.now() - ms) / 1000);
-  if (sec < 60) return tr("time.justNow");
-  if (sec < 3600) return tr("time.minutes", { n: Math.floor(sec / 60) });
-  if (sec < 86400) return tr("time.hours", { n: Math.floor(sec / 3600) });
-  if (sec < 86400 * 7) return tr("time.days", { n: Math.floor(sec / 86400) });
-  if (sec < 86400 * 30)
-    return tr("time.weeks", { n: Math.floor(sec / (86400 * 7)) });
-  if (sec < 86400 * 365)
-    return tr("time.months", { n: Math.floor(sec / (86400 * 30)) });
-  return tr("time.years", { n: Math.floor(sec / (86400 * 365)) });
-}
 
-function threadsForProject(projectId: string): ThreadRow[] {
-  const proj = projects.find((p) => p.id === projectId);
-  return threads
-    .filter((t) => {
-      if (t.projectId === projectId) return true;
-      if (!proj) return false;
-      // 无 projectId 的「不使用项目」会话不归入项目（即使 cwd 碰巧在项目下）
-      if (!t.projectId) return false;
-      const cwd = t.cwd.replace(/\\/g, "/").toLowerCase();
-      const root = proj.path.replace(/\\/g, "/").toLowerCase();
-      return cwd === root || cwd.startsWith(root + "/");
-    })
-    .sort((a, b) =>
-      (b.updatedAt ?? "").localeCompare(a.updatedAt ?? ""),
-    );
-}
 
-/** 侧栏虚拟组：不使用项目的会话 */
-const CHATS_GROUP_ID = "__chats__";
-
-/** 未挂任何项目的会话（侧栏「对话」组） */
-function threadsForChatsGroup(): ThreadRow[] {
-  const claimed = new Set<string>();
-  for (const p of projects) {
-    for (const t of threadsForProject(p.id)) {
-      claimed.add(t.sessionId);
-    }
-  }
-  return threads
-    .filter((t) => !claimed.has(t.sessionId))
-    .sort((a, b) =>
-      (b.updatedAt ?? "").localeCompare(a.updatedAt ?? ""),
-    );
-}
 
 const $ = <T extends HTMLElement>(id: string) =>
   document.getElementById(id) as T;
@@ -244,15 +253,6 @@ const $ = <T extends HTMLElement>(id: string) =>
 let projects: Project[] = [];
 let threads: ThreadRow[] = [];
 let selectedProjectId: string | null = null;
-/** 侧栏项目：已展开的文件夹 */
-const expandedProjectIds = new Set<string>();
-/** 侧栏项目：已点「展开更多」、显示全部会话 */
-const projectShowAllThreads = new Set<string>();
-/** 项目下「归档」夹是否展开 */
-const expandedArchiveIds = new Set<string>();
-/** 是否已做过默认展开（避免用户全部收起后刷新又被强制展开） */
-let projectExpandInitialized = false;
-const THREADS_PREVIEW_LIMIT = 5;
 /** 用户是否手动选过项目 /「不使用项目」（避免 refresh 强制回填首项） */
 let projectChoiceTouched = false;
 let activeThreadId: string | null = null;
@@ -342,16 +342,6 @@ let lastCancelledPromptIndex: number | null = null;
  * 会先后带同一条 Internal error（#6 起双路径都画红条）。
  */
 let lastShownTurnError: { turnId: number; key: string } | null = null;
-/** 本 turn 内 agent 写入的类 plan 文档路径（非 session plan.md 时兜底展示） */
-let lastPlanArtifactPath: string | null = null;
-/** 计划面板：磁盘已保存内容（用于脏检测） */
-let planPanelSavedContent = "";
-/** 计划面板显示的真源路径 */
-let planPanelPath: string | null = null;
-let planPanelBound = false;
-let planPanelBusy = false;
-/** 计划面板：源码 | Markdown 预览 */
-let planPanelViewMode: "source" | "preview" = "source";
 /**
  * chip 显示：当前上下文的模型/推理。
  * - 打开某会话时 = 该会话记忆
@@ -359,30 +349,18 @@ let planPanelViewMode: "source" | "preview" = "source";
  */
 let modelLabel = "grok";
 /** 推理力度（对齐 CLI /effort：low|medium|high|xhigh） */
-type EffortLevel = "low" | "medium" | "high" | "xhigh";
 let effortLevel: EffortLevel = "high";
 /** 新对话默认（设置页 / 欢迎页改 chip 时更新；不因打开旧会话而改） */
 let defaultModelLabel = "grok";
 let defaultEffortLevel: EffortLevel = "high";
-function effortOptions(): Array<{ id: EffortLevel; label: string }> {
-  return [
-    { id: "low", label: tr("effort.low") },
-    { id: "medium", label: tr("effort.medium") },
-    { id: "high", label: tr("effort.high") },
-    { id: "xhigh", label: tr("effort.xhigh") },
-  ];
-}
-/** 顶栏「打开位置」默认目标 */
 let defaultOpenTarget: SettingsOpenTarget = "explorer";
 /** UI language preference from settings (`system` | zh-CN | en-US) */
 let localePreference: LocalePreference = "system";
 /** Appearance preference（对齐 Codex Appearance：system | light | dark） */
 let themePreference: SettingsThemePreference = "system";
-/** 分 variant 的 chrome + codeThemeId */
+/** 分 variant 的 chrome + codeThemeId（经 ThemeController 持有） */
 let appearanceLight: VariantAppearance = defaultAppearance("light");
 let appearanceDark: VariantAppearance = defaultAppearance("dark");
-let systemThemeMql: MediaQueryList | null = null;
-let systemThemeListener: ((ev: MediaQueryListEvent) => void) | null = null;
 /** Codex 可拖拽文件侧栏 */
 let sidePane: SidePaneController | null = null;
 /** Codex 式全页设置 */
@@ -392,43 +370,11 @@ let pluginsPage: PluginsPageController | null = null;
 /** 斜杠命令中心 */
 let slashPalette: SlashPaletteController | null = null;
 let atFilePalette: AtFilePaletteController | null = null;
-/** 待发送附件（文件/图片/文件夹路径，注入 prompt 上下文） */
-type ComposerAttachment = {
-  path: string;
-  name: string;
-  kind: "file" | "image" | "folder";
-  /** 缩略图 / 灯箱用 data URL */
-  previewUrl?: string;
-};
-let composerAttachments: ComposerAttachment[] = [];
 /**
  * Goal UI 真源：agent goal_updated 投影（对齐 CLI AgentView.goal_state）。
  * compose 草稿仅本地，未 setup 前不算有目标。
  */
-type GoalUiStatus =
-  | "active"
-  | "user_paused"
-  | "back_off_paused"
-  | "no_progress_paused"
-  | "infra_paused"
-  | "blocked"
-  | "budget_limited"
-  | "complete";
-
-type GoalUiProjection = {
-  goalId: string;
-  objective: string;
-  status: GoalUiStatus;
-  phase: "idle" | "planning" | "executing";
-  tokenBudget: number | null;
-  tokensUsed: number;
-  elapsedMs: number;
-  elapsedFloorMs: number;
-  pauseMessage?: string;
-  lastEvent?: string;
-  verifyingCompletion: boolean;
-  planning: boolean;
-};
+type GoalUiProjection = GoalUiProjectionMod;
 
 /** 当前会话投影（null = 无目标 UI） */
 let goalProjection: GoalUiProjection | null = null;
@@ -440,14 +386,11 @@ let goalComposeActive = false;
  * 输入栏 plan/goal chip 互斥焦点：最后一次被激活的一侧占 chip 位。
  * plan 与 goal 状态可同时存在于会话，但 UI **只显示一个** chip。
  */
-type SessionModeChipFocus = "plan" | "goal" | null;
+type SessionModeChipFocus = SessionModeChipFocusMod;
 let sessionModeChipFocus: SessionModeChipFocus = null;
 /** wall-clock：live active 时从 received 起外推 */
 let goalElapsedAnchorAt: number | null = null;
-let goalElapsedTimer: ReturnType<typeof setInterval> | null = null;
 let goalCompleteHideTimer: ReturnType<typeof setTimeout> | null = null;
-/** 进行中 goal 时轮询 agent 日志，防止 ACP 丢 complete 事件 */
-let goalSyncTimer: ReturnType<typeof setInterval> | null = null;
 /** 目标 token 预算（CLI `/goal … --budget N`）；发送时拼进 /goal */
 let goalTokenBudget: number | null = null;
 /** clear 后本地记 id，防迟到事件复活（与 Host store 双保险） */
@@ -455,13 +398,7 @@ const goalLocalClearedIds = new Set<string>();
 /** 本会话 / 默认 max-turns（写入 create meta；0=不限） */
 let maxTurnsLimit: number | null = null;
 /** agent available_commands_update 缓存（按 session） */
-let agentAvailableCommands: Array<{
-  name: string;
-  description?: string;
-  input?: { hint?: string };
-}> = [];
 /** 崩溃后展示「重新附着」条 */
-let agentCrashPending = false;
 async function inv<T>(
   method: HostIpcMethod,
   params?: unknown,
@@ -479,6 +416,1142 @@ function esc(s: string): string {
     .replace(/>/g, "&gt;")
     .replace(/"/g, "&quot;");
 }
+
+/** 侧栏项目/会话列表（DOM + 展开态） */
+let sidebarList: SidebarListController | null = null;
+let modelMenu: ModelMenuController | null = null;
+let btwSideUi: BtwSideUi | null = null;
+let btwActions: BtwActions | null = null;
+let chatScroll: ChatScrollLayout | null = null;
+let slashDispatch: SlashDispatch | null = null;
+let shellNavActions: ShellNavActions | null = null;
+let goalBannerUi: GoalBannerUi | null = null;
+let goalRuntime: GoalRuntimeActions | null = null;
+let planEventHandlers: PlanEventHandlers | null = null;
+let transcriptHandlers: TranscriptEventHandlers | null = null;
+let busEventHandlers: BusEventHandlers | null = null;
+let subagentTaskHandlers: SubagentTaskEventHandlers | null = null;
+let contextUi: ContextUi | null = null;
+let permMenuUi: PermMenuUi | null = null;
+let composerBindUi: ComposerBindUi | null = null;
+let planPanelUi: PlanPanelUi | null = null;
+let tasksPanelUi: TasksPanelUi | null = null;
+let memoryBrowserUi: MemoryBrowserUi | null = null;
+let promptHistoryUi: PromptHistoryUi | null = null;
+let crashBannerUi: CrashBannerUi | null = null;
+let plusMenuUi: PlusMenuUi | null = null;
+let projectPickerUi: ProjectPickerUi | null = null;
+let availableCommandsCache: AvailableCommandsCache | null = null;
+let automationsModalUi: AutomationsModalUi | null = null;
+let sessionSearchUi: SessionSearchUi | null = null;
+let promptQueueCtrl: PromptQueueController | null = null;
+let forkActions: ForkActions | null = null;
+let rewindActions: RewindActions | null = null;
+let sessionOpsActions: SessionOpsActions | null = null;
+let modelSessionActions: ModelSessionActions | null = null;
+let projectActions: ProjectActions | null = null;
+let goalSlashActions: GoalSlashActions | null = null;
+let sessionPolicyActions: SessionPolicyActions | null = null;
+let skillActions: SkillActions | null = null;
+let themeCtrl: ThemeController | null = null;
+let permPromptUi: PermPromptUi | null = null;
+/** 附件 chips / 添加 */
+let attachUi: ComposerAttachUi | null = null;
+
+function threadsForProject(projectId: string): ThreadRow[] {
+  return threadsForProjectPure(projects, threads, projectId);
+}
+function threadsForChatsGroup(): ThreadRow[] {
+  return threadsForChatsGroupPure(projects, threads);
+}
+function threadDisplayTitle(
+  t: ThreadRow | undefined,
+  fallbackId?: string,
+): string {
+  return threadDisplayTitlePure(t, fallbackId, tr("slash.forkDefaultTitle"));
+}
+function parentThreadTitle(parentSessionId: string | undefined): string | null {
+  return parentThreadTitlePure(
+    threads,
+    parentSessionId,
+    tr("slash.forkDefaultTitle"),
+  );
+}
+function isThreadOpen(t: ThreadRow): boolean {
+  return isThreadOpenPure(t, activeThreadId, activeSessionId);
+}
+
+function ensureSidebarList(): SidebarListController {
+  if (sidebarList) return sidebarList;
+  sidebarList = new SidebarListController({
+    inv,
+    esc,
+    showToast: (text, kind) => showToast(text, kind ?? "info"),
+    getProjects: () => projects,
+    setProjects: (p) => {
+      projects = p;
+    },
+    getThreads: () => threads,
+    setThreads: (t) => {
+      threads = t;
+    },
+    getSelectedProjectId: () => selectedProjectId,
+    setSelectedProjectId: (id) => {
+      selectedProjectId = id;
+    },
+    getProjectChoiceTouched: () => projectChoiceTouched,
+    setProjectChoiceTouched: (v) => {
+      projectChoiceTouched = v;
+    },
+    getActiveThreadId: () => activeThreadId,
+    getActiveSessionId: () => activeSessionId,
+    isSessionWorking: (sid) => workingSessions.has(sid),
+    onListRefreshed: () => {
+      syncChatTopTitle();
+      setWelcomeTitle();
+    },
+    onOpenThread: (t) => {
+      void openThread(t);
+    },
+    onProjectSelected: () => {
+      if (!activeThreadId && !activeSessionId) {
+        setWelcomeTitle();
+        showWelcome(true);
+      }
+    },
+    onRemoveProject: (id, title, path) =>
+      removeProjectFromList(id, title, path),
+    onRenameThread: (t) => renameThread(t),
+    onExportThread: async (t, destination) => {
+      const r = await exportActiveSession({ destination, threadId: t.id });
+      if (r.message) showToast(r.message, r.ok ? "info" : "error");
+    },
+    onForkThread: async (t) => {
+      const r = await forkSessionFrom(t, { confirm: true });
+      if (r.message) showToast(r.message, r.ok ? "info" : "error");
+    },
+    onArchiveThread: (t, archived) => archiveThread(t, archived),
+    onDeleteThread: (t) => deleteThread(t),
+    onOpenParentThread: (parent) => {
+      selectedProjectId =
+        parent.projectId || projectIdOfThread(parent) || selectedProjectId;
+      if (selectedProjectId) {
+        ensureSidebarList().expandedProjectIds.add(selectedProjectId);
+      }
+      void openThread(parent);
+    },
+  });
+  return sidebarList;
+}
+
+function ensureAttachUi(): ComposerAttachUi {
+  if (attachUi) return attachUi;
+  attachUi = new ComposerAttachUi({
+    inv,
+    esc,
+    showToast: (text, kind) => showToast(text, kind ?? "info"),
+    getSessionId: () => activeSessionId,
+    getPickDefaultPath: () => selectedProject()?.path,
+    openPathInWorkspace: (opts) => openPathInWorkspace(opts),
+  });
+  return attachUi;
+}
+
+function hideThreadMenu(): void {
+  ensureSidebarList().hideThreadMenu();
+}
+async function refreshProjectsAndThreads(): Promise<void> {
+  await ensureSidebarList().refreshProjectsAndThreads();
+}
+
+function addAttachments(
+  paths: string[],
+  opts?: {
+    kind?: ComposerAttachment["kind"];
+    previewMap?: Record<string, string>;
+  },
+): number {
+  return ensureAttachUi().add(paths, opts);
+}
+function removeAttachment(path: string): void {
+  ensureAttachUi().remove(path);
+}
+function clearAttachments(): void {
+  ensureAttachUi().clear();
+}
+function renderAttachmentChips(): void {
+  ensureAttachUi().renderChips();
+}
+function buildPromptWithAttachments(userText: string): {
+  display: string;
+  content: string;
+} {
+  return ensureAttachUi().buildPrompt(userText);
+}
+async function pickAndAddAttachments(): Promise<void> {
+  await ensureAttachUi().pickAndAdd();
+}
+
+function ensureModelMenu(): ModelMenuController {
+  if (modelMenu) return modelMenu;
+  modelMenu = new ModelMenuController({
+    inv,
+    esc,
+    showToast: (text, kind) => showToast(text, kind ?? "info"),
+    getModelLabel: () => modelLabel,
+    setModelLabel: (id) => {
+      modelLabel = id;
+    },
+    getDefaultModelLabel: () => defaultModelLabel,
+    setDefaultModelLabel: (id) => {
+      defaultModelLabel = id;
+    },
+    getEffortLevel: () => effortLevel,
+    setEffortLevel: (level) => setEffortLevel(level),
+    effortLabel,
+    isMainShellOverlayOpen,
+    getActiveThreadId: () => activeThreadId,
+    getActiveSessionId: () => activeSessionId,
+    applySessionModelAndEffort,
+    promptSetModel,
+  });
+  return modelMenu;
+}
+
+function ensureBtwSideUi(): BtwSideUi {
+  if (btwSideUi) return btwSideUi;
+  btwSideUi = new BtwSideUi({
+    esc,
+    showToast: (text, kind) => showToast(text, kind ?? "info"),
+    getActiveSessionId: () => activeSessionId,
+    ensureBtwSideOpen: () => ensureBtwSideOpen(),
+    renderMarkdownToSafeHtml,
+  });
+  return btwSideUi;
+}
+
+function ensureChatScroll(): ChatScrollLayout {
+  if (chatScroll) return chatScroll;
+  chatScroll = new ChatScrollLayout({
+    hideEphemeralMenus,
+    getTranscriptEl: () => document.getElementById("transcript"),
+  });
+  return chatScroll;
+}
+
+function ensurePlanEventHandlers(): PlanEventHandlers {
+  if (planEventHandlers) return planEventHandlers;
+  planEventHandlers = new PlanEventHandlers({
+    inv,
+    showToast: (text, kind) => showToast(text, kind ?? "info"),
+    getActiveSessionId: () => activeSessionId,
+    getThreads: () => threads,
+    eventBelongsToActiveSession,
+    markSessionWorking,
+    endStreamBubble,
+    setTurnStatus,
+    getPlanPhase: () => planPhase,
+    setPlanPhase: (phase) => {
+      planPhase = phase;
+    },
+    setPendingApproval: (p) => {
+      pendingPlanApproval = p;
+    },
+    syncPermLabels,
+    openPlanPanel,
+    isPlanOn,
+    isPlanApprovalArmed,
+    snapshotActiveSessionPlan,
+  });
+  return planEventHandlers;
+}
+
+function demoteLiveThreadToDisk(): void {
+  if (
+    activeThreadId &&
+    !activeThreadId.startsWith("disk_") &&
+    activeSessionId
+  ) {
+    activeThreadId = `disk_${activeSessionId}`;
+  }
+}
+
+function ensureTranscriptHandlers(): TranscriptEventHandlers {
+  if (transcriptHandlers) return transcriptHandlers;
+  transcriptHandlers = new TranscriptEventHandlers({
+    showWelcome,
+    appendLine,
+    appendThoughtDelta,
+    appendProcessText,
+    beginTurn,
+    endTurn,
+    armTurnForLiveStream,
+    setTurnStatus,
+    endStreamBubble,
+    markToolStarted,
+    markToolCompleted,
+    markToolIncomplete,
+    maybeGoalFromToolRaw,
+    notePlanArtifactFromTool,
+    scheduleRefreshFileTree: (delayMs) =>
+      sidePane?.scheduleRefreshFileTree(delayMs),
+    showAskUserDialog,
+    showPermission,
+    showTurnErrorOnce,
+    showAgentCrashBanner,
+    refreshContextAfterCompact,
+    syncGoalFromAgent,
+    refreshContextUsage,
+    maybeSurfacePlanAfterTurn,
+    afterTurnSettled,
+    markSessionWorking,
+    setComposerBusy,
+    demoteLiveThreadToDisk,
+    getTurnActive: () => turnActive,
+    isUserStopSuppressed,
+    getTurnUiPhase: () => turnUiPhase,
+    getAlreadyPaintedStopped: () => alreadyPaintedStopped,
+    getAssistantStartedThisTurn: () => assistantStartedThisTurn,
+    getBlockHistoryResyncAfterStop: () => blockHistoryResyncAfterStop,
+    getActiveSessionId: () => activeSessionId,
+  });
+  return transcriptHandlers;
+}
+
+function ensureBusEventHandlers(): BusEventHandlers {
+  if (busEventHandlers) return busEventHandlers;
+  busEventHandlers = new BusEventHandlers({
+    handleDeepLinkPayload,
+    handleShellNavigate,
+    handleShellNotice,
+    onAppUpdate: (upd) => {
+      settingsPage?.onAppUpdateEvent(upd);
+      syncAppUpdateTopButton(upd);
+    },
+    getActiveSessionId: () => activeSessionId,
+    getActiveThreadId: () => activeThreadId,
+    getTurnActive: () => turnActive,
+    getTurnUiPhase: () => turnUiPhase,
+    isUserStopSuppressed,
+    eventBelongsToActiveSession,
+    setAttachUiState: (state, lastError) =>
+      setAttachUiState(state as AttachState, lastError),
+    demoteLiveThreadToDisk,
+    endTurn,
+    setComposerBusy,
+    markSessionWorking,
+    reloadPromptQueueFromHost,
+    showToast: (text, kind) => showToast(text, kind ?? "info"),
+    applyAvailableCommandsEvent: (ev) =>
+      applyAvailableCommandsEvent(
+        ev as Parameters<AvailableCommandsCache["applyEvent"]>[0],
+      ),
+    scheduleRefreshFileTree: () => sidePane?.scheduleRefreshFileTree(),
+    handlePlanApprovalRequested: (ev) =>
+      handlePlanApprovalRequested(
+        ev as Parameters<PlanEventHandlers["handleApprovalRequested"]>[0],
+      ),
+    handlePlanModeChanged: (ev) =>
+      handlePlanModeChanged(
+        ev as Parameters<PlanEventHandlers["handleModeChanged"]>[0],
+      ),
+    applyAgentGoalEvent: (ev) =>
+      applyAgentGoalEvent(ev as Parameters<typeof applyAgentGoalEvent>[0]),
+    handleSubagentUpdated: (ev) =>
+      handleSubagentUpdated(
+        ev as Parameters<typeof handleSubagentUpdated>[0],
+      ),
+    handleTaskUpdated: (ev) =>
+      handleTaskUpdated(ev as Parameters<typeof handleTaskUpdated>[0]),
+  });
+  return busEventHandlers;
+}
+
+function ensureSubagentTaskHandlers(): SubagentTaskEventHandlers {
+  if (subagentTaskHandlers) return subagentTaskHandlers;
+  subagentTaskHandlers = new SubagentTaskEventHandlers({
+    getActiveSessionId: () => activeSessionId,
+    showToast: (text, kind) => showToast(text, kind ?? "info"),
+    appendProcessText,
+    applySubagentUpdate: (ev) => sidePane?.applySubagentUpdate(ev),
+    rememberTaskSnap,
+  });
+  return subagentTaskHandlers;
+}
+
+function ensureGoalRuntime(): GoalRuntimeActions {
+  if (goalRuntime) return goalRuntime;
+  goalRuntime = new GoalRuntimeActions({
+    inv,
+    showToast: (text, kind) => showToast(text, kind ?? "info"),
+    confirmText,
+    getActiveSessionId: () => activeSessionId,
+    getActiveThreadId: () => activeThreadId,
+    ensureLiveThread,
+    isPlanOn,
+    getProjection: () => goalProjection,
+    setProjection: (p) => {
+      goalProjection = p;
+    },
+    getPendingTitle: () => pendingGoalTitle,
+    setPendingTitle: (t) => {
+      pendingGoalTitle = t;
+    },
+    getComposeActive: () => goalComposeActive,
+    setComposeActive: (v) => {
+      goalComposeActive = v;
+    },
+    getTokenBudget: () => goalTokenBudget,
+    setTokenBudget: (n) => {
+      goalTokenBudget = n;
+    },
+    getElapsedAnchorAt: () => goalElapsedAnchorAt,
+    setElapsedAnchorAt: (n) => {
+      goalElapsedAnchorAt = n;
+    },
+    getLocalClearedIds: () => goalLocalClearedIds,
+    getCompleteHideTimer: () => goalCompleteHideTimer,
+    setCompleteHideTimer: (t) => {
+      goalCompleteHideTimer = t;
+    },
+    getSessionModeChipFocus: () => sessionModeChipFocus,
+    setSessionModeChipFocus: (f) => {
+      sessionModeChipFocus = f;
+    },
+    setComposerPlaceholders,
+    syncSessionModeChips,
+    renderBanner: () => renderGoalBanner(),
+    stopSyncTimer: () => stopGoalSyncTimer(),
+    stopElapsedTimer: () => stopGoalElapsedTimer(),
+    elapsedMsNow: () => goalElapsedMsNow(),
+    currentTitle: () => currentGoalTitle(),
+    paused: () => goalPaused(),
+    completed: () => goalCompleted(),
+    refreshTurnPhaseActivityLabel,
+    scheduleReconcileTurnAfterGoalStopped,
+    activeComposerInput: () => activeComposerInput(),
+    promptEditGoal,
+    runGoalCommand,
+  });
+  return goalRuntime;
+}
+
+function ensureBtwActions(): BtwActions {
+  if (btwActions) return btwActions;
+  btwActions = new BtwActions({
+    inv,
+    showToast: (text, kind) => showToast(text, kind ?? "info"),
+    showWelcome,
+    appendLine,
+    getActiveSessionId: () => activeSessionId,
+    getActiveThreadId: () => activeThreadId,
+    getSessionViewGen: () => sessionViewGen,
+    getTurnActive: () => turnActive,
+    getTurnUiPhase: () => turnUiPhase,
+    ensureLiveThread,
+    openBtwCategory: (focusInput) =>
+      sidePane?.openBtwCategory(focusInput) ?? false,
+    syncBtwAvailability: () => {
+      sidePane?.syncBtwAvailability();
+    },
+    paintExchangeUi: (sessionId, ex, opts) =>
+      applyBtwExchangeUi(sessionId, ex, opts),
+    rebindForSession: (sessionId) => rebindBtwSideForSession(sessionId),
+    syncComposer: (sessionId) => syncBtwSideComposer(sessionId),
+    stopQuestion: () => stopBtwSideQuestion(),
+    clearThread: () => clearBtwSideThread(),
+    activeComposerInput: () => activeComposerInput(),
+    takeComposerPrompt: () => takeComposerPrompt(),
+    recordPromptHistory,
+    scrollTranscriptIfSticky,
+    getTranscriptEl: () => document.getElementById("transcript"),
+  });
+  return btwActions;
+}
+
+function ensureSlashDispatch(): SlashDispatch {
+  if (slashDispatch) return slashDispatch;
+  slashDispatch = new SlashDispatch({
+    getAccessMode: () => accessMode,
+    setAccessMode: (mode) => {
+      accessMode = mode;
+    },
+    isPlanOn,
+    syncSessionPolicyLive,
+    syncPermLabels,
+    exitPlanMode,
+    enterPlanMode,
+    showViewPlan,
+    runGoalCommand,
+    promptSetMaxTurns,
+    findSkillPathFromPaletteCache,
+    runResolvedSkillSlash,
+    insertComposerText,
+    runMemoryCommand,
+    promptSetModel,
+    isWelcomeVisible: () => !$("welcome").classList.contains("hidden"),
+    getModelMenuAnchorWelcome: () => $("btn-model"),
+    getModelMenuAnchorChat: () => $("btn-model-2"),
+    showModelMenu,
+    showContextDetails,
+    applySessionModelAndEffort,
+    promptSetEffort,
+    showStatus: () => ensureSessionOps().showStatus(),
+    exportActiveSession,
+    compactActiveSession,
+    forkActiveSession,
+    rewindViaSlash,
+    showPromptQueueModal,
+    promptQueueLength: () => ensurePromptQueue().length,
+    clearPromptQueue,
+    showTasksPanel,
+    showPromptHistorySearch,
+    runBtwCommand,
+    runInterjectCommand,
+    permLabel,
+    getComposerInput: () => $("composer-input") as HTMLTextAreaElement,
+    getChatInput: () => $("chat-input") as HTMLTextAreaElement,
+    getFocusInput: () => $("focus-input") as HTMLTextAreaElement,
+    isChatVisible: () => !$("chat").classList.contains("hidden"),
+  });
+  return slashDispatch;
+}
+
+function ensureShellNav(): ShellNavActions {
+  if (shellNavActions) return shellNavActions;
+  shellNavActions = new ShellNavActions({
+    inv,
+    openModal,
+    closeModal,
+    showToast: (text, kind) => showToast(text, kind ?? "info"),
+    showWelcome,
+    getModalBody: () => $("modal-body"),
+    getThreads: () => threads,
+    setSelectedProjectId: (id) => {
+      selectedProjectId = id;
+    },
+    refreshProjectsAndThreads,
+    openThread,
+  });
+  return shellNavActions;
+}
+
+function ensureGoalBanner(): GoalBannerUi {
+  if (goalBannerUi) return goalBannerUi;
+  goalBannerUi = new GoalBannerUi({
+    getProjection: () => goalProjection,
+    getPendingTitle: () => pendingGoalTitle,
+    getComposeActive: () => goalComposeActive,
+    getElapsedAnchorAt: () => goalElapsedAnchorAt,
+    syncSessionModeChips,
+    syncGoalFromAgent: () => syncGoalFromAgent(),
+  });
+  return goalBannerUi;
+}
+
+function ensureContextUi(): ContextUi {
+  if (contextUi) return contextUi;
+  contextUi = new ContextUi({
+    inv,
+    esc,
+    getActiveSessionId: () => activeSessionId,
+    openModal,
+    closeModal,
+    fetchSessionInfoForActive: () => fetchSessionInfoForActive(),
+    bindModalCancel: (onCancel) => {
+      const el = document.getElementById("prompt-dlg-cancel");
+      if (el) el.onclick = () => onCancel();
+    },
+  });
+  return contextUi;
+}
+
+function ensurePermMenu(): PermMenuUi {
+  if (permMenuUi) return permMenuUi;
+  permMenuUi = new PermMenuUi({
+    getAccessMode: () => accessMode,
+    hideModelMenu,
+    hidePlusMenu,
+    getMenuEl: () => document.getElementById("perm-menu"),
+  });
+  return permMenuUi;
+}
+
+function ensureComposerBind(): ComposerBindUi {
+  if (composerBindUi) return composerBindUi;
+  composerBindUi = new ComposerBindUi({
+    inv,
+    showToast: (text, kind) => showToast(text, kind ?? "info"),
+    resolveLocalFilePath,
+    addAttachments,
+  });
+  return composerBindUi;
+}
+
+function ensurePlanPanel(): PlanPanelUi {
+  if (planPanelUi) return planPanelUi;
+  planPanelUi = new PlanPanelUi({
+    inv,
+    showToast: (text, kind) => showToast(text, kind ?? "info"),
+    getActiveSessionId: () => activeSessionId,
+    getActiveCwd: () => activeCwd,
+    getSessionViewGen: () => sessionViewGen,
+    getPlanPhase: () => planPhase,
+    setPlanPhase: (phase) => {
+      planPhase = phase;
+    },
+    getPendingApproval: () => pendingPlanApproval,
+    setPendingApproval: (p) => {
+      pendingPlanApproval = p;
+    },
+    isPlanOn,
+    syncPermLabels,
+    syncSessionPolicyLive,
+    paintAssistantHtml,
+    openPlanCategory: () => {
+      sidePane?.openPlanCategory();
+    },
+    closePlanCategory: () => {
+      sidePane?.closePlanCategory();
+    },
+    setPlanRailActivity: (activity) => {
+      sidePane?.setPlanRailActivity(activity);
+    },
+    hasSidePane: () => Boolean(sidePane),
+    getTurnStatusText: () =>
+      document.querySelector(".turn-status")?.textContent ??
+      document.getElementById("turn-status")?.textContent ??
+      "",
+    setTurnStatus,
+    removeTurnStatus,
+    getTurnActive: () => turnActive,
+    markSessionWorking,
+    setComposerBusy,
+    appendLine,
+    paintUserMessage,
+    showWelcome,
+  });
+  return planPanelUi;
+}
+
+function ensureTasksPanel(): TasksPanelUi {
+  if (tasksPanelUi) return tasksPanelUi;
+  tasksPanelUi = new TasksPanelUi({
+    inv,
+    esc,
+    showToast: (text, kind) => showToast(text, kind ?? "info"),
+    openModal,
+    closeModal,
+    getActiveSessionId: () => activeSessionId,
+    ensureLiveThread,
+    appendProcessText,
+  });
+  return tasksPanelUi;
+}
+
+function ensureMemoryBrowser(): MemoryBrowserUi {
+  if (memoryBrowserUi) return memoryBrowserUi;
+  memoryBrowserUi = new MemoryBrowserUi({
+    inv,
+    esc,
+    showToast: (text, kind) => showToast(text, kind ?? "info"),
+    openModal,
+    closeModal,
+    getActiveCwd: () => getActiveCwd(),
+    getActiveThreadId: () => activeThreadId,
+    ensureLiveThread,
+  });
+  return memoryBrowserUi;
+}
+
+function ensurePromptHistory(): PromptHistoryUi {
+  if (promptHistoryUi) return promptHistoryUi;
+  promptHistoryUi = new PromptHistoryUi({
+    esc,
+    showToast: (text, kind) => showToast(text, kind ?? "info"),
+    openModal,
+    closeModal,
+    activeComposerInput,
+    isSlashPaletteOpen: () => Boolean(slashPalette?.isOpen()),
+  });
+  return promptHistoryUi;
+}
+
+function ensureCrashBanner(): CrashBannerUi {
+  if (crashBannerUi) return crashBannerUi;
+  crashBannerUi = new CrashBannerUi({
+    esc,
+    showToast: (text, kind) => showToast(text, kind ?? "info"),
+    getActiveSessionId: () => activeSessionId,
+    getActiveCwd: () => activeCwd,
+    getActiveThreadId: () => activeThreadId,
+    setActiveThreadId: (id) => {
+      activeThreadId = id;
+    },
+    appendLine,
+    ensureLiveThread,
+    refreshAgentAvailableCommands,
+  });
+  return crashBannerUi;
+}
+
+function ensurePlusMenu(): PlusMenuUi {
+  if (plusMenuUi) return plusMenuUi;
+  plusMenuUi = new PlusMenuUi({
+    onPickFiles: () => pickAndAddAttachments(),
+    onPlan: () =>
+      runSlashCommand({
+        id: "plan",
+        title: tr("plan.modeChip"),
+        description: "",
+        action: { kind: "set-perm", mode: "plan" },
+      }).then((r) => {
+        if (r.message) showToast(r.message, r.ok ? "info" : "error");
+      }),
+    onGoal: () => runGoalCommand("set"),
+  });
+  return plusMenuUi;
+}
+
+function ensureProjectPicker(): ProjectPickerUi {
+  if (projectPickerUi) return projectPickerUi;
+  projectPickerUi = new ProjectPickerUi({
+    esc,
+    getProjects: () => projects,
+    getSelectedProjectId: () => selectedProjectId,
+    setSelectedProjectId: (id) => {
+      selectedProjectId = id;
+    },
+    markChoiceTouched: () => {
+      projectChoiceTouched = true;
+    },
+    setWelcomeTitle,
+    showWelcome,
+    refreshProjectsAndThreads,
+  });
+  return projectPickerUi;
+}
+
+function ensureAvailableCommands(): AvailableCommandsCache {
+  if (availableCommandsCache) return availableCommandsCache;
+  availableCommandsCache = new AvailableCommandsCache({
+    inv,
+    getActiveThreadId: () => activeThreadId,
+    getActiveSessionId: () => activeSessionId,
+    onChanged: () => {
+      slashPalette?.invalidate();
+    },
+  });
+  return availableCommandsCache;
+}
+
+function ensureAutomationsModal(): AutomationsModalUi {
+  if (automationsModalUi) return automationsModalUi;
+  automationsModalUi = new AutomationsModalUi({
+    inv,
+    esc,
+    openModal,
+    getProjects: () => projects,
+  });
+  return automationsModalUi;
+}
+
+function ensureSessionSearch(): SessionSearchUi {
+  if (sessionSearchUi) return sessionSearchUi;
+  sessionSearchUi = new SessionSearchUi({
+    inv,
+    esc,
+    openModal,
+    closeModal,
+    showToast: (text, kind) => showToast(text, kind ?? "info"),
+    getProjects: () => projects,
+    getThreads: () => threads,
+    getSelectedProject: () => selectedProject(),
+    setSelectedProjectId: (id) => {
+      selectedProjectId = id;
+    },
+    markProjectChoiceTouched: () => {
+      projectChoiceTouched = true;
+    },
+    showWelcome,
+    refreshProjectsAndThreads,
+    openThread,
+    openPathInWorkspace,
+  });
+  return sessionSearchUi;
+}
+
+function ensurePromptQueue(): PromptQueueController {
+  if (promptQueueCtrl) return promptQueueCtrl;
+  promptQueueCtrl = new PromptQueueController({
+    inv,
+    esc,
+    showToast: (text, kind) => showToast(text, kind ?? "info"),
+    openModal,
+    closeModal,
+    getActiveSessionId: () => activeSessionId,
+    getTurnActive: () => turnActive,
+    getTurnUiPhase: () => turnUiPhase,
+    dispatchAgentPrompt,
+    runInterjectCommand,
+    syncChatComposerReserve,
+    scrollTranscriptIfSticky,
+  });
+  return promptQueueCtrl;
+}
+
+function ensureForkActions(): ForkActions {
+  if (forkActions) return forkActions;
+  forkActions = new ForkActions({
+    inv,
+    openModal,
+    closeModal,
+    showToast: (text, kind) => showToast(text, kind ?? "info"),
+    getActiveSessionId: () => activeSessionId,
+    getActiveThreadId: () => activeThreadId,
+    getActiveCwd: () => activeCwd,
+    getSelectedProject: () => selectedProject(),
+    getModelLabel: () => modelLabel,
+    getEffortLevel: () => effortLevel,
+    getTurnActive: () => turnActive,
+    cancelTurn: () => {
+      void cancelTurn();
+    },
+    closePlanPanelOnSessionChange,
+    threadDisplayTitle,
+    getThreads: () => threads,
+    setThreads: (next) => {
+      threads = next;
+    },
+    openThread,
+    refreshProjectsAndThreads,
+  });
+  return forkActions;
+}
+
+function ensureRewindActions(): RewindActions {
+  if (rewindActions) return rewindActions;
+  rewindActions = new RewindActions({
+    inv,
+    showToast: (text, kind) => showToast(text, kind ?? "info"),
+    getTurnActive: () => turnActive,
+    getActiveSessionId: () => activeSessionId,
+    ensureLiveThread,
+    confirmText,
+    promptText,
+    endTurn: () => endTurn(),
+    truncateTranscriptFromPrompt,
+    fillComposerAfterRewind: (text) => {
+      const ta = (
+        document.getElementById("chat")?.classList.contains("hidden")
+          ? document.getElementById("composer-input")
+          : document.getElementById("chat-input")
+      ) as HTMLTextAreaElement | null;
+      if (ta) {
+        ta.value = text;
+        ta.focus();
+      }
+    },
+    appendLine,
+    setComposerBusy,
+    markSessionWorking,
+    refreshContextUsage,
+    refreshProjectsAndThreads,
+  });
+  return rewindActions;
+}
+
+function ensureSessionOps(): SessionOpsActions {
+  if (sessionOpsActions) return sessionOpsActions;
+  sessionOpsActions = new SessionOpsActions({
+    inv,
+    openModal,
+    closeModal,
+    showToast: (text, kind) => showToast(text, kind ?? "info"),
+    promptText,
+    confirmText,
+    getActiveSessionId: () => activeSessionId,
+    getActiveThreadId: () => activeThreadId,
+    activeThreadRefId,
+    getTurnActive: () => turnActive,
+    ensureLiveThread,
+    appendLine,
+    refreshContextAfterCompact,
+    refreshProjectsAndThreads,
+    leaveThreadIfOpen,
+    expandArchiveForProject: (projectId) => {
+      ensureSidebarList().expandedArchiveIds.add(projectId);
+    },
+    getMaxTurnsLimit: () => maxTurnsLimit,
+    setMaxTurnsLimit: (n) => {
+      maxTurnsLimit = n;
+    },
+    getSelectedProject: () => selectedProject(),
+    getActiveCwd: () => activeCwd,
+    getModelLabel: () => modelLabel,
+    getEffortLevel: () => effortLevel,
+    effortLabel: () => effortLabel(),
+    permLabel: () => permLabel(),
+    getDefaultOpenTarget: () => defaultOpenTarget,
+    setLastContextUsage,
+    syncContextLabels,
+    getThreads: () => threads,
+    getProjects: () => projects,
+    setSelectedProjectId: (id) => {
+      selectedProjectId = id;
+    },
+    expandProject: (projectId) => {
+      ensureSidebarList().expandedProjectIds.add(projectId);
+    },
+    openThread,
+  });
+  return sessionOpsActions;
+}
+
+function ensureTheme(): ThemeController {
+  if (themeCtrl) return themeCtrl;
+  themeCtrl = new ThemeController({ inv });
+  themeCtrl.setPreferenceOnly(themePreference);
+  themeCtrl.setAppearanceLight(appearanceLight);
+  themeCtrl.setAppearanceDark(appearanceDark);
+  return themeCtrl;
+}
+
+function ensurePermPromptUi(): PermPromptUi {
+  if (permPromptUi) return permPromptUi;
+  permPromptUi = new PermPromptUi({
+    inv,
+    openModal,
+    closeModal,
+    showToast: (text, kind) => showToast(text, kind ?? "info"),
+    showWelcome,
+    getAccessMode: () => accessMode,
+    isPlanOn,
+    setPlanPhaseActive: () => {
+      planPhase = "active";
+    },
+    syncPermLabels,
+  });
+  return permPromptUi;
+}
+
+function ensureSkillActions(): SkillActions {
+  if (skillActions) return skillActions;
+  skillActions = new SkillActions({
+    inv,
+    showToast: (text, kind) => showToast(text, kind ?? "info"),
+    getActiveCwd: () => activeCwd,
+    getSelectedProjectPath: () => selectedProject()?.path,
+    getActiveSessionId: () => activeSessionId,
+    ensureSessionForAgentSlash,
+    showWelcome,
+    appendLine,
+    dispatchAgentPrompt,
+    getStaticSlashCommands,
+    runSlashCommand,
+    activeComposerInput: () => activeComposerInput(),
+    hideSlashPalette: () => {
+      slashPalette?.hide();
+    },
+    findSkillPathFromPaletteCache,
+  });
+  return skillActions;
+}
+
+function ensureSessionPolicy(): SessionPolicyActions {
+  if (sessionPolicyActions) return sessionPolicyActions;
+  sessionPolicyActions = new SessionPolicyActions({
+    inv,
+    showToast: (text, kind) => showToast(text, kind ?? "info"),
+    getAccessMode: () => accessMode,
+    setAccessMode: (mode) => {
+      accessMode = mode;
+    },
+    isPlanOn,
+    getPlanPhase: () => planPhase,
+    setPlanPhase: (phase) => {
+      planPhase = phase;
+    },
+    getPendingApproval: () => pendingPlanApproval,
+    getActiveSessionId: () => activeSessionId,
+    getActiveThreadId: () => activeThreadId,
+    getActiveCwd: () => activeCwd,
+    setActiveCwd,
+    findThreadCwdBySession: (sessionId) =>
+      threads.find((t) => t.sessionId === sessionId)?.cwd,
+    ensureLiveThread,
+    patchSessionPlan: (sessionId, patch) => {
+      patchSessionPlan(sessionId, patch as Parameters<typeof patchSessionPlan>[1]);
+    },
+    getSessionModeChipFocus: () => sessionModeChipFocus,
+    setSessionModeChipFocusOnly: (focus) => {
+      sessionModeChipFocus = focus;
+    },
+    currentGoalTitle,
+    getGoalComposeActive: () => goalComposeActive,
+    setGoalComposeActive: (v) => {
+      goalComposeActive = v;
+    },
+    goalCompleted,
+    syncPermLabelsOnly: () => {
+      const v = permLabel();
+      for (const id of ["perm-label", "perm-label-2"] as const) {
+        const el = document.getElementById(id);
+        if (el) el.textContent = v;
+      }
+    },
+    openPlanPanel,
+    syncPlanPanelChrome,
+    setComposerPlaceholders,
+    beginGoalCompose,
+    runGoalCommand,
+    activeComposerInput: () => activeComposerInput(),
+  });
+  return sessionPolicyActions;
+}
+
+function ensureGoalSlashActions(): GoalSlashActions {
+  if (goalSlashActions) return goalSlashActions;
+  goalSlashActions = new GoalSlashActions({
+    inv,
+    openModal,
+    closeModal,
+    showToast: (text, kind) => showToast(text, kind ?? "info"),
+    getActiveSessionId: () => activeSessionId,
+    getGoalProjection: () => goalProjection,
+    getGoalTokenBudget: () => goalTokenBudget,
+    setGoalTokenBudget: (n) => {
+      goalTokenBudget = n;
+    },
+    currentGoalTitle,
+    goalCompleted,
+    pauseGoal,
+    resumeGoal,
+    resetGoalUiState,
+    renderGoalBanner,
+    beginGoalCompose,
+    markGoalLocalCleared: (goalId) => {
+      goalLocalClearedIds.add(goalId);
+    },
+    sendAgentGoalSlash,
+    applyGoalTitle,
+    getPendingGoalTitle: () => pendingGoalTitle,
+    agentContentForSend,
+  });
+  return goalSlashActions;
+}
+
+function ensureProjectActions(): ProjectActions {
+  if (projectActions) return projectActions;
+  projectActions = new ProjectActions({
+    inv,
+    showToast: (text, kind) => showToast(text, kind ?? "info"),
+    getSelectedProjectId: () => selectedProjectId,
+    setSelectedProjectId: (id) => {
+      selectedProjectId = id;
+    },
+    setProjectChoiceTouched: (v) => {
+      projectChoiceTouched = v;
+    },
+    getProjects: () => projects,
+    onProjectRemovedFromSidebar: (id) => {
+      const sb = ensureSidebarList();
+      sb.expandedProjectIds.delete(id);
+      sb.projectShowAllThreads.delete(id);
+      sb.expandedArchiveIds.delete(id);
+    },
+    refreshProjectsAndThreads,
+    setWelcomeTitle,
+    showWelcome,
+    getActiveThreadId: () => activeThreadId,
+    getActiveSessionId: () => activeSessionId,
+  });
+  return projectActions;
+}
+
+function ensureModelSessionActions(): ModelSessionActions {
+  if (modelSessionActions) return modelSessionActions;
+  modelSessionActions = new ModelSessionActions({
+    inv,
+    openModal,
+    closeModal,
+    showToast: (text, kind) => showToast(text, kind ?? "info"),
+    promptText,
+    confirmText,
+    getModelLabel: () => modelLabel,
+    setModelId,
+    getEffortLevel: () => effortLevel,
+    setEffortLevel,
+    effortLabel: (level) => effortLabel(level),
+    getTurnActive: () => turnActive,
+    getActiveSessionId: () => activeSessionId,
+    getActiveThreadId: () => activeThreadId,
+    getActiveCwd: () => activeCwd,
+    ensureLiveThread,
+    setDefaultModelLabel: (id) => {
+      defaultModelLabel = id;
+    },
+    setDefaultEffortLevel: (level) => {
+      defaultEffortLevel = level;
+    },
+    setModelsCache,
+    getModelsCache,
+    getMaxTurnsLimit: () => maxTurnsLimit,
+    getAccessMode: () => accessMode,
+    isPlanOn,
+    getSelectedProject: () => selectedProject(),
+    getSelectedProjectId: () => selectedProjectId,
+    setSelectedProjectId: (id) => {
+      selectedProjectId = id;
+    },
+    setProjectChoiceTouched: (v) => {
+      projectChoiceTouched = v;
+    },
+    leaveCurrentSessionToWelcome,
+    setActiveCwd,
+    clearPromptHistoryStore,
+    setWelcomeTitle,
+    showWelcome,
+    clearTranscript,
+    setActiveThreadId: (id) => {
+      activeThreadId = id;
+    },
+    setActiveSessionId: (id) => {
+      activeSessionId = id;
+    },
+    syncChatTopTitle,
+    onSessionChanged: () => {
+      sidePane?.onSessionChanged();
+    },
+    expandChatsGroup: () => {
+      ensureSidebarList().expandedProjectIds.add(CHATS_GROUP_ID);
+    },
+    setSuspendLiveTranscript: (v) => {
+      suspendLiveTranscript = v;
+    },
+    startContextPolling,
+    refreshProjectsAndThreads,
+    focusChatInput: () => {
+      ($("chat-input") as HTMLTextAreaElement | null)?.focus();
+    },
+  });
+  return modelSessionActions;
+}
+
+function parseGoalInput(
+  raw: string,
+  opts?: { forceGoal?: boolean },
+): ReturnType<typeof parseGoalInputPure> {
+  return parseGoalInputPure(raw, {
+    forceGoal: opts?.forceGoal,
+    goalComposeActive,
+  });
+}
+
+function resolveLocalFilePath(file: File): string {
+  return resolveLocalFilePathPure(file, window.grokDesktop?.getPathForFile);
+}
+
 
 function selectedProject(): Project | undefined {
   return projects.find((p) => p.id === selectedProjectId);
@@ -515,68 +1588,19 @@ function syncChatTopTitle(): void {
 }
 
 function closeProjectPicker(): void {
-  const picker = $("project-picker");
-  const chip = $("btn-project-chip");
-  picker.classList.add("hidden");
-  chip.classList.remove("open");
-  chip.setAttribute("aria-expanded", "false");
+  ensureProjectPicker().close();
 }
 
 function renderProjectPickerList(filter = ""): void {
-  const box = $("project-picker-list");
-  box.innerHTML = "";
-  const q = filter.trim().toLowerCase();
-  const filtered = projects.filter(
-    (p) =>
-      !q ||
-      p.title.toLowerCase().includes(q) ||
-      p.path.toLowerCase().includes(q),
-  );
-  if (!filtered.length) {
-    box.innerHTML = `<div class="picker-empty">${projects.length ? tr("picker.noMatch") : tr("picker.noProjects")}</div>`;
-    return;
-  }
-  for (const p of filtered) {
-    const row = document.createElement("button");
-    row.type = "button";
-    row.className = `picker-project${p.id === selectedProjectId ? " selected" : ""}`;
-    row.setAttribute("role", "option");
-    row.setAttribute("aria-selected", p.id === selectedProjectId ? "true" : "false");
-    const check =
-      p.id === selectedProjectId
-        ? `<span class="picker-check">✓</span>`
-        : `<span class="picker-check" style="visibility:hidden">✓</span>`;
-    row.innerHTML = `<span class="picker-folder">📁</span><span class="picker-name">${esc(p.title)}</span>${check}`;
-    row.onclick = () => {
-      selectedProjectId = p.id;
-      projectChoiceTouched = true;
-      closeProjectPicker();
-      setWelcomeTitle();
-      showWelcome(true);
-      void refreshProjectsAndThreads();
-    };
-    box.appendChild(row);
-  }
+  ensureProjectPicker().renderList(filter);
 }
 
 function openProjectPicker(): void {
-  const picker = $("project-picker");
-  const chip = $("btn-project-chip");
-  const wasOpen = !picker.classList.contains("hidden");
-  if (wasOpen) {
-    closeProjectPicker();
-    return;
-  }
-  // 关闭其它浮层
-  $("perm-menu").classList.add("hidden");
-  renderProjectPickerList("");
-  const q = $("project-picker-q") as HTMLInputElement;
-  q.value = "";
-  picker.classList.remove("hidden");
-  chip.classList.add("open");
-  chip.setAttribute("aria-expanded", "true");
-  // 下一帧聚焦搜索
-  requestAnimationFrame(() => q.focus());
+  ensureProjectPicker().open({
+    hideOtherMenus: () => {
+      document.getElementById("perm-menu")?.classList.add("hidden");
+    },
+  });
 }
 
 function showWelcome(show: boolean): void {
@@ -602,8 +1626,6 @@ let streamAssistantRaw = "";
 /** 当前 turn 的稳定 id；只允许匹配的流写入对应气泡 */
 let currentTurnId = 0;
 let streamTurnId = 0;
-/** 流式滚动节流（避免每 token 强制 layout） */
-let streamScrollRaf = 0;
 /**
  * When true, drop live transcript events (create/openThread race:
  * invoke 返回后仍可能有滞留的 session/update，会与 history 叠出双份气泡)。
@@ -612,28 +1634,7 @@ let suspendLiveTranscript = false;
 
 // ── Codex 时间线：Turn 状态机 ──────────────────────────────
 let turnActive = false;
-/**
- * S19 本地 follow-up 队列：当前 turn 进行中用户再发送时入队，
- * turn 正常结束后自动 dispatch。用户停止 turn 时暂停队列（对齐 Codex
- * interrupted steers），需点「继续发送」或等下一轮正常结束后恢复。
- * `/btw`（旁路）与 `/interject`（插进当前 turn）另见 threads.btw / threads.interject。
- */
-type QueuedPrompt = {
-  id: string;
-  display: string;
-  content: string;
-  attachments: ComposerAttachment[];
-  status?: "pending" | "sending" | "failed";
-  lastError?: string | null;
-};
-const promptQueue: QueuedPrompt[] = [];
-let queueDrainScheduled = false;
-/** 用户 interrupt/停止后为 true，阻止自动 drain */
-let queuePausedByInterrupt = false;
-/** L1 队列是否启用（Host 落盘 flags） */
-let queueingEnabled = true;
-/** Agent 队列 wire 同步错误（仅 toast） */
-let queueSyncError: string | null = null;
+/** S19 follow-up 队列状态 → PromptQueueController（ensurePromptQueue） */
 /** Mode B 附着状态（驱动 pill） */
 let attachUiState: AttachState = "history_only";
 
@@ -641,12 +1642,6 @@ let attachUiState: AttachState = "history_only";
  * S17 本会话 prompt 历史（最新在前）：
  * ↑ 空输入/光标行首召回；/history 模糊搜索插入。
  */
-const PROMPT_HISTORY_MAX = 100;
-let promptHistory: string[] = [];
-/** -1 = 未浏览；0 = 最新一条 */
-let promptHistoryIndex = -1;
-/** 进入 ↑ 浏览前保存的草稿 */
-let promptHistoryDraft = "";
 /** 当前 turn 开始时间（Working for / Worked for 计时） */
 let turnStartedAt = 0;
 let turnStatusEl: HTMLElement | null = null;
@@ -667,47 +1662,6 @@ let assistantStartedThisTurn = false;
 /** sessionId → working（侧栏转圈） */
 const workingSessions = new Set<string>();
 
-/** goal 流水线 / 验证器英文过程（不当作主对话气泡） */
-function looksLikeGoalProcessText(s: string): boolean {
-  const t = s.trim();
-  if (!t) return false;
-  const patterns = [
-    /\bNot Refuted\b/i,
-    /\bRefuted\b/i,
-    /\bObjective met\b/i,
-    /\bFINAL_RESPONSE\b/,
-    /\bAuditing against\b/i,
-    /\bAcceptance criteria\b/i,
-    /\bWriting the verdict\b/i,
-    /\bWriting verdict\b/i,
-    /\bWriting a minimal plan\b/i,
-    /\bconversational objective\b/i,
-    /\badversarial verifier\b/i,
-    /\bimplementer evidence\b/i,
-    /\bgating check\b/i,
-    /\bI'?ll verify\b/i,
-    /\bChecking the plan\b/i,
-    /\bGoal Plan Writer\b/i,
-    /\bYou are an \*\*adversarial\b/i,
-    /\bYou are the Goal\b/i,
-    /\bverdict files?\b/i,
-    /\bclassifier verification\b/i,
-    /\bpending_depth\b/i,
-    /^Done\.?\s*$/im,
-  ];
-  if (patterns.some((p) => p.test(t))) return true;
-  // 大段英文 + 验证口吻
-  const latin = (t.match(/[A-Za-z]/g) ?? []).length;
-  const ratio = latin / Math.max(t.length, 1);
-  if (
-    ratio > 0.55 &&
-    t.length > 80 &&
-    /\b(objective|plan|evidence|verify|verifier|acceptance|refute)\b/i.test(t)
-  ) {
-    return true;
-  }
-  return false;
-}
 
 function updateProcessHeader(): void {
   if (!processBlockEl) return;
@@ -726,23 +1680,7 @@ function updateProcessHeader(): void {
   }
 }
 
-/** 短耗时：23s / 800ms / 1分5s */
-function formatElapsedCompact(ms: number): string {
-  if (!Number.isFinite(ms) || ms < 0) ms = 0;
-  if (ms < 1000) return tr("turn.timeMs", { n: Math.max(ms, 0) });
-  const sec = Math.round(ms / 1000);
-  if (sec < 60) return tr("turn.timeSec", { n: sec });
-  const m = Math.floor(sec / 60);
-  const s = sec % 60;
-  return s > 0
-    ? tr("turn.timeMinSec", { m, s })
-    : tr("turn.timeMin", { m });
-}
 
-/** 兼容旧 key：已处理 → 现统一走「已完成 ·」 */
-function formatTurnElapsed(ms: number): string {
-  return tr("turn.workedFor", { time: formatElapsedCompact(ms) });
-}
 
 function formatTurnWorking(ms: number): string {
   // 目标已停、回合仍 busy：勿用「工作中」装成自驱
@@ -856,9 +1794,6 @@ function scheduleReconcileTurnAfterGoalStopped(): void {
   }, 2000);
 }
 
-function formatTurnStopped(ms: number): string {
-  return tr("turn.stoppedAfter", { time: formatElapsedCompact(ms) });
-}
 
 function stopTurnPhaseTimer(): void {
   if (turnPhaseTimer != null) {
@@ -1069,10 +2004,7 @@ function resetStreamState(finalize = true): void {
   streamAssistantRaw = "";
   streamIsProcess = false;
   streamTurnId = 0;
-  if (streamScrollRaf) {
-    cancelAnimationFrame(streamScrollRaf);
-    streamScrollRaf = 0;
-  }
+  ensureChatScroll().cancelStreamRaf();
 }
 
 function clearTranscript(): void {
@@ -1090,101 +2022,10 @@ function clearTranscript(): void {
   processItemCount = 0;
   streamIsProcess = false;
   // 新时间线默认重新 stick
-  chatStick = true;
-  chatLastScrollTop = 0;
+  ensureChatScroll().forceStick();
 }
 
-function normalizeAssistantForDedupe(s: string): string {
-  return s
-    .replace(/\s+/g, " ")
-    .replace(/[`*_>#\-]/g, "")
-    .trim()
-    .toLowerCase();
-}
 
-/**
- * 把 agent/provider 错误收成可展示文案。
- * - 提供商/中转（有映射且域为上游/配置）：责任域 · 原样错误信息
- * - 本机/软件：责任域 · 短标题
- * - 无映射：短原文（不加伪标签）
- */
-function formatTurnErrorMessage(
-  message: string | undefined,
-  details?: unknown,
-): string {
-  const raw = (message ?? "").trim() || "";
-  const isGenericShell = (s: string) =>
-    !s ||
-    /^internal error\.?$/i.test(s) ||
-    s === "ACP error" ||
-    /^method not found\.?$/i.test(s);
-
-  const tryMsg = (v: unknown): string | null => {
-    if (typeof v === "string" && v.trim()) {
-      const t = v.trim();
-      // 纯字符串 data（CLI btw 等）本身即真因
-      return isGenericShell(t) ? null : t;
-    }
-    if (v && typeof v === "object") {
-      const o = v as Record<string, unknown>;
-      // 优先 data：message 常为 "Internal error" 外壳
-      if (o.data != null) {
-        const fromData = tryMsg(o.data);
-        if (fromData) return fromData;
-      }
-      if (typeof o.message === "string" && o.message.trim()) {
-        const m = o.message.trim();
-        if (!isGenericShell(m)) return m;
-      }
-      if (typeof o.error_message === "string" && o.error_message.trim()) {
-        return o.error_message.trim();
-      }
-    }
-    return null;
-  };
-  let detail: string | null = null;
-  const brace = raw.indexOf("{");
-  if (brace >= 0) {
-    try {
-      detail = tryMsg(JSON.parse(raw.slice(brace)));
-    } catch {
-      /* ignore */
-    }
-  }
-  if (!detail && details != null) detail = tryMsg(details);
-
-  // raw 本身已是 enrich 后的真因时，直接参与匹配
-  const primary =
-    raw && !isGenericShell(raw) ? raw : detail || raw;
-  // 匹配可用多段；提供商正文只用单条真因（避免 haystack 重复）
-  const bodySource =
-    (detail && !isGenericShell(detail) ? detail : null) ||
-    (primary && !isGenericShell(primary) ? primary : null) ||
-    raw;
-  const haystack = [bodySource, detail, raw].filter(Boolean).join("\n");
-  const labeled = formatFriendlyErrorLabelTitle(haystack, tr, {
-    body: bodySource,
-  });
-  if (labeled) return labeled;
-
-  // 未映射：取首行短标题，去掉 Internal error 外壳（不加伪责任域）
-  let line =
-    (detail && !isGenericShell(detail) ? detail : primary || tr("err.internal"))
-      .split(/\r?\n/)[0]
-      ?.trim() || tr("err.internal");
-  line = line.replace(/^internal error:\s*/i, "").trim() || tr("err.internal");
-  // 侧问常见前缀：缩短展示
-  line = line
-    .replace(/^side question model call failed:\s*/i, "")
-    .trim() || line;
-  if (isGenericShell(line) || line === tr("err.internal")) {
-    return `${tr("err.domain.app")} · ${tr("err.internal")}`;
-  }
-  if (line.length > 80) line = line.slice(0, 80) + "…";
-  return line;
-}
-
-/** 本 turn 错误红条去重：turn.completed 与 turns.prompt 失败常成对，只画一条 */
 function showTurnErrorOnce(
   message: string | undefined,
   details?: unknown,
@@ -1198,27 +2039,6 @@ function showTurnErrorOnce(
   appendLine(text, "error");
 }
 
-/**
- * 流式文案与 history 落盘文案常有细微差别（标点/少字/末句改写）。
- * 用于去重：相同、互相包含、或共同前缀足够长则视为同一条。
- */
-function assistantTextsRoughlyEqual(a: string, b: string): boolean {
-  const na = normalizeAssistantForDedupe(a);
-  const nb = normalizeAssistantForDedupe(b);
-  if (!na || !nb) return false;
-  if (na === nb) return true;
-  const shorter = na.length <= nb.length ? na : nb;
-  const longer = na.length <= nb.length ? nb : na;
-  if (shorter.length < 12) return false;
-  if (longer.includes(shorter)) return true;
-  let i = 0;
-  const lim = Math.min(shorter.length, longer.length);
-  while (i < lim && shorter[i] === longer[i]) i += 1;
-  // 至少 40 字相同，或覆盖较短文案 70%
-  return i >= 40 || i >= Math.floor(shorter.length * 0.7);
-}
-
-/** 同一 turn 内避免 agent 重复推送几乎相同的主回复 */
 function findDedupeAssistantBubble(
   turnId: number,
   nextRaw: string,
@@ -1245,20 +2065,13 @@ function findDedupeAssistantBubble(
 /** 流式：只追加纯文本（O(1) DOM 文本更新），不做 MD/高亮 */
 function appendAssistantStream(el: HTMLElement, raw: string): void {
   paintAssistantStreaming(el, raw);
-  if (streamScrollRaf) return;
-  streamScrollRaf = requestAnimationFrame(() => {
-    streamScrollRaf = 0;
-    scrollTranscriptIfSticky();
-  });
+  ensureChatScroll().scheduleStreamScroll();
 }
 
 /** 定稿：完整 Markdown + 高亮 + 文件路径可点（每条消息一次） */
 function flushAssistantMarkdown(el: HTMLElement | null): void {
   if (!el) return;
-  if (streamScrollRaf) {
-    cancelAnimationFrame(streamScrollRaf);
-    streamScrollRaf = 0;
-  }
+  ensureChatScroll().flushStreamScroll();
   const raw = el.dataset.raw ?? "";
   if (raw) {
     paintAssistantHtml(el, raw, { highlight: true, cwd: activeCwd });
@@ -1266,232 +2079,23 @@ function flushAssistantMarkdown(el: HTMLElement | null): void {
   }
 }
 
-function chatScroller(): HTMLElement {
-  return (
-    (document.getElementById("chat-scroll") as HTMLElement | null) ??
-    $("transcript")
-  );
-}
-
-/**
- * 会话区 sticky-bottom（最简正确模型）
- *
- * chatStick === true  → 内容变更时程序贴底
- * chatStick === false → **绝不写 scrollTop**
- *
- * 状态更新规则（无 pin / 无 ignore / 无 resize 旁路）：
- *   - scrollTop 变小（上滑/拖条上移）→ 立刻 unstick
- *   - 距底 ≤ NEAR 且未因上滑离开 → stick
- * 上滚轮额外立刻 unstick（赶在流式 rAF 之前）
- *
- * 截图「截断」：↓ FAB 仍在 = 下文在视口外，是滚不动/被拽回，
- * 不是正文被 slice。内容无 max-height 截断。
- */
-const CHAT_NEAR_BOTTOM_PX = 80;
-const CHAT_FAB_HIDE_PX = 64;
-
-let chatStick = true;
-/** 用于判断 scrollTop 增减（上滑 unstick） */
-let chatLastScrollTop = 0;
-
-function chatScrollGap(scroller?: HTMLElement): number {
-  const s = scroller ?? chatScroller();
-  return s.scrollHeight - s.scrollTop - s.clientHeight;
-}
-
-function applyScrollToBottom(): void {
-  if (!chatStick) {
-    updateScrollDownFab();
-    return;
-  }
-  const scroller = chatScroller();
-  scroller.scrollTop = scroller.scrollHeight;
-  chatLastScrollTop = scroller.scrollTop;
-  updateScrollDownFab();
-}
-
 /** 发消息 / FAB / 进会话：强制 stick 并滚到底 */
 function scrollTranscript(): void {
-  chatStick = true;
-  if (streamScrollRaf) {
-    cancelAnimationFrame(streamScrollRaf);
-    streamScrollRaf = 0;
-  }
-  applyScrollToBottom();
+  ensureChatScroll().scrollToBottom();
 }
 
 /** 流式 / 工具 / DOM 变更：仅 stick 时贴底，否则零写入 */
 function scrollTranscriptIfSticky(): void {
-  if (!chatStick) {
-    updateScrollDownFab();
-    return;
-  }
-  applyScrollToBottom();
+  ensureChatScroll().scrollIfSticky();
 }
 
-/** 底栏贴底：消息区优先让位；坞 max-height 保证完整在 chat 内，工具栏优先 */
+/** 底栏贴底：消息区优先让位 */
 function syncChatComposerReserve(): void {
-  const chat = document.getElementById("chat");
-  const dock = document.getElementById("chat-composer-dock");
-  if (!chat || !dock) return;
-  if (chat.classList.contains("hidden")) return;
-
-  const chatH = chat.clientHeight || 0;
-  if (chatH <= 0) return;
-
-  // 消息区至少 40%（且 ≥72px），剩余全给底栏上限
-  const minScroll = Math.max(72, Math.floor(chatH * 0.4));
-  const byScroll = Math.max(96, chatH - minScroll);
-  const byRatio = Math.floor(chatH * (chatH < 420 ? 0.52 : chatH < 600 ? 0.48 : 0.45));
-  const maxDock = Math.min(byScroll, byRatio, 300);
-  dock.style.maxHeight = `${maxDock}px`;
-
-  const ta = document.getElementById("chat-input") as HTMLTextAreaElement | null;
-  const goal = document.getElementById("goal-banner-chat");
-  const perm = document.getElementById("permission-bar");
-  const toolbar = dock.querySelector(".composer-toolbar") as HTMLElement | null;
-  const goalH =
-    goal && !goal.classList.contains("hidden") ? goal.getBoundingClientRect().height + 6 : 0;
-  const permH =
-    perm && !perm.classList.contains("hidden") ? perm.getBoundingClientRect().height + 8 : 0;
-  const toolbarH = toolbar?.getBoundingClientRect().height ?? 36;
-  const chrome = 28; // dock padding + gaps
-  const maxTa = Math.max(
-    22,
-    Math.min(120, Math.floor(maxDock - goalH - permH - toolbarH - chrome)),
-  );
-  if (ta) {
-    ta.style.maxHeight = `${maxTa}px`;
-    fitChatInputHeight(ta, maxTa);
-  }
-
-  const h = Math.ceil(dock.getBoundingClientRect().height);
-  chat.style.setProperty("--chat-composer-h", `${Math.max(h, 72)}px`);
-  scrollTranscriptIfSticky();
-}
-
-/** 对话输入框随内容增高，不超过 maxPx，空内容回到默认 */
-function fitChatInputHeight(ta: HTMLTextAreaElement, maxPx: number): void {
-  if (!ta.value) {
-    ta.style.height = "";
-    return;
-  }
-  ta.style.height = "0px";
-  const next = Math.min(Math.max(ta.scrollHeight, 28), maxPx);
-  ta.style.height = `${next}px`;
-}
-
-function updateScrollDownFab(): void {
-  const fab = document.getElementById("btn-scroll-down");
-  const scroller = document.getElementById("chat-scroll");
-  if (!fab || !scroller) return;
-  const show = !chatStick || chatScrollGap(scroller) >= CHAT_FAB_HIDE_PX;
-  fab.classList.toggle("hidden", !show);
+  ensureChatScroll().syncComposerReserve();
 }
 
 function bindChatScrollLayout(): void {
-  const scroller = document.getElementById("chat-scroll");
-  const dock = document.getElementById("chat-composer-dock");
-  const fab = document.getElementById("btn-scroll-down");
-  if (!scroller) return;
-
-  chatLastScrollTop = scroller.scrollTop;
-
-  const unstickNow = () => {
-    chatStick = false;
-    if (streamScrollRaf) {
-      cancelAnimationFrame(streamScrollRaf);
-      streamScrollRaf = 0;
-    }
-    updateScrollDownFab();
-  };
-
-  // 上滚轮：在 scroll / 流式 rAF 之前立刻 unstick
-  scroller.addEventListener(
-    "wheel",
-    (e) => {
-      if (e.deltaY < 0 && scroller.scrollHeight > scroller.clientHeight) {
-        unstickNow();
-      }
-    },
-    { passive: true },
-  );
-
-  /**
-   * 原生滚动条：pointer 落在 clientWidth 右侧（scrollbar 槽）。
-   * 按下瞬间 unstick，避免「拖条首帧前」流式 rAF 仍贴底把 thumb 拽回。
-   * 不写 scrollTop，只改标志。
-   */
-  window.addEventListener(
-    "pointerdown",
-    (e) => {
-      if (e.button !== 0) return;
-      const rect = scroller.getBoundingClientRect();
-      if (
-        e.clientY < rect.top ||
-        e.clientY > rect.bottom ||
-        e.clientX < rect.left ||
-        e.clientX > rect.right
-      ) {
-        return;
-      }
-      // classic scrollbar：clientWidth 以右；overlay：右缘 ~16px
-      const barLeft = Math.min(rect.left + scroller.clientWidth, rect.right - 16);
-      if (e.clientX >= barLeft) unstickNow();
-    },
-    { capture: true },
-  );
-
-  /**
-   * scrollTop 变小 → 用户上滑/拖条上移 → 立刻 unstick（即使仍在近底 80px 内）。
-   * 距底 ≤ NEAR 且 scrollTop 未减小 → stick（用户滚回底部 / 程序贴底）。
-   */
-  scroller.addEventListener(
-    "scroll",
-    () => {
-      const top = scroller.scrollTop;
-      const gap = chatScrollGap(scroller);
-      if (top < chatLastScrollTop - 0.5) {
-        chatStick = false;
-      } else if (gap <= CHAT_NEAR_BOTTOM_PX) {
-        chatStick = true;
-      }
-      chatLastScrollTop = top;
-      updateScrollDownFab();
-    },
-    { passive: true },
-  );
-
-  fab?.addEventListener("click", () => scrollTranscript());
-  const chat = document.getElementById("chat");
-  const chatInput = document.getElementById("chat-input") as HTMLTextAreaElement | null;
-  chatInput?.addEventListener("input", () => {
-    const maxRaw = chatInput.style.maxHeight;
-    const maxPx = maxRaw ? parseInt(maxRaw, 10) : 120;
-    fitChatInputHeight(chatInput, Number.isFinite(maxPx) ? maxPx : 120);
-    syncChatComposerReserve();
-  });
-  if (typeof ResizeObserver !== "undefined") {
-    const ro = new ResizeObserver(() => syncChatComposerReserve());
-    if (dock) ro.observe(dock);
-    if (chat) ro.observe(chat);
-  }
-  window.addEventListener("resize", () => {
-    syncChatComposerReserve();
-    hideEphemeralMenus();
-  });
-  if (chat && typeof MutationObserver !== "undefined") {
-    new MutationObserver(() => {
-      if (!chat.classList.contains("hidden")) {
-        requestAnimationFrame(() => syncChatComposerReserve());
-      }
-    }).observe(chat, {
-      attributes: true,
-      attributeFilter: ["class"],
-      subtree: true,
-    });
-  }
-  requestAnimationFrame(() => syncChatComposerReserve());
+  ensureChatScroll().bind();
 }
 
 /** 空闲 / 进行中：仅由发送钮 arrow-up / stop 表达（方案 2） */
@@ -1513,465 +2117,35 @@ function setComposerBusy(busy: boolean): void {
   syncPromptQueueBar();
 }
 
-/** 同步输入区上方的排队条（HTML 见 prompt-queue-ui） */
-function syncPromptQueueBar(): void {
-  const bars = ["prompt-queue-bar", "prompt-queue-bar-welcome"]
-    .map((id) => document.getElementById(id))
-    .filter((el): el is HTMLElement => !!el);
-  for (const bar of bars) {
-    if (!promptQueue.length) {
-      bar.classList.add("hidden");
-      bar.innerHTML = "";
-      queuePausedByInterrupt = false;
-      continue;
-    }
-    bar.classList.remove("hidden");
-    bar.innerHTML = buildPromptQueueBarHtml(
-      promptQueue.map((q) => ({
-        id: q.id,
-        display: q.display,
-        content: q.content,
-        status: q.status,
-        lastError: q.lastError,
-      })),
-      queuePausedByInterrupt,
-    );
-  }
-  // 高度变化时重算底栏留白
-  requestAnimationFrame(() => {
-    try {
-      syncChatComposerReserve();
-    } catch {
-      /* init 前可能未定义 */
-    }
-  });
-}
+/** S19 follow-up 队列 → PromptQueueController（保留入口名供 boot/onEvent 绑定） */
+const syncPromptQueueBar = () => ensurePromptQueue().syncBar();
+const applyHostQueueMirror = (
+  file: Parameters<PromptQueueController["applyHostMirror"]>[0],
+) => ensurePromptQueue().applyHostMirror(file);
+const reloadPromptQueueFromHost = () => ensurePromptQueue().reloadFromHost();
+const clearPromptQueue = (opts?: { silent?: boolean }) =>
+  ensurePromptQueue().clear(opts);
+const removeQueuedPrompt = (id: string) => ensurePromptQueue().remove(id);
+const appendQueuedSystemLine = (id: string, preview: string) =>
+  ensurePromptQueue().appendQueuedSystemLine(id, preview);
+const interjectQueuedPrompt = (id: string) => ensurePromptQueue().interject(id);
+const sendNowQueuedPrompt = (id: string) => ensurePromptQueue().sendNow(id);
+const moveQueuedPrompt = (id: string, dir: -1 | 1) =>
+  ensurePromptQueue().move(id, dir);
+const openEditQueuedPrompt = (id: string) => ensurePromptQueue().openEdit(id);
+const resumePromptQueue = () => ensurePromptQueue().resume();
+const enqueuePrompt = (item: {
+  display: string;
+  content: string;
+  attachments: ComposerAttachment[];
+  status?: "pending" | "sending" | "failed";
+  lastError?: string | null;
+}) => ensurePromptQueue().enqueue(item);
+const scheduleDrainPromptQueue = () => ensurePromptQueue().scheduleDrain();
+const showPromptQueueModal = () => ensurePromptQueue().showModal();
 
-function applyHostQueueMirror(file: Awaited<ReturnType<typeof loadSessionQueue>>): void {
-  const m = mirrorQueueToLocal(file);
-  promptQueue.length = 0;
-  for (const it of m.items) {
-    promptQueue.push({
-      id: it.id,
-      display: it.display,
-      content: it.content,
-      attachments: (it.attachments as ComposerAttachment[]) ?? [],
-      status: it.status,
-      lastError: it.lastError,
-    });
-  }
-  queuePausedByInterrupt = m.pausedByInterrupt;
-  queueingEnabled = m.queueingEnabled;
-  queueSyncError = m.syncError;
-  syncPromptQueueBar();
-}
-
-/** 按 activeSessionId 从 Host 重载 L1 队列 */
-async function reloadPromptQueueFromHost(): Promise<void> {
-  if (!activeSessionId) {
-    promptQueue.length = 0;
-    queuePausedByInterrupt = false;
-    syncPromptQueueBar();
-    return;
-  }
-  const file = await loadSessionQueue(inv, activeSessionId);
-  applyHostQueueMirror(file);
-}
-
-function clearPromptQueue(opts?: { silent?: boolean }): void {
-  if (!promptQueue.length && !queuePausedByInterrupt) return;
-  const sid = activeSessionId;
-  if (sid) {
-    void hostClearQueue(inv, sid).then((f) => {
-      applyHostQueueMirror(f);
-      removeAllQueuedSystemLines();
-      if (!opts?.silent) showToast(tr("queue.cleared"));
-    });
-    return;
-  }
-  promptQueue.length = 0;
-  queuePausedByInterrupt = false;
-  syncPromptQueueBar();
-  removeAllQueuedSystemLines();
-  if (!opts?.silent) showToast(tr("queue.cleared"));
-}
-
-function refreshQueueModalIfOpen(): void {
-  const modal = document.getElementById("modal");
-  if (!modal || modal.classList.contains("hidden")) return;
-  if (!modal.querySelector(".prompt-queue-list--modal")) return;
-  showPromptQueueModal();
-}
-
-function removeQueuedPrompt(id: string): void {
-  void removeQueuedPromptAsync(id);
-}
-
-/** 移除时间线上「已排队：…」系统行（与 queue 项 id 绑定） */
-function removeQueuedSystemLine(queueItemId: string): void {
-  if (!queueItemId) return;
-  const root = document.getElementById("transcript");
-  if (!root) return;
-  for (const n of Array.from(
-    root.querySelectorAll(".line.system[data-queue-id]"),
-  )) {
-    if ((n as HTMLElement).dataset.queueId === queueItemId) n.remove();
-  }
-}
-
-function removeAllQueuedSystemLines(): void {
-  const root = document.getElementById("transcript");
-  if (!root) return;
-  root
-    .querySelectorAll(".line.system[data-queue-id]")
-    .forEach((n) => n.remove());
-}
-
-/** 时间线提示：已排队（不画用户气泡）；插话/出队时按 data-queue-id 清除 */
-function appendQueuedSystemLine(queueItemId: string, preview: string): void {
-  const el = $("transcript");
-  const div = document.createElement("div");
-  div.className = "line system";
-  div.dataset.messageAuthorRole = "system";
-  div.dataset.queueId = queueItemId;
-  div.textContent = tr("queue.queuedLine", {
-    preview: preview.replace(/\s+/g, " ").slice(0, 60),
-  });
-  el.appendChild(div);
-  scrollTranscriptIfSticky();
-}
-
-/** 出队（awaitable；插话 / 立即发送先出队再发） */
-async function removeQueuedPromptAsync(id: string): Promise<boolean> {
-  const sid = activeSessionId;
-  if (sid) {
-    const f = await hostRemoveItem(inv, sid, id);
-    applyHostQueueMirror(f);
-    refreshQueueModalIfOpen();
-    removeQueuedSystemLine(id);
-    return Boolean(f);
-  }
-  const i = promptQueue.findIndex((q) => q.id === id);
-  if (i < 0) return false;
-  promptQueue.splice(i, 1);
-  if (!promptQueue.length) queuePausedByInterrupt = false;
-  syncPromptQueueBar();
-  refreshQueueModalIfOpen();
-  removeQueuedSystemLine(id);
-  return true;
-}
-
-/**
- * 队列「插话」：经 threads.interject 注入当前回合（不 cancel），成功后再出队。
- * 仅 working 可用；与 /interject 同路径。
- */
-async function interjectQueuedPrompt(id: string): Promise<void> {
-  const q = promptQueue.find((x) => x.id === id);
-  if (!q || q.status === "sending") return;
-  if (turnUiPhase === "cancelling") {
-    showToast(tr("interject.cancelling"), "error");
-    return;
-  }
-  if (!turnActive || turnUiPhase !== "working") {
-    showToast(tr("interject.needTurn"), "error");
-    return;
-  }
-  const text = (q.content || q.display).trim();
-  if (!text) {
-    showToast(tr("interject.empty"), "error");
-    return;
-  }
-  const result = await runInterjectCommand(text);
-  if (result.ok) {
-    await removeQueuedPromptAsync(id);
-  } else if (result.message) {
-    showToast(result.message, "error");
-  }
-}
-
-/**
- * 队列「立即发送」：先出队，再 cancel 当前回合并发送此条（CLI send_now）。
- * 须先出队，否则 cancel 后 drain 可能抢发同一条。无进行中回合时直接 dispatch。
- */
-async function sendNowQueuedPrompt(id: string): Promise<void> {
-  const q = promptQueue.find((x) => x.id === id);
-  if (!q || q.status === "sending") return;
-  if (turnUiPhase === "cancelling") {
-    showToast(tr("interject.cancelling"), "error");
-    return;
-  }
-  const content = q.content;
-  const display = q.display;
-  const wasBusy = turnActive;
-  await removeQueuedPromptAsync(id);
-  const result = await dispatchAgentPrompt(content, display, {
-    force: false,
-    interrupt: wasBusy ? "send_now" : undefined,
-  });
-  if (result.ok) {
-    if (wasBusy) showToast(tr("chat.sendNow"));
-  } else if (result.error) {
-    showToast(result.error, "error");
-  }
-}
-
-function moveQueuedPrompt(id: string, dir: -1 | 1): void {
-  const i = promptQueue.findIndex((q) => q.id === id);
-  if (i < 0) return;
-  const j = i + dir;
-  if (j < 0 || j >= promptQueue.length) return;
-  const ordered = promptQueue.map((q) => q.id);
-  const tmp = ordered[i]!;
-  ordered[i] = ordered[j]!;
-  ordered[j] = tmp;
-  const sid = activeSessionId;
-  if (sid) {
-    void hostReorder(inv, sid, ordered).then((f) => {
-      applyHostQueueMirror(f);
-      refreshQueueModalIfOpen();
-    });
-    return;
-  }
-  const t = promptQueue[i]!;
-  promptQueue[i] = promptQueue[j]!;
-  promptQueue[j] = t;
-  syncPromptQueueBar();
-  refreshQueueModalIfOpen();
-}
-
-function updateQueuedPrompt(
-  id: string,
-  patch: { display: string; content: string },
-): boolean {
-  const q = promptQueue.find((x) => x.id === id);
-  if (!q) return false;
-  const d = patch.display.trim();
-  const c = patch.content.trim();
-  if (!d && !c) return false;
-  const display = d || c;
-  const content = c || d;
-  const sid = activeSessionId;
-  if (sid) {
-    void hostUpdateItem(inv, sid, id, { display, content }).then((f) => {
-      applyHostQueueMirror(f);
-      refreshQueueModalIfOpen();
-    });
-    return true;
-  }
-  q.display = display;
-  q.content = content;
-  syncPromptQueueBar();
-  refreshQueueModalIfOpen();
-  return true;
-}
-
-function openEditQueuedPrompt(id: string): void {
-  const q = promptQueue.find((x) => x.id === id);
-  if (!q) return;
-  const initial = q.content || q.display;
-  openModal(
-    tr("queue.editTitle"),
-    `<p class="prompt-dlg-hint">${esc(tr("queue.editHint"))}</p>
-     <textarea id="queue-edit-ta" class="queue-edit-ta" rows="6" spellcheck="true"></textarea>
-     <div class="prompt-dlg-actions">
-       <button type="button" class="btn-dark" id="queue-edit-save">${esc(tr("queue.editSave"))}</button>
-       <button type="button" class="btn-ghost" id="prompt-dlg-cancel">${esc(tr("context.close"))}</button>
-     </div>`,
-  );
-  const ta = $("queue-edit-ta") as HTMLTextAreaElement;
-  ta.value = initial;
-  ta.focus();
-  ta.setSelectionRange(ta.value.length, ta.value.length);
-  $("queue-edit-save").onclick = () => {
-    const text = ta.value.replace(/\r\n/g, "\n").trim();
-    if (!text) {
-      showToast(tr("queue.editEmpty"), "error");
-      return;
-    }
-    // 编辑文本；附件块仍保留在 content 前缀时由用户自行改；简化：整体替换为新文本
-    if (updateQueuedPrompt(id, { display: text, content: text })) {
-      showToast(tr("queue.edited"));
-      closeModal();
-    }
-  };
-  $("prompt-dlg-cancel").onclick = () => closeModal();
-}
-
-function resumePromptQueue(): void {
-  const sid = activeSessionId;
-  if (sid) {
-    void hostSetQueueFlags(inv, sid, { pausedByInterrupt: false }).then((f) => {
-      applyHostQueueMirror(f);
-      showToast(tr("queue.resumed"));
-      if (!turnActive) scheduleDrainPromptQueue();
-    });
-    return;
-  }
-  if (!promptQueue.length) {
-    queuePausedByInterrupt = false;
-    syncPromptQueueBar();
-    return;
-  }
-  queuePausedByInterrupt = false;
-  syncPromptQueueBar();
-  showToast(tr("queue.resumed"));
-  if (!turnActive) scheduleDrainPromptQueue();
-}
-
-function enqueuePrompt(item: Omit<QueuedPrompt, "id">): string {
-  const id = `q_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 7)}`;
-  const sid = activeSessionId;
-  if (sid) {
-    void hostEnqueue(inv, sid, {
-      id,
-      content: item.content,
-      display: item.display,
-      attachments: item.attachments as unknown[],
-    }).then((f) => {
-      applyHostQueueMirror(f);
-      const toastKey = queuePausedByInterrupt
-        ? "queue.enqueuedPaused"
-        : "queue.enqueued";
-      showToast(tr(toastKey, { n: promptQueue.length }));
-      if (queueSyncError) {
-        showToast(tr("queue.localOnly", { err: queueSyncError }), "error");
-      }
-    });
-    return id;
-  }
-  promptQueue.push({ ...item, id });
-  syncPromptQueueBar();
-  const toastKey = queuePausedByInterrupt
-    ? "queue.enqueuedPaused"
-    : "queue.enqueued";
-  showToast(tr(toastKey, { n: promptQueue.length }));
-  return id;
-}
-
-/**
- * turn 结束后尝试发送队首。用 setTimeout 避免与 endTurn 重入。
- * 用户停止导致的 pause 期间不自动 drain。
- */
-function scheduleDrainPromptQueue(): void {
-  if (queueDrainScheduled) return;
-  if (!promptQueue.length) return;
-  if (queuePausedByInterrupt) return;
-  queueDrainScheduled = true;
-  window.setTimeout(() => {
-    queueDrainScheduled = false;
-    void drainPromptQueue();
-  }, 80);
-}
-
-async function drainPromptQueue(): Promise<void> {
-  if (turnActive) return;
-  if (queuePausedByInterrupt) return;
-  const sid = activeSessionId;
-  if (!sid) {
-    // 无会话：仅本地队列（极少路径）
-    const next = promptQueue.shift();
-    if (!next) {
-      syncPromptQueueBar();
-      return;
-    }
-    removeQueuedSystemLine(next.id);
-    syncPromptQueueBar();
-    await dispatchAgentPrompt(next.content, next.display, {
-      force: false,
-      attachments: next.attachments as ComposerAttachment[] | undefined,
-    });
-    return;
-  }
-  // L1 权威：take → 发送 → complete（勿只 shift 内存，否则磁盘项会复活）
-  const taken = await hostTakeNext(inv, sid);
-  if (!taken?.item) {
-    if (taken?.queue) applyHostQueueMirror(taken.queue);
-    else syncPromptQueueBar();
-    return;
-  }
-  // take 期间用户可能已切会话：回 pending 语义用 failed 保留，勿静默删除
-  if (activeSessionId !== sid) {
-    await hostCompleteSending(
-      inv,
-      sid,
-      taken.item.id,
-      false,
-      "session switched during queue drain",
-    );
-    return;
-  }
-  applyHostQueueMirror(taken.queue);
-  const item = taken.item;
-  // take 后该项已离队：清掉时间线「已排队」提示
-  removeQueuedSystemLine(item.id);
-  const result = await dispatchAgentPrompt(item.content, item.display, {
-    force: false,
-    attachments: (item.attachments as ComposerAttachment[]) ?? undefined,
-  });
-  // 仅当仍在原会话时镜像 UI；complete 始终写回原 sid 的 L1
-  await hostCompleteSending(
-    inv,
-    sid,
-    item.id,
-    result.ok,
-    result.ok ? undefined : result.error,
-  );
-  if (activeSessionId === sid) {
-    const file = await loadSessionQueue(inv, sid);
-    applyHostQueueMirror(file);
-  }
-}
-
-function showPromptQueueModal(): { ok: boolean; message?: string } {
-  if (!promptQueue.length) {
-    openModal(tr("queue.modalTitle"), buildPromptQueueEmptyModalHtml());
-    $("prompt-dlg-cancel").onclick = () => closeModal();
-    return { ok: true, message: tr("queue.empty") };
-  }
-  openModal(
-    tr("queue.modalTitle"),
-    buildPromptQueueModalBodyHtml(
-      promptQueue.map((q) => ({
-        id: q.id,
-        display: q.display,
-        content: q.content,
-        status: q.status,
-        lastError: q.lastError,
-      })),
-      queuePausedByInterrupt,
-    ),
-  );
-  const resumeBtn = document.getElementById("queue-modal-resume");
-  if (resumeBtn) {
-    resumeBtn.onclick = () => {
-      resumePromptQueue();
-      closeModal();
-    };
-  }
-  $("queue-modal-clear").onclick = () => {
-    clearPromptQueue();
-    closeModal();
-  };
-  $("prompt-dlg-cancel").onclick = () => closeModal();
-  return { ok: true };
-}
-
-/** S20：本会话最近后台任务快照（来自 task.updated 事件） */
-type TaskSnap = {
-  taskId: string;
-  phase: string;
-  command?: string;
-  description?: string;
-  isMonitor?: boolean;
-  success?: boolean;
-  exitCode?: number | null;
-  updatedAt: number;
-  sessionId?: string;
-};
-const taskSnaps = new Map<string, TaskSnap>();
-const TASK_SNAP_MAX = 40;
-
-function rememberTaskSnap(ev: {
+/** S20：后台任务面板 → TasksPanelUi */
+const rememberTaskSnap = (ev: {
   sessionId?: string;
   taskId: string;
   phase: string;
@@ -1980,531 +2154,28 @@ function rememberTaskSnap(ev: {
   isMonitor?: boolean;
   success?: boolean;
   exitCode?: number | null;
-}): void {
-  const id = ev.taskId || "";
-  if (!id) return;
-  taskSnaps.set(id, {
-    taskId: id,
-    phase: ev.phase,
-    command: ev.command,
-    description: ev.description,
-    isMonitor: ev.isMonitor,
-    success: ev.success,
-    exitCode: ev.exitCode,
-    updatedAt: Date.now(),
-    sessionId: ev.sessionId,
-  });
-  // 裁剪最旧
-  if (taskSnaps.size > TASK_SNAP_MAX) {
-    const sorted = [...taskSnaps.entries()].sort(
-      (a, b) => a[1].updatedAt - b[1].updatedAt,
-    );
-    for (let i = 0; i < sorted.length - TASK_SNAP_MAX; i++) {
-      taskSnaps.delete(sorted[i][0]);
-    }
-  }
-}
+}) => ensureTasksPanel().noteUpdated(ev);
+const showTasksPanel = () => ensureTasksPanel().show();
 
-function isTaskRunningPhase(phase: string): boolean {
-  return phase === "backgrounded" || phase === "monitor";
-}
+/** agent available_commands → AvailableCommandsCache */
+const refreshAgentAvailableCommands = () => ensureAvailableCommands().refresh();
+const applyAvailableCommandsEvent = (
+  ev: Parameters<AvailableCommandsCache["applyEvent"]>[0],
+) => ensureAvailableCommands().applyEvent(ev);
 
-function showTasksPanel(): { ok: boolean; message?: string } {
-  // Async refresh from Host aggregate (process/monitor/subagent/scheduled)
-  void showTasksPanelAsync();
-  return { ok: true };
-}
+/** R4：agent 崩溃条 → CrashBannerUi */
+const showAgentCrashBanner = (message?: string) =>
+  ensureCrashBanner().show(message);
+const hideAgentCrashBanner = () => ensureCrashBanner().hide();
 
-async function showTasksPanelAsync(): Promise<void> {
-  type Agg = {
-    id: string;
-    kind: string;
-    title: string;
-    status: string;
-    canKill?: boolean;
-    canOpen?: boolean;
-    automationId?: string;
-    childSessionId?: string;
-  };
-  let agg: Agg[] = [];
-  if (activeSessionId) {
-    const res = await inv<{ items: Agg[] }>("threads.tasksList", {
-      sessionId: activeSessionId,
-    });
-    if (res.ok && res.data?.items) agg = res.data.items;
-  }
-  // Fallback: local taskSnaps when Host empty
-  if (!agg.length) {
-    const rows = [...taskSnaps.values()]
-      .filter(
-        (t) =>
-          !activeSessionId || !t.sessionId || t.sessionId === activeSessionId,
-      )
-      .sort((a, b) => b.updatedAt - a.updatedAt);
-    agg = rows.map((t) => ({
-      id: t.taskId,
-      kind: t.isMonitor ? "monitor" : "process",
-      title: (t.description || t.command || t.taskId).trim(),
-      status:
-        t.phase === "completed"
-          ? t.success === false
-            ? "failed"
-            : "ok"
-          : t.phase,
-      canKill: isTaskRunningPhase(t.phase),
-    }));
-  }
-  if (!agg.length) {
-    openModal(
-      tr("tasks.modalTitle"),
-      `<p class="prompt-dlg-hint">${esc(tr("tasks.empty"))}</p>
-       <p class="prompt-dlg-hint">${esc(tr("tasks.hint"))}</p>
-       <p class="prompt-dlg-hint">${esc(tr("tasks.automationsHint"))}</p>
-       <div class="prompt-dlg-actions">
-         <button type="button" class="btn-ghost" id="prompt-dlg-cancel">${esc(tr("context.close"))}</button>
-       </div>`,
-    );
-    $("prompt-dlg-cancel").onclick = () => closeModal();
-    return;
-  }
-  const items = agg
-    .map((t) => {
-      const kind = t.kind || "process";
-      const label = (t.title || "").trim() || kind;
-      const short = t.id.slice(0, 10);
-      const st = t.status || "unknown";
-      const running = t.canKill || isTaskRunningPhase(st);
-      return `<div class="task-panel-row" data-task-id="${esc(t.id)}">
-        <div class="task-panel-main">
-          <span class="task-panel-st task-st-${esc(st)}">[${esc(st)}]</span>
-          <span class="task-panel-kind">${esc(kind)}</span>
-          <span class="task-panel-id" title="${esc(t.id)}">${esc(short)}</span>
-          <span class="task-panel-label" title="${esc(label)}">${esc(label.slice(0, 100))}</span>
-        </div>
-        <div class="task-panel-acts">
-          <button type="button" class="btn-ghost sm" data-task-copy="${esc(t.id)}">${esc(tr("tasks.copyId"))}</button>
-          ${
-            running && (kind === "process" || kind === "monitor")
-              ? `<button type="button" class="btn-dark sm" data-task-kill="${esc(t.id)}" title="${esc(tr("tasks.killTitle"))}">${esc(tr("tasks.kill"))}</button>`
-              : ""
-          }
-          ${
-            kind === "scheduled" || t.canOpen
-              ? `<button type="button" class="btn-ghost sm" data-task-open-auto="${esc(t.automationId || t.id)}">${esc(tr("tasks.openAutomations"))}</button>`
-              : ""
-          }
-        </div>
-      </div>`;
-    })
-    .join("");
-  openModal(
-    tr("tasks.modalTitle"),
-    `<p class="prompt-dlg-hint">${esc(tr("tasks.panelHint"))}</p>
-     <div class="task-panel-list">${items}</div>
-     <div class="prompt-dlg-actions">
-       <button type="button" class="btn-ghost" id="prompt-dlg-cancel">${esc(tr("context.close"))}</button>
-     </div>`,
-  );
-  $("prompt-dlg-cancel").onclick = () => closeModal();
-  for (const btn of Array.from(
-    document.querySelectorAll("[data-task-copy]"),
-  )) {
-    (btn as HTMLElement).onclick = async () => {
-      const id = (btn as HTMLElement).dataset.taskCopy ?? "";
-      try {
-        await navigator.clipboard.writeText(id);
-        showToast(tr("common.copied"));
-      } catch {
-        showToast(tr("common.copyFailed"), "error");
-      }
-    };
-  }
-  for (const btn of Array.from(
-    document.querySelectorAll("[data-task-kill]"),
-  )) {
-    (btn as HTMLElement).onclick = () => {
-      const id = (btn as HTMLElement).dataset.taskKill ?? "";
-      if (id) void killBackgroundTask(id);
-    };
-  }
-  for (const btn of Array.from(
-    document.querySelectorAll("[data-task-open-auto]"),
-  )) {
-    (btn as HTMLElement).onclick = () => {
-      closeModal();
-      document.getElementById("btn-automations")?.click();
-    };
-  }
-}
-
-/** S20：杀后台任务（ACP `_x.ai/task/kill`） */
-async function killBackgroundTask(taskId: string): Promise<void> {
-  const id = taskId.trim();
-  if (!id) return;
-  const snap = taskSnaps.get(id);
-  if (snap && !isTaskRunningPhase(snap.phase)) {
-    showToast(tr("tasks.notRunning"), "error");
-    return;
-  }
-  const threadId = await ensureLiveThread();
-  if (!threadId) {
-    showToast(tr("tasks.killNeedAttach"), "error");
-    return;
-  }
-  const btn = Array.from(
-    document.querySelectorAll("[data-task-kill]"),
-  ).find(
-    (el) => (el as HTMLElement).dataset.taskKill === id,
-  ) as HTMLButtonElement | null;
-  if (btn) {
-    btn.disabled = true;
-    btn.textContent = tr("tasks.killing");
-  }
-  const res = await inv<{
-    taskId: string;
-    outcome: string;
-    sessionId: string;
-  }>("threads.killTask", { threadId, taskId: id });
-  if (!res.ok) {
-    showToast(res.error?.message ?? tr("tasks.killFail"), "error");
-    if (btn) {
-      btn.disabled = false;
-      btn.textContent = tr("tasks.kill");
-    }
-    return;
-  }
-  // 乐观：标记本地快照为已结束（真实终态仍等 task.updated）
-  const prev = taskSnaps.get(id);
-  if (prev) {
-    taskSnaps.set(id, {
-      ...prev,
-      phase: "completed",
-      success: false,
-      updatedAt: Date.now(),
-    });
-  }
-  const outcome = res.data?.outcome ?? "killed";
-  showToast(tr("tasks.killOk", { id: id.slice(0, 8), outcome }));
-  appendProcessText(
-    tr("tasks.killProcess", { id: id.slice(0, 8), outcome }),
-  );
-  // 刷新面板
-  showTasksPanel();
-}
-
-/** 拉取 / 缓存 agent available_commands */
-async function refreshAgentAvailableCommands(): Promise<void> {
-  if (!activeThreadId || activeThreadId.startsWith("disk_")) return;
-  const res = await inv<{
-    commands: Array<{
-      name: string;
-      description?: string;
-      input?: { hint?: string };
-    }>;
-    tools?: string[];
-  }>("threads.availableCommands", { threadId: activeThreadId });
-  if (res.ok && res.data?.commands) {
-    agentAvailableCommands = res.data.commands;
-  }
-}
-
-function applyAvailableCommandsEvent(ev: {
-  sessionId?: string;
-  threadId?: string;
-  commands: Array<{
-    name: string;
-    description?: string;
-    input?: { hint?: string };
-  }>;
-}): void {
-  if (
-    activeSessionId &&
-    ev.sessionId &&
-    ev.sessionId !== activeSessionId
-  ) {
-    return;
-  }
-  if (
-    activeThreadId &&
-    ev.threadId &&
-    ev.threadId !== activeThreadId &&
-    !activeThreadId.startsWith("disk_")
-  ) {
-    return;
-  }
-  agentAvailableCommands = ev.commands ?? [];
-  slashPalette?.invalidate();
-}
-
-/** R4：agent 崩溃条 — 提示重新附着 */
-function showAgentCrashBanner(message?: string): void {
-  agentCrashPending = true;
-  let bar = document.getElementById("agent-crash-bar");
-  if (!bar) {
-    bar = document.createElement("div");
-    bar.id = "agent-crash-bar";
-    bar.className = "agent-crash-bar";
-    const host =
-      document.querySelector(".chat-composer-wrap") ||
-      document.getElementById("chat-view") ||
-      document.body;
-    host.insertBefore(bar, host.firstChild);
-  }
-  bar.innerHTML = `<span class="agent-crash-msg">${esc(
-    message?.trim() || tr("crash.default"),
-  )}</span>
-    <button type="button" class="btn-dark sm" id="btn-agent-reattach">${esc(
-      tr("crash.reattach"),
-    )}</button>
-    <button type="button" class="btn-ghost sm" id="btn-agent-crash-dismiss">${esc(
-      tr("common.close"),
-    )}</button>`;
-  bar.classList.remove("hidden");
-  const re = document.getElementById("btn-agent-reattach");
-  if (re) {
-    re.onclick = () => void reattachAfterCrash();
-  }
-  const dis = document.getElementById("btn-agent-crash-dismiss");
-  if (dis) {
-    dis.onclick = () => hideAgentCrashBanner();
-  }
-}
-
-function hideAgentCrashBanner(): void {
-  agentCrashPending = false;
-  const bar = document.getElementById("agent-crash-bar");
-  if (bar) bar.classList.add("hidden");
-}
-
-async function reattachAfterCrash(): Promise<void> {
-  if (!activeSessionId || !activeCwd) {
-    showToast(tr("crash.needSession"), "error");
-    return;
-  }
-  // 强制视为 disk 会话，触发新 attach
-  if (activeThreadId && !activeThreadId.startsWith("disk_")) {
-    activeThreadId = `disk_${activeSessionId}`;
-  }
-  appendLine(tr("crash.reattaching"), "system");
-  const tid = await ensureLiveThread();
-  if (tid) {
-    hideAgentCrashBanner();
-    showToast(tr("crash.reattachOk"));
-    void refreshAgentAvailableCommands();
-  } else {
-    showToast(tr("crash.reattachFail"), "error");
-  }
-}
-
-// ── S17 prompt history ─────────────────────────────────────
-
-function resetPromptHistoryBrowse(): void {
-  promptHistoryIndex = -1;
-  promptHistoryDraft = "";
-}
-
-function clearPromptHistoryStore(): void {
-  promptHistory = [];
-  resetPromptHistoryBrowse();
-}
-
-/** 记录一条用户发送文案（最新在前；连续重复去重） */
-function recordPromptHistory(text: string): void {
-  const t = text.replace(/\r\n/g, "\n").trim();
-  if (!t || t.length < 1) return;
-  // 跳过纯 slash 命令
-  if (/^\/\S*$/.test(t)) return;
-  if (promptHistory[0] === t) {
-    resetPromptHistoryBrowse();
-    return;
-  }
-  // 若历史中已有相同项，提到最前
-  const prev = promptHistory.indexOf(t);
-  if (prev >= 0) promptHistory.splice(prev, 1);
-  promptHistory.unshift(t);
-  if (promptHistory.length > PROMPT_HISTORY_MAX) {
-    promptHistory.length = PROMPT_HISTORY_MAX;
-  }
-  resetPromptHistoryBrowse();
-}
-
-/** 从磁盘 user 消息填充（打开会话时，最新在前） */
-function seedPromptHistoryFromUserTexts(texts: string[]): void {
-  const seen = new Set<string>();
-  const out: string[] = [];
-  // texts 通常时间正序；倒序取最新
-  for (let i = texts.length - 1; i >= 0; i--) {
-    const t = (texts[i] ?? "").replace(/\r\n/g, "\n").trim();
-    if (!t || seen.has(t)) continue;
-    seen.add(t);
-    out.push(t);
-    if (out.length >= PROMPT_HISTORY_MAX) break;
-  }
-  promptHistory = out;
-  resetPromptHistoryBrowse();
-}
-
-function applyPromptToComposer(text: string, ta?: HTMLTextAreaElement | null): void {
-  const input = ta ?? activeComposerInput();
-  input.value = text;
-  const pos = text.length;
-  input.setSelectionRange(pos, pos);
-  input.focus();
-  input.dispatchEvent(new Event("input", { bubbles: true }));
-}
-
-/**
- * ↑/↓ 浏览 prompt 历史。
- * 仅在：slash/@ 未打开、光标在开头（或已在浏览中）时拦截。
- */
-function handlePromptHistoryKey(
-  ta: HTMLTextAreaElement,
-  e: KeyboardEvent,
-): boolean {
-  if (e.ctrlKey || e.altKey || e.metaKey) return false;
-  if (e.key !== "ArrowUp" && e.key !== "ArrowDown") return false;
-  if (slashPalette?.isOpen()) return false;
-  // @ 浮层：有则跳过
-  const atEl = document.getElementById("at-file-palette");
-  if (atEl && !atEl.classList.contains("hidden")) return false;
-
-  const start = ta.selectionStart ?? 0;
-  const end = ta.selectionEnd ?? 0;
-  const browsing = promptHistoryIndex >= 0;
-
-  if (e.key === "ArrowUp") {
-    // 多行：不在首行则交给浏览器
-    if (!browsing) {
-      const before = ta.value.slice(0, start);
-      if (before.includes("\n")) return false;
-      if (start !== end) return false;
-      // 非空且光标不在开头：不抢
-      if (ta.value.length > 0 && start > 0) return false;
-    }
-    if (!promptHistory.length) return false;
-    e.preventDefault();
-    if (!browsing) {
-      promptHistoryDraft = ta.value;
-      promptHistoryIndex = 0;
-    } else if (promptHistoryIndex < promptHistory.length - 1) {
-      promptHistoryIndex += 1;
-    }
-    applyPromptToComposer(promptHistory[promptHistoryIndex] ?? "", ta);
-    return true;
-  }
-
-  // ArrowDown
-  if (!browsing) return false;
-  e.preventDefault();
-  if (promptHistoryIndex <= 0) {
-    applyPromptToComposer(promptHistoryDraft, ta);
-    resetPromptHistoryBrowse();
-  } else {
-    promptHistoryIndex -= 1;
-    applyPromptToComposer(promptHistory[promptHistoryIndex] ?? "", ta);
-  }
-  return true;
-}
-
-function filterPromptHistory(query: string): string[] {
-  const q = query.trim().toLowerCase();
-  if (!q) return [...promptHistory];
-  const tokens = q.split(/\s+/).filter(Boolean);
-  return promptHistory.filter((line) => {
-    const hay = line.toLowerCase();
-    return tokens.every((t) => hay.includes(t));
-  });
-}
-
-function showPromptHistorySearch(): { ok: boolean; message?: string } {
-  openModal(
-    tr("history.modalTitle"),
-    `<div class="session-search-wrap">
-      <input id="prompt-hist-q" class="prompt-dlg-input" type="search"
-        placeholder="${esc(tr("history.searchPh"))}" autocomplete="off" />
-      <div id="prompt-hist-hits" class="session-search-list prompt-hist-list"></div>
-      <p class="prompt-dlg-hint" id="prompt-hist-hint">${esc(tr("history.hint"))}</p>
-      <div class="prompt-dlg-actions">
-        <button type="button" class="btn-ghost" id="prompt-dlg-cancel">${esc(tr("context.close"))}</button>
-      </div>
-    </div>`,
-  );
-  const qEl = $("prompt-hist-q") as HTMLInputElement;
-  const hitsEl = $("prompt-hist-hits");
-  let active = 0;
-  let filtered: string[] = [];
-
-  const render = () => {
-    filtered = filterPromptHistory(qEl.value);
-    active = Math.min(active, Math.max(0, filtered.length - 1));
-    if (!filtered.length) {
-      hitsEl.innerHTML = `<div class="session-search-empty">${esc(
-        promptHistory.length ? tr("history.noMatch") : tr("history.empty"),
-      )}</div>`;
-      return;
-    }
-    hitsEl.innerHTML = filtered
-      .slice(0, 40)
-      .map((line, i) => {
-        const short =
-          line.length > 160
-            ? line.slice(0, 160).replace(/\s+/g, " ") + "…"
-            : line.replace(/\s+/g, " ");
-        return `<button type="button" class="session-search-item prompt-hist-item${i === active ? " is-active" : ""}" data-hist-i="${i}" role="option">
-          <span class="session-search-title">${esc(short)}</span>
-        </button>`;
-      })
-      .join("");
-    hitsEl.querySelectorAll<HTMLElement>("[data-hist-i]").forEach((btn) => {
-      btn.onclick = () => {
-        const i = Number(btn.dataset.histI);
-        pick(i);
-      };
-    });
-    // 滚到选中项
-    hitsEl
-      .querySelector(".prompt-hist-item.is-active")
-      ?.scrollIntoView({ block: "nearest" });
-  };
-
-  const pick = (i: number) => {
-    const text = filtered[i];
-    if (text == null) return;
-    closeModal();
-    resetPromptHistoryBrowse();
-    applyPromptToComposer(text);
-    showToast(tr("history.inserted"));
-  };
-
-  qEl.oninput = () => {
-    active = 0;
-    render();
-  };
-  qEl.onkeydown = (ev) => {
-    if (ev.key === "ArrowDown") {
-      ev.preventDefault();
-      if (filtered.length) {
-        active = Math.min(filtered.length - 1, active + 1);
-        render();
-      }
-    } else if (ev.key === "ArrowUp") {
-      ev.preventDefault();
-      if (filtered.length) {
-        active = Math.max(0, active - 1);
-        render();
-      }
-    } else if (ev.key === "Enter") {
-      ev.preventDefault();
-      pick(active);
-    } else if (ev.key === "Escape") {
-      closeModal();
-    }
-  };
-  $("prompt-dlg-cancel").onclick = () => closeModal();
-  render();
-  window.setTimeout(() => qEl.focus(), 0);
-  return { ok: true };
-}
+// ── S17 prompt history → PromptHistoryUi ───────────────────
+const clearPromptHistoryStore = () => ensurePromptHistory().clear();
+const recordPromptHistory = (text: string) => ensurePromptHistory().record(text);
+const seedPromptHistoryFromUserTexts = (texts: string[]) =>
+  ensurePromptHistory().seedFromUserTexts(texts);
+const handlePromptHistoryKey = (ta: HTMLTextAreaElement, e: KeyboardEvent) =>
+  ensurePromptHistory().handleKey(ta, e);
+const showPromptHistorySearch = () => ensurePromptHistory().showSearch();
 
 /**
  * 方案 B：把当前主区 turn 投影快照到 session 槽（切走前调用）。
@@ -2731,34 +2402,6 @@ function setTurnStatus(label: string): void {
   }
 }
 
-/**
- * 流式拼接时：prev 已是一段像完整回复的文字，chunk 又像另一段回复开头
- * → 禁止 `prev + chunk`（跨 turn 串流典型形态，如图：苹果回复 + 螺蛳粉回复）。
- */
-function looksLikeGluedNewAssistantReply(prev: string, chunk: string): boolean {
-  const p = prev.trim();
-  const c = chunk.trim();
-  if (!p || !c) return false;
-  if (c.startsWith(p) || p.startsWith(c)) return false;
-  // 正常 token 续写：短增量
-  if (c.length <= 32) return false;
-  // 大块新全文（非 prev 前缀）：几乎一定是另一轮的完整/半完整回复
-  if (c.length >= 24 && p.length >= 30 && !c.startsWith(p.slice(0, 20))) {
-    const restarts =
-      /^(你好|您好|嗨|哈喽|Hi\b|Hello\b|我是|针对|关于|好的|收到|发了[「""])/i.test(
-        c,
-      );
-    const prevLooksFinished =
-      p.length >= 50 ||
-      /[。！？.!?]\s*$/.test(p) ||
-      /\n\s*[-*•]/.test(p) ||
-      /例如[：:]/.test(p);
-    if (restarts && prevLooksFinished) return true;
-    // 两段都像「独立段落开头」且无共享前缀
-    if (prevLooksFinished && c.length >= 40) return true;
-  }
-  return false;
-}
 
 function beginTurn(): void {
   // 先定稿并切断上一 turn 的流式指针，防止新 delta 拼进旧气泡
@@ -3047,24 +2690,12 @@ async function cancelTurn(opts?: {
     // interrupt：保留队列 + 暂停 drain；send_now / clearQueue 另议
     if (opts?.clearQueue) {
       clearPromptQueue({ silent: true });
-    } else if (pauseQueue && promptQueue.length) {
-      queuePausedByInterrupt = true;
-      syncPromptQueueBar();
-      if (activeSessionId) {
-        void hostSetQueueFlags(inv, activeSessionId, {
-          pausedByInterrupt: true,
-        });
-      }
+    } else if (pauseQueue && ensurePromptQueue().length) {
+      ensurePromptQueue().setPausedSyncHost(true);
     } else if (!pauseQueue) {
       // send_now：用户继续工作，解除 interrupt pause
-      if (queuePausedByInterrupt) {
-        queuePausedByInterrupt = false;
-        syncPromptQueueBar();
-        if (activeSessionId) {
-          void hostSetQueueFlags(inv, activeSessionId, {
-            pausedByInterrupt: false,
-          });
-        }
+      if (ensurePromptQueue().isPaused) {
+        ensurePromptQueue().setPausedSyncHost(false);
       }
     }
     // 停止后短暂禁止 history 回补（下一轮干净流后解除）
@@ -3092,7 +2723,7 @@ async function cancelTurn(opts?: {
         outcome: "stopped",
         skipQueueDrain:
           !pauseQueue ||
-          queuePausedByInterrupt ||
+          ensurePromptQueue().isPaused ||
           Boolean(opts?.clearQueue),
       });
     }
@@ -3452,47 +3083,6 @@ function endStreamBubble(): void {
   resetStreamState(true);
 }
 
-/** 从 history 正文中拆出附件块（与 buildPromptWithAttachments 对称） */
-function parseUserHistoryPayload(raw: string): {
-  text: string;
-  attachments: ComposerAttachment[];
-} {
-  const markers = [
-    "[Attachments — include these paths in context; for folders, consider the directory tree]",
-    "[Attachments — include these paths in context]",
-  ];
-  let idx = -1;
-  let marker = "";
-  for (const m of markers) {
-    const i = raw.indexOf(m);
-    if (i >= 0 && (idx < 0 || i < idx)) {
-      idx = i;
-      marker = m;
-    }
-  }
-  if (idx < 0) {
-    return { text: raw.trim(), attachments: [] };
-  }
-  const text = raw.slice(0, idx).trim();
-  const rest = raw.slice(idx + marker.length);
-  const attachments: ComposerAttachment[] = [];
-  for (const line of rest.split(/\r?\n/)) {
-    const m = line.match(/^\s*-\s*(file|image|folder)\s*:\s*(.+)\s*$/i);
-    if (!m) continue;
-    const kind = m[1]!.toLowerCase() as ComposerAttachment["kind"];
-    const pathStr = m[2]!.trim();
-    if (!pathStr) continue;
-    const base = pathStr.split(/[/\\]/).pop() || pathStr;
-    attachments.push({
-      path: pathStr,
-      name: kind === "folder" ? `${base.replace(/\/$/, "")}/` : base,
-      kind,
-    });
-  }
-  return { text, attachments };
-}
-
-/** 会话图片：独立媒体区，不放进用户气泡 */
 function renderMsgImages(
   host: HTMLElement,
   attachments: ComposerAttachment[],
@@ -3578,24 +3168,6 @@ function renderMsgFileChips(
   host.appendChild(chips);
 }
 
-/** 用户气泡下时间：6月21日 18:49 */
-function formatUserMsgTime(d: Date): string {
-  const now = new Date();
-  const mo = d.getMonth() + 1;
-  const day = d.getDate();
-  const hh = String(d.getHours()).padStart(2, "0");
-  const mm = String(d.getMinutes()).padStart(2, "0");
-  if (d.getFullYear() === now.getFullYear()) {
-    return `${mo}月${day}日 ${hh}:${mm}`;
-  }
-  return `${d.getFullYear()}年${mo}月${day}日 ${hh}:${mm}`;
-}
-
-/**
- * 用户气泡：正文 + 附件；气泡下时间 / 复制 / 回撤（完整 rewind）。
- * at：消息时间。省略=现在；null=不显示时间（历史无戳时）。
- * promptIndex：显式索引；省略则用 nextUserPromptIndex++。
- */
 function paintUserMessage(
   text: string,
   attachments?: ComposerAttachment[],
@@ -3742,135 +3314,11 @@ function truncateTranscriptFromPrompt(targetPromptIndex: number): void {
   resetStreamState(true);
 }
 
-/**
- * 回退到指定 user prompt 之前（完整：对话+文件）。
- * agent 语义：force=false 仅为预览（success 恒 false）；确认后必须 force=true 才真正执行。
- */
 async function rewindToUserPrompt(
   promptIndex: number,
   previewText: string,
 ): Promise<void> {
-  if (turnActive) {
-    showToast(tr("chat.rewindWait"), "error");
-    return;
-  }
-  if (!activeSessionId) {
-    showToast(tr("chat.rewindNeedSession"), "error");
-    return;
-  }
-
-  const threadId = await ensureLiveThread();
-  if (!threadId) {
-    showToast(tr("chat.rewindAttachFail2"), "error");
-    return;
-  }
-
-  // 预览：force=false 返回 conflicts / clean_files，不改状态
-  const previewRes = await inv<{
-    success: boolean;
-    targetPromptIndex: number;
-    revertedFiles: string[];
-    conflicts: Array<{ path?: string; conflictType?: string }>;
-    cleanFiles?: string[];
-    error?: string;
-  }>("threads.rewindPreview", {
-    threadId,
-    targetPromptIndex: promptIndex,
-  });
-
-  const conflicts = previewRes.data?.conflicts ?? [];
-  const conflictN = conflicts.length;
-  const cleanN =
-    (previewRes.data as { cleanFiles?: string[] } | undefined)?.cleanFiles
-      ?.length ?? 0;
-  const preview =
-    previewText.length > 80 ? `${previewText.slice(0, 80)}…` : previewText;
-
-  let conflictNote = "";
-  if (conflictN > 0) {
-    const sample = conflicts
-      .slice(0, 5)
-      .map((c) => c.path || "?")
-      .join("\n");
-    conflictNote =
-      `\n\n⚠ 检测到 ${conflictN} 个文件可能被外部修改，确认后将强制覆盖：\n${sample}` +
-      (conflictN > 5 ? "\n…" : "");
-  } else if (cleanN > 0) {
-    conflictNote = `\n\n将还原约 ${cleanN} 个文件快照。`;
-  }
-
-  // 预览阶段 agent 失败（如 index 非法）
-  if (!previewRes.ok && !previewRes.data) {
-    showToast(previewRes.error?.message ?? tr("chat.rewindPreviewFail"), "error");
-    return;
-  }
-  const previewErr = previewRes.data?.error || previewRes.error?.message;
-  if (
-    previewErr &&
-    /Cannot rewind|current prompt index|Valid targets/i.test(previewErr)
-  ) {
-    showToast(previewErr, "error");
-    return;
-  }
-
-  const ok = await confirmText({
-    title: tr("chat.rewindConfirmTitle"),
-    message:
-      `将恢复到该用户消息执行前的状态（对齐 CLI /rewind · 完整回退）：\n\n` +
-      `· 删除此消息及之后的全部对话\n` +
-      `· 将相关文件恢复为当时快照（未进 git 的改动可能丢失）\n\n` +
-      `目标消息：${preview || tr("chat.rewindConfirmBodyEmpty")}` +
-      conflictNote,
-    okLabel: tr("chat.rewindOk"),
-    cancelLabel: tr("common.cancel"),
-  });
-  if (!ok) return;
-
-  showToast(tr("chat.rewinding"));
-  // 真正执行：必须 force=true（agent 在 force=false 时只做 dry-run）
-  const res = await inv<{
-    success: boolean;
-    targetPromptIndex: number;
-    revertedFiles: string[];
-    promptText?: string;
-  }>("threads.rewind", {
-    threadId,
-    targetPromptIndex: promptIndex,
-    force: true,
-  });
-
-  if (!res.ok || res.data?.success === false) {
-    // 确保发送钮不卡在「停止」态
-    endTurn();
-    showToast(res.error?.message ?? tr("chat.rewindFailed"), "error");
-    return;
-  }
-
-  // 回退会截断对话/打断 agent 状态：必须清 turn UI（否则发送钮停在 ■）
-  endTurn();
-  truncateTranscriptFromPrompt(promptIndex);
-  if (res.data?.promptText) {
-    const ta = (
-      $("chat").classList.contains("hidden")
-        ? $("composer-input")
-        : $("chat-input")
-    ) as HTMLTextAreaElement;
-    ta.value = res.data.promptText;
-    ta.focus();
-  }
-  const n = res.data?.revertedFiles?.length ?? 0;
-  appendLine(
-    n > 0
-      ? `已回退到消息 #${promptIndex} 之前（对话+文件，还原 ${n} 个文件）`
-      : `已回退到消息 #${promptIndex} 之前（对话+文件）`,
-    "system",
-  );
-  showToast(n > 0 ? tr("chat.rewoundFiles", { n }) : tr("chat.rewound"));
-  // 双保险：截断后强制发送钮恢复 ↑
-  setComposerBusy(false);
-  if (activeSessionId) markSessionWorking(activeSessionId, false);
-  void refreshContextUsage();
-  void refreshProjectsAndThreads();
+  await ensureRewindActions().toUserPrompt(promptIndex, previewText);
 }
 
 function permLabel(): string {
@@ -3892,125 +3340,20 @@ function effortLabel(level: EffortLevel = effortLevel): string {
   return effortOptions().find((e) => e.id === level)?.label ?? level;
 }
 
-/**
- * CLI 对齐：展示名 = catalog name（config `name` ?? `model` ?? id）。
- * 内部切换仍用 modelLabel（id）。
- */
-function modelDisplayName(modelId: string = modelLabel): string {
-  const id = (modelId || "grok").trim();
-  const hit = modelsCache?.find((m) => m.id === id);
-  const n = hit?.name?.trim();
-  if (n) return n;
-  return id;
-}
-
-/** chip 短标：展示名 + 推理档（对齐 CLI display name） */
 function modelChipText(): string {
-  const id = (modelLabel || "grok").trim();
-  let short = modelDisplayName(id);
-  // 仅当仍显示 id 且为 grok-* slug 时剥前缀做短标
-  if (short === id && /^grok-/i.test(short)) {
-    short = short.replace(/^grok-/i, "");
-  }
-  if (short.length > 18) short = short.slice(0, 16) + "…";
-  return `${short} ${effortLabel()}`;
+  return ensureModelMenu().modelChipText();
 }
 
 function syncModelLabels(): void {
-  const v = modelChipText();
-  for (const id of ["model-label", "model-label-2"] as const) {
-    const el = document.getElementById(id);
-    if (el) el.textContent = v;
-  }
-  const display = modelDisplayName();
-  const modelForTitle =
-    display !== (modelLabel || "").trim()
-      ? `${display} (${modelLabel})`
-      : display;
-  for (const id of ["btn-model", "btn-model-2"] as const) {
-    const btn = document.getElementById(id);
-    if (btn) {
-      btn.title = tr("chat.modelTitle", {
-        model: modelForTitle,
-        effort: effortLabel(),
-        level: effortLevel,
-      });
-    }
-  }
-  // 侧问栏：只读展示主会话模型（无切换）
-  const btwRo = document.getElementById("btw-model-readonly");
-  if (btwRo) {
-    btwRo.textContent = v;
-    btwRo.title = tr("btw.modelReadonlyTitle", { model: modelForTitle }) ||
-      `与主会话相同：${modelForTitle}`;
-  }
-}
-
-type ContextUsageRow = {
-  sessionId: string;
-  used: number;
-  total: number;
-  percent: number;
-  available: boolean;
-  source: string;
-  path?: string;
-};
-
-let lastContextUsage: ContextUsageRow | null = null;
-let contextPollTimer: ReturnType<typeof setInterval> | null = null;
-
-/** 273k / 500k 风格 */
-function formatTokenK(n: number): string {
-  if (!Number.isFinite(n) || n < 0) return "—";
-  if (n >= 1_000_000) {
-    const m = n / 1_000_000;
-    return `${m >= 10 ? m.toFixed(0) : m.toFixed(1).replace(/\.0$/, "")}M`;
-  }
-  if (n >= 1000) {
-    const k = n / 1000;
-    if (k >= 100) return `${Math.round(k)}k`;
-    return `${k.toFixed(k % 1 === 0 ? 0 : 1).replace(/\.0$/, "")}k`;
-  }
-  return String(Math.round(n));
-}
-
-function formatContextChipText(u: ContextUsageRow | null): string {
-  if (!u || !u.available || u.total <= 0) return "—";
-  const pct = u.percent.toFixed(2);
-  return `${formatTokenK(u.used)} / ${formatTokenK(u.total)} (${pct}%)`;
+  ensureModelMenu().syncLabels();
 }
 
 function syncContextLabels(): void {
-  const text = formatContextChipText(lastContextUsage);
-  const pct = lastContextUsage?.percent ?? 0;
-  const el = document.getElementById("context-label");
-  if (el) el.textContent = text;
-  const btn = document.getElementById("btn-context");
-  if (!btn) return;
-  btn.classList.toggle("is-warn", pct >= 70 && pct < 90);
-  btn.classList.toggle("is-high", pct >= 90);
-  btn.title = lastContextUsage?.available
-    ? tr("chat.contextChip", { text })
-    : tr("context.needSession");
+  ensureContextUi().syncLabels();
 }
 
 async function refreshContextUsage(): Promise<ContextUsageRow | null> {
-  if (!activeSessionId) {
-    lastContextUsage = null;
-    syncContextLabels();
-    return null;
-  }
-  const res = await inv<ContextUsageRow>("session.context", {
-    sessionId: activeSessionId,
-  });
-  if (!res.ok || !res.data) {
-    lastContextUsage = null;
-    syncContextLabels();
-    return null;
-  }
-  lastContextUsage = res.data;
-  syncContextLabels();
-  return lastContextUsage;
+  return ensureContextUi().refresh();
 }
 
 /** auto-compact 事件里的 tokens 往往比 signals.json 写回更早，先乐观刷新 chip */
@@ -4018,27 +3361,7 @@ function applyOptimisticContextFromCompact(ev: {
   tokensBefore?: number;
   tokensAfter?: number;
 }): void {
-  if (ev.tokensAfter == null || !Number.isFinite(ev.tokensAfter)) return;
-  const after = Math.max(0, ev.tokensAfter);
-  const prev = lastContextUsage;
-  const total =
-    prev?.total && prev.total > 0
-      ? prev.total
-      : ev.tokensBefore != null && ev.tokensBefore > after
-        ? Math.max(ev.tokensBefore, after)
-        : after > 0
-          ? Math.round(after / 0.15)
-          : 0;
-  lastContextUsage = {
-    sessionId: activeSessionId ?? prev?.sessionId ?? "",
-    used: after,
-    total,
-    percent: total > 0 ? Math.min(100, (after / total) * 100) : 0,
-    available: total > 0 || after > 0,
-    source: prev?.source === "signals" ? "signals" : "signals",
-    path: prev?.path,
-  };
-  syncContextLabels();
+  ensureContextUi().applyOptimisticFromCompact(ev);
 }
 
 /** compact 完成后：乐观 chip + 多次回读 signals（写盘有延迟） */
@@ -4046,141 +3369,27 @@ function refreshContextAfterCompact(ev: {
   tokensBefore?: number;
   tokensAfter?: number;
 }): void {
-  applyOptimisticContextFromCompact(ev);
-  void refreshContextUsage();
-  window.setTimeout(() => void refreshContextUsage(), 600);
-  window.setTimeout(() => void refreshContextUsage(), 2000);
-  window.setTimeout(() => void refreshContextUsage(), 5000);
+  ensureContextUi().refreshAfterCompact(ev);
 }
 
 function startContextPolling(): void {
-  stopContextPolling();
-  void refreshContextUsage();
-  contextPollTimer = setInterval(() => {
-    if (activeSessionId) void refreshContextUsage();
-  }, 4000);
+  ensureContextUi().startPolling();
 }
 
 function stopContextPolling(): void {
-  if (contextPollTimer) {
-    clearInterval(contextPollTimer);
-    contextPollTimer = null;
-  }
+  ensureContextUi().stopPolling();
 }
 
 async function showContextDetails(): Promise<{ ok: boolean; message?: string }> {
-  if (!activeSessionId) {
-    openModal(
-      tr("context.title"),
-      `<p class="prompt-dlg-hint">${esc(tr("context.needOpen"))}</p>
-       <div class="prompt-dlg-actions">
-         <button type="button" class="btn-ghost" id="prompt-dlg-cancel">${esc(tr("context.close"))}</button>
-       </div>`,
-    );
-    $("prompt-dlg-cancel").onclick = () => closeModal();
-    return { ok: true };
-  }
+  return ensureContextUi().showDetails();
+}
 
-  // 优先 session/info 完整 ContextInfo；失败则回退 signals.json
-  const info = await fetchSessionInfoForActive();
-  if (info) {
-    const c = info.context;
-    if (c.total > 0 || c.used > 0) {
-      lastContextUsage = {
-        sessionId: info.sessionId,
-        used: c.used,
-        total: c.total,
-        percent:
-          c.usagePct ||
-          (c.total > 0 ? Math.min(100, (c.used / c.total) * 100) : 0),
-        available: true,
-        source: "signals",
-      };
-      syncContextLabels();
-    }
-    const bodyLines = [
-      tr("status.contextUsed", {
-        used: c.used.toLocaleString(),
-        total: c.total.toLocaleString(),
-        pct:
-          c.usagePct ||
-          (c.total > 0 ? Math.round((c.used / c.total) * 100) : 0),
-      }),
-      tr("status.contextFree", { free: c.freeTokens.toLocaleString() }),
-      tr("status.contextSystem", {
-        tokens: c.systemPromptTokens.toLocaleString(),
-      }),
-      tr("status.contextTools", {
-        count: c.toolDefinitionsCount,
-        tokens: c.toolDefinitionsTokens.toLocaleString(),
-      }),
-      tr("status.contextMessages", {
-        count: c.messageCount,
-        tokens: c.messageTokens.toLocaleString(),
-      }),
-      tr("status.contextTurnsTools", {
-        turns: c.turnCount,
-        tools: c.toolCallCount,
-        compact: c.compactionCount,
-      }),
-      tr("status.autoCompactAt", {
-        pct: c.autoCompactThresholdPercent || 85,
-      }),
-    ];
-    if (c.usageCategories?.length) {
-      bodyLines.push("", tr("status.categoriesHeader"));
-      for (const cat of c.usageCategories) {
-        const detail = cat.detail ? ` (${cat.detail})` : "";
-        bodyLines.push(
-          `  ${cat.label}${detail}: ${cat.tokens.toLocaleString()}`,
-        );
-      }
-    }
-    bodyLines.push("", tr("context.tipCompact"));
-    openModal(
-      tr("context.title"),
-      `<pre class="slash-status-pre">${esc(bodyLines.join("\n"))}</pre>
-       <div class="prompt-dlg-actions">
-         <button type="button" class="btn-ghost" id="prompt-dlg-cancel">${esc(tr("context.close"))}</button>
-       </div>`,
-    );
-    $("prompt-dlg-cancel").onclick = () => closeModal();
-    return { ok: true };
-  }
-
-  await refreshContextUsage();
-  const u = lastContextUsage;
-  if (!u || !u.available) {
-    openModal(
-      tr("context.title"),
-      `<p class="prompt-dlg-hint">${esc(tr("context.noData"))}</p>
-       <pre class="slash-status-pre">${esc(tr("context.sessionLine", { id: activeSessionId }))}</pre>
-       <div class="prompt-dlg-actions">
-         <button type="button" class="btn-ghost" id="prompt-dlg-cancel">${esc(tr("context.close"))}</button>
-       </div>`,
-    );
-    $("prompt-dlg-cancel").onclick = () => closeModal();
-    return { ok: true };
-  }
-  const pathLine = u.path ? tr("chat.contextPathLine", { path: u.path }) : "";
-  const body = tr("chat.contextDetail", {
-    usedK: formatTokenK(u.used),
-    used: u.used.toLocaleString(),
-    totalK: formatTokenK(u.total),
-    total: u.total.toLocaleString(),
-    percent: u.percent.toFixed(2),
-    source: u.source,
-    pathLine,
-  });
-  openModal(
-    tr("context.title"),
-    `<pre class="slash-status-pre">${esc(body)}</pre>
-     <div class="prompt-dlg-actions">
-       <button type="button" class="btn-ghost" id="prompt-dlg-cancel">${esc(tr("context.close"))}</button>
-     </div>`,
-  );
-  $("prompt-dlg-cancel").onclick = () => closeModal();
-  return { ok: true };
+/** 兼容旧 getLastContextUsage() 读写 */
+function getLastContextUsage(): ContextUsageRow | null {
+  return ensureContextUi().getLast();
+}
+function setLastContextUsage(row: ContextUsageRow | null): void {
+  ensureContextUi().setLast(row);
 }
 
 function setEffortLevel(level: EffortLevel): void {
@@ -4193,13 +3402,6 @@ function setModelId(id: string): void {
   syncModelLabels();
 }
 
-function parseEffort(v?: string | null): EffortLevel | null {
-  const e = (v ?? "").trim().toLowerCase();
-  if (e === "low" || e === "medium" || e === "high" || e === "xhigh") return e;
-  return null;
-}
-
-/** 欢迎页 / 新对话：chip 回到默认模型 */
 function applyDefaultToChip(): void {
   modelLabel = defaultModelLabel || "grok";
   effortLevel = defaultEffortLevel;
@@ -4219,348 +3421,49 @@ function applyThreadToChip(t: {
   void ensureChipModelAvailable({ toast: Boolean(m) });
 }
 
-/** agent 因 harness 不兼容拒绝热切换（对齐 CLI：需新会话） */
-function isModelSwitchNeedsNewSession(err?: {
-  message?: string;
-  details?: unknown;
-}): boolean {
-  if (!err) return false;
-  const msg = err.message ?? "";
-  if (/MODEL_SWITCH_INCOMPATIBLE_AGENT/i.test(msg)) return true;
-  if (/start a new session/i.test(msg) && /model/i.test(msg)) return true;
-  if (/requires agent/i.test(msg) && /active agent/i.test(msg)) return true;
-  if (/Cannot switch to model/i.test(msg)) return true;
-
-  const walk = (v: unknown, depth = 0): boolean => {
-    if (!v || depth > 4) return false;
-    if (typeof v === "string") {
-      return (
-        v === "MODEL_SWITCH_INCOMPATIBLE_AGENT" ||
-        v === "start_new_session" ||
-        /MODEL_SWITCH_INCOMPATIBLE/i.test(v)
-      );
-    }
-    if (typeof v !== "object") return false;
-    const o = v as Record<string, unknown>;
-    if (
-      o.code === "MODEL_SWITCH_INCOMPATIBLE_AGENT" ||
-      o.suggestion === "start_new_session"
-    ) {
-      return true;
-    }
-    if (o.data != null && walk(o.data, depth + 1)) return true;
-    if (o.details != null && walk(o.details, depth + 1)) return true;
-    return false;
-  };
-  return walk(err.details);
-}
-
-/**
- * 对齐 CLI「Start a new session with &lt;model&gt;」：
- * 结束当前会话 UI，用目标模型新建空会话（不自动发消息）。
- */
 async function startFreshSessionWithModel(
   modelId: string,
   effort: EffortLevel,
 ): Promise<{ ok: boolean; message?: string }> {
-  const p = selectedProject();
-  const noProject = !p && !selectedProjectId;
-  const cwd = activeCwd || p?.path;
-  if (!cwd && !noProject) {
-    return { ok: false, message: tr("model.needProject") };
-  }
-  // 先干净离开旧 live（保持项目 cwd 选中），再 create 空会话
-  const keepProjectId = selectedProjectId;
-  const keepCwd = cwd;
-  // 保留旧会话 L1 队列；新会话空队列
-  await leaveCurrentSessionToWelcome({ clearQueue: false });
-  if (keepProjectId) selectedProjectId = keepProjectId;
-  else {
-    selectedProjectId = null;
-    projectChoiceTouched = true;
-  }
-  if (keepCwd) setActiveCwd(keepCwd);
-  clearPromptHistoryStore();
-
-  setModelId(modelId);
-  setEffortLevel(effort);
-  setWelcomeTitle();
-  showWelcome(false);
-  clearTranscript();
-
-  const res = await inv<{
-    threadId: string;
-    sessionId: string;
-    cwd: string;
-  }>("threads.create", {
-    cwd: keepCwd,
-    projectId: keepProjectId ?? p?.id,
-    noProject: noProject || undefined,
-    title: `新会话 · ${shortModelName(modelId)}`.slice(0, 48),
-    model: modelId,
+  return ensureModelSessionActions().startFreshSessionWithModel(
+    modelId,
     effort,
-    maxTurns: maxTurnsLimit ?? undefined,
-    alwaysApprove: accessMode === "always_approve",
-    plan: isPlanOn(),
-    // 兼容字段：展示用派生 mode
-    mode: isPlanOn()
-      ? "plan"
-      : accessMode === "always_approve"
-        ? "always_approve"
-        : "normal",
-  });
-
-  if (!res.ok) {
-    showWelcome(true);
-    return {
-      ok: false,
-      message: res.error?.message ?? tr("model.createFailed"),
-    };
-  }
-
-  activeThreadId = res.data!.threadId;
-  activeSessionId = res.data!.sessionId;
-  syncChatTopTitle();
-  setActiveCwd(res.data!.cwd);
-  sidePane?.onSessionChanged();
-  if (p?.id) selectedProjectId = p.id;
-  else {
-    selectedProjectId = null;
-    projectChoiceTouched = true;
-    expandedProjectIds.add(CHATS_GROUP_ID);
-  }
-  suspendLiveTranscript = false;
-  clearTranscript();
-  showWelcome(false);
-  startContextPolling();
-  await refreshProjectsAndThreads();
-  ($("chat-input") as HTMLTextAreaElement | null)?.focus();
-  return {
-    ok: true,
-    message: `已用 ${modelId} 开启新会话（未复制历史，对齐 CLI）`,
-  };
+  );
 }
 
-/**
- * 对齐 CLI `/model` `/effort`：
- * - 无会话：只改本地默认
- * - 有会话且 harness 兼容：session/set_model 热切换
- * - harness 不兼容（已有 turn）：弹窗询问是否新会话（对齐 CLI 截图）
- */
 async function applySessionModelAndEffort(opts?: {
   modelId?: string;
   effort?: EffortLevel;
-  /** 仅改 effort / 仅改 model 时的 toast 文案侧重点 */
   focus?: "model" | "effort" | "both";
 }): Promise<{ ok: boolean; message?: string }> {
-  const prevModel = modelLabel;
-  const prevEffort = effortLevel;
-  const nextModel = (opts?.modelId ?? modelLabel).trim() || modelLabel;
-  const nextEffort = opts?.effort ?? effortLevel;
-
-  // 乐观更新 chip
-  if (opts?.modelId) setModelId(opts.modelId);
-  if (opts?.effort) setEffortLevel(opts.effort);
-
-  const revert = () => {
-    setModelId(prevModel);
-    setEffortLevel(prevEffort);
-  };
-
-  const hasLiveSession = Boolean(
-    activeSessionId && (activeThreadId || activeCwd),
-  );
-  if (!hasLiveSession) {
-    // 无会话：改的是「新对话默认」，并同步 chip
-    // 对齐 CLI `/model` → SetDefaultModel：纯改模型时写入 [models].default
-    if (opts?.modelId) {
-      defaultModelLabel = modelLabel;
-      try {
-        const persist = await inv<{ defaultModel: string }>(
-          "providers.setDefault",
-          { modelId: modelLabel },
-        );
-        if (persist.ok) {
-          modelsCache = null; // 下次拉列表刷新 isDefault
-        }
-      } catch {
-        /* 内存默认仍生效；持久化失败不挡 chip */
-      }
-    }
-    if (opts?.effort) defaultEffortLevel = effortLevel;
-    const focus = opts?.focus ?? "both";
-    if (focus === "effort") {
-      return {
-        ok: true,
-        message: `默认推理 → ${effortLabel()}（${effortLevel}）；将用于新会话`,
-      };
-    }
-    if (focus === "model") {
-      return {
-        ok: true,
-        message: tr("model.defaultPersisted", { model: modelLabel }),
-      };
-    }
-    return {
-      ok: true,
-      message: tr("model.defaultPersisted", { model: modelLabel }),
-    };
-  }
-
-  if (turnActive) {
-    revert();
-    return {
-      ok: false,
-      message: tr("model.waitTurn"),
-    };
-  }
-
-  const threadId = await ensureLiveThread();
-  if (!threadId) {
-    // 无法附着：保留本地 chip，用于下次 create；不强制回退
-    return {
-      ok: true,
-      message: tr("mode.attachFail"),
-    };
-  }
-
-  const res = await inv<{ modelId: string; effort?: string; sessionId: string }>(
-    "threads.setModel",
-    {
-      threadId,
-      modelId: nextModel,
-      effort: nextEffort,
-    },
-  );
-
-  if (res.ok) {
-    const focus = opts?.focus ?? "both";
-    if (focus === "effort") {
-      return {
-        ok: true,
-        message: `本会话推理 → ${effortLabel()}（${effortLevel}）`,
-      };
-    }
-    if (focus === "model") {
-      return {
-        ok: true,
-        message: `本会话模型 → ${modelLabel}`,
-      };
-    }
-    return {
-      ok: true,
-      message: `本会话已切换：${modelLabel} · ${effortLabel()}`,
-    };
-  }
-
-  // 对齐 CLI：跨 harness 且已有对话 → 询问是否新会话
-  if (isModelSwitchNeedsNewSession(res.error)) {
-    const displayName = shortModelName(nextModel);
-    const ok = await confirmText({
-      title: tr("model.newSessionTitle"),
-      message: `切换到 ${nextModel} 需要开启新会话（与 CLI 一致：当前会话的 agent 类型不兼容）。\n\n是：用 ${displayName} 新建会话（不复制历史）\n否：留在当前会话`,
-      okLabel: tr("model.newSessionOk"),
-      cancelLabel: tr("model.stayCurrent"),
-    });
-    if (!ok) {
-      revert();
-      return { ok: true, message: tr("model.keepCurrent") };
-    }
-    return startFreshSessionWithModel(nextModel, nextEffort);
-  }
-
-  revert();
-  return {
-    ok: false,
-    message: res.error?.message ?? tr("model.switchFailed"),
-  };
+  return ensureModelSessionActions().applySessionModelAndEffort(opts);
 }
 
-/** 自定义模型 id（高级） */
 async function promptSetModel(): Promise<{ ok: boolean; message?: string }> {
-  const next = await promptText({
-    title: tr("model.customTitle"),
-    hint: tr("model.customHint"),
-    defaultValue: modelLabel,
-    placeholder: tr("model.customPh"),
-  });
-  if (next == null) return { ok: true };
-  const v = next.trim();
-  if (!v) return { ok: false, message: tr("model.empty") };
-  return applySessionModelAndEffort({ modelId: v, focus: "model" });
+  return ensureModelSessionActions().promptSetModel();
 }
 
 async function promptSetEffort(): Promise<{ ok: boolean; message?: string }> {
-  return new Promise((resolve) => {
-    openModal(
-      tr("slash.effort"),
-      `<p class="prompt-dlg-hint">对齐 CLI <code>/effort</code>：low / medium / high / xhigh。已打开会话时立即热切换。</p>
-       <div class="effort-pick-list" id="effort-pick-list">
-         ${effortOptions().map(
-           (e) =>
-             `<button type="button" class="menu-item effort-pick${e.id === effortLevel ? " is-checked" : ""}" data-effort="${e.id}">
-               <span>${esc(e.label)} <span class="slash-item-desc">(${esc(e.id)})</span></span>
-               <span class="menu-check">${e.id === effortLevel ? "✓" : ""}</span>
-             </button>`,
-         ).join("")}
-       </div>
-       <div class="prompt-dlg-actions">
-         <button type="button" class="btn-ghost" id="prompt-dlg-cancel">取消</button>
-       </div>`,
-    );
-    $("prompt-dlg-cancel").onclick = () => {
-      closeModal();
-      resolve({ ok: true });
-    };
-    for (const btn of Array.from(
-      document.querySelectorAll("#effort-pick-list [data-effort]"),
-    )) {
-      (btn as HTMLElement).onclick = () => {
-        const id = (btn as HTMLElement).dataset.effort as EffortLevel;
-        if (!id) return;
-        closeModal();
-        void applySessionModelAndEffort({ effort: id, focus: "effort" }).then(
-          resolve,
-        );
-      };
-    }
-  });
+  return ensureModelSessionActions().promptSetEffort();
 }
 
-type ModelRow = {
-  id: string;
-  name?: string;
-  isDefault?: boolean;
-  source?: "official" | "custom";
-};
 
-/**
- * 渲染侧**禁止**硬编码官方模型表。
- * 无缓存 / 请求失败时用空表，等 Host `models.list`（已按登录态过滤）。
- */
-const FALLBACK_MODELS: ModelRow[] = [];
 
-/** 渲染侧缓存：点 chip 不阻塞等待 grok models */
-let modelsCache: ModelRow[] | null = null;
-let modelsFetch: Promise<ModelRow[]> | null = null;
-let modelMenuSeq = 0;
+/** 兼容旧代码对 modelsCache 的读写（实际缓存在 ModelMenuController） */
+function getModelsCache(): ModelRow[] | null {
+  return ensureModelMenu().cache();
+}
+function setModelsCache(list: ModelRow[] | null): void {
+  ensureModelMenu().setCache(list);
+}
 
 /** 登录/登出后丢弃缓存，强制重新拉可见 catalog */
 function invalidateModelsCache(): void {
-  modelsCache = null;
-  modelsFetch = null;
+  ensureModelMenu().invalidateCache();
 }
 
 function hideModelMenu(): void {
-  modelMenuSeq += 1;
-  $("model-menu").classList.add("hidden");
-  $("model-menu").innerHTML = "";
-  $("model-menu").classList.remove("flyout-left");
-}
-
-function modelsForMenu(list: ModelRow[]): ModelRow[] {
-  // 不再把「已从目录消失」的幽灵 id 塞回菜单（删提供商后的假选项）
-  return list.map((m) => ({ ...m }));
+  ensureModelMenu().hideMenu();
 }
 
 /** 设置 / 插件全页是否盖住主壳（此时勿 setModel、勿抢焦点） */
@@ -4577,432 +3480,45 @@ function isMainShellOverlayOpen(): boolean {
  */
 async function ensureChipModelAvailable(opts?: {
   toast?: boolean;
-  /** 全页设置打开时禁止 setModel（延后到 onClosed） */
   allowSetModel?: boolean;
-  /** 登录/登出后强制重新拉 list */
   force?: boolean;
 }): Promise<boolean> {
-  const want = (modelLabel || "").trim();
-  const list = await fetchModelsList(
-    opts?.force ? { force: true } : undefined,
-  );
-  if (want && list.some((m) => m.id === want)) return true;
-  const prev = want || "(empty)";
-  const preferred =
-    (defaultModelLabel || "").trim() ||
-    list.find((m) => m.isDefault)?.id?.trim() ||
-    list[0]?.id?.trim() ||
-    "";
-  // 默认本身也可能已从目录消失时，再落到列表首项；禁止幽灵 "grok"
-  const resolved = list.some((m) => m.id === preferred)
-    ? preferred
-    : list[0]?.id?.trim() || "";
-  if (resolved === want) return true;
-  modelLabel = resolved;
-  if (resolved) defaultModelLabel = resolved;
-  syncModelLabels();
-  // 设置/插件盖住主壳时只改 chip，不打 setModel（避免与 inert 恢复竞态）
-  const canSetModel =
-    opts?.allowSetModel !== false && !isMainShellOverlayOpen();
-  if (
-    canSetModel &&
-    resolved &&
-    activeThreadId &&
-    !activeThreadId.startsWith("disk_") &&
-    activeSessionId
-  ) {
-    void inv("threads.setModel", {
-      threadId: activeThreadId,
-      modelId: resolved,
-      effort: effortLevel,
-    }).catch(() => undefined);
-  }
-  if (
-    opts?.toast &&
-    want &&
-    want !== resolved &&
-    resolved &&
-    !isMainShellOverlayOpen()
-  ) {
-    showToast(tr("model.unavailableFallback", { prev, next: resolved }));
-  }
-  return false;
-}
-
-function shortModelName(id: string = modelLabel): string {
-  const mid = (id || "grok").trim();
-  let short = modelDisplayName(mid);
-  if (short === mid && /^grok-/i.test(short)) {
-    short = short.replace(/^grok-/i, "");
-  }
-  if (short.length > 18) short = short.slice(0, 16) + "…";
-  return short;
+  return ensureModelMenu().ensureChipAvailable(opts);
 }
 
 function fetchModelsList(opts?: { force?: boolean }): Promise<ModelRow[]> {
-  if (opts?.force) {
-    modelsCache = null;
-    modelsFetch = null;
-  }
-  if (modelsFetch) return modelsFetch;
-  modelsFetch = inv<ModelRow[]>("models.list")
-    .then((r) => {
-      // 空列表合法（未登录且无自定义）；勿回落幽灵官方表
-      const list = Array.isArray(r.data) ? r.data : [];
-      modelsCache = list;
-      // 列表带上 display name 后刷新 chip（否则仍显示 id）
-      syncModelLabels();
-      return list;
-    })
-    .catch(() => modelsCache ?? FALLBACK_MODELS)
-    .finally(() => {
-      modelsFetch = null;
-    });
-  return modelsFetch;
+  return ensureModelMenu().fetchList(opts);
 }
 
 /** 启动后预取，首点 chip 也尽量命中缓存 */
 function prefetchModelsList(): void {
-  void fetchModelsList();
-}
-
-/** 模型菜单行（对齐 CLI catalog：官方 / 自定义分组） */
-function modelMenuItemHtml(m: ModelRow): string {
-  const on = m.id === modelLabel;
-  const name = m.name || m.id;
-  return `<button type="button" class="menu-item${on ? " is-checked" : ""}" data-model="${esc(m.id)}" role="menuitem">
-        <span>${esc(name)}</span>
-        <span class="menu-check" aria-hidden="true">✓</span>
-      </button>`;
-}
-
-/**
- * Codex 式：主面板 = 推理 + 当前模型行(>)；
- * 模型侧栏默认收起，点击模型行才展开。
- * 侧栏按官方 / 自定义分组（对齐 CLI 鉴权语义，非 Leader 内部结构）。
- */
-function modelMenuHtml(models: ModelRow[], flyoutOpen: boolean): string {
-  const effortHtml = effortOptions().map((e) => {
-    const on = e.id === effortLevel;
-    return `<button type="button" class="menu-item${on ? " is-checked" : ""}" data-effort="${e.id}" role="menuitem">
-      <span>${esc(e.label)}</span>
-      <span class="menu-check" aria-hidden="true">✓</span>
-    </button>`;
-  }).join("");
-
-  const official = models.filter((m) => m.source !== "custom");
-  const custom = models.filter((m) => m.source === "custom");
-  let modelHtml = "";
-  if (official.length && custom.length) {
-    modelHtml += `<div class="menu-section-label">${esc(tr("model.groupOfficial"))}</div>`;
-    modelHtml += official.map(modelMenuItemHtml).join("");
-    modelHtml += `<div class="menu-section-label">${esc(tr("model.groupCustom"))}</div>`;
-    modelHtml += custom.map(modelMenuItemHtml).join("");
-  } else {
-    modelHtml = models.map(modelMenuItemHtml).join("");
-  }
-
-  return `
-    <div class="model-menu-primary">
-      <div class="menu-section-label">推理</div>
-      ${effortHtml}
-      <button type="button" class="menu-item model-menu-trigger${flyoutOpen ? " is-open" : ""}" data-open-models role="menuitem" aria-haspopup="true" aria-expanded="${flyoutOpen ? "true" : "false"}">
-        <span class="model-trigger-name">${esc(shortModelName())}</span>
-        <span class="menu-chevron" aria-hidden="true">›</span>
-      </button>
-    </div>
-    <div class="model-menu-flyout${flyoutOpen ? "" : " hidden"}" role="menu" aria-label="${tr("model.pick")}">
-      ${official.length && custom.length ? "" : `<div class="menu-section-label">模型</div>`}
-      ${modelHtml}
-      <button type="button" class="menu-item" data-model-custom role="menuitem">
-        <span>自定义…</span>
-        <span class="menu-check"></span>
-      </button>
-    </div>`;
-}
-
-function isModelFlyoutOpen(menu: HTMLElement): boolean {
-  const flyout = menu.querySelector(".model-menu-flyout");
-  return Boolean(flyout && !flyout.classList.contains("hidden"));
-}
-
-function setModelFlyoutOpen(menu: HTMLElement, open: boolean): void {
-  const flyout = menu.querySelector(".model-menu-flyout") as HTMLElement | null;
-  const trigger = menu.querySelector("[data-open-models]") as HTMLElement | null;
-  if (flyout) flyout.classList.toggle("hidden", !open);
-  if (trigger) {
-    trigger.classList.toggle("is-open", open);
-    trigger.setAttribute("aria-expanded", open ? "true" : "false");
-  }
-}
-
-function positionModelMenu(anchor: HTMLElement, menu: HTMLElement): void {
-  const r = anchor.getBoundingClientRect();
-  const primary = menu.querySelector(".model-menu-primary") as HTMLElement | null;
-  const flyout = menu.querySelector(".model-menu-flyout") as HTMLElement | null;
-  const flyoutOpen = Boolean(flyout && !flyout.classList.contains("hidden"));
-  const pw = primary?.offsetWidth || 160;
-  const ph = primary?.offsetHeight || 200;
-  const fw = flyoutOpen ? flyout?.offsetWidth || 180 : 0;
-
-  // 主面板贴 chip 上方或下方（右对齐）
-  let left = r.right - pw;
-  if (left < 8) left = 8;
-  const spaceBelow = window.innerHeight - r.bottom;
-  let top: number;
-  if (spaceBelow < ph + 12 && r.top > ph + 12) {
-    top = Math.max(8, r.top - ph - 6);
-  } else {
-    top = r.bottom + 6;
-  }
-  // 侧栏展开时：优先开在主面板左侧（chip 在右下）；空间不够再开右边
-  const openLeft =
-    flyoutOpen &&
-    left + pw + 8 + fw > window.innerWidth - 8 &&
-    left - 8 - fw >= 8;
-  menu.classList.toggle("flyout-left", openLeft);
-  if (openLeft) {
-    const total = pw + 8 + fw;
-    left = Math.max(8, r.right - total);
-  }
-  menu.style.left = `${left}px`;
-  menu.style.top = `${top}px`;
-}
-
-function bindModelMenuClicks(menu: HTMLElement, anchor: HTMLElement, seq: number): void {
-  menu.onclick = (e) => {
-    const t = (e.target as HTMLElement).closest(
-      "[data-effort], [data-model], [data-model-custom], [data-open-models]",
-    ) as HTMLElement | null;
-    if (!t) return;
-    if (t.hasAttribute("data-open-models")) {
-      // Codex：点模型行才展开/收起侧栏
-      const next = !isModelFlyoutOpen(menu);
-      setModelFlyoutOpen(menu, next);
-      positionModelMenu(anchor, menu);
-      return;
-    }
-    if (t.dataset.effort) {
-      const id = t.dataset.effort as EffortLevel;
-      // 先更新 UI ✓，再热切换
-      setEffortLevel(id);
-      if (seq === modelMenuSeq) {
-        const open = isModelFlyoutOpen(menu);
-        menu.innerHTML = modelMenuHtml(
-          modelsForMenu(modelsCache ?? FALLBACK_MODELS),
-          open,
-        );
-        positionModelMenu(anchor, menu);
-        bindModelMenuClicks(menu, anchor, seq);
-      }
-      void applySessionModelAndEffort({ effort: id, focus: "effort" }).then(
-        (res) => {
-          if (res.message) showToast(res.message, res.ok ? "info" : "error");
-        },
-      );
-      return;
-    }
-    if (t.hasAttribute("data-model-custom")) {
-      hideModelMenu();
-      void promptSetModel().then((res) => {
-        if (res.message) showToast(res.message, res.ok ? "info" : "error");
-      });
-      return;
-    }
-    if (t.dataset.model) {
-      const mid = t.dataset.model;
-      hideModelMenu();
-      void applySessionModelAndEffort({ modelId: mid, focus: "model" }).then(
-        (res) => {
-          if (res.message) showToast(res.message, res.ok ? "info" : "error");
-        },
-      );
-    }
-  };
+  ensureModelMenu().prefetch();
 }
 
 /** 同步立刻弹出（用缓存/回退）；模型列表后台刷新 */
 function showModelMenu(anchor: HTMLElement): void {
-  $("perm-menu").classList.add("hidden");
-  const menu = $("model-menu");
-  const seq = ++modelMenuSeq;
-
-  const paint = (list: ModelRow[], keepFlyout?: boolean) => {
-    if (seq !== modelMenuSeq) return;
-    const open = keepFlyout ? isModelFlyoutOpen(menu) : false;
-    menu.innerHTML = modelMenuHtml(modelsForMenu(list), open);
-    menu.classList.remove("hidden");
-    positionModelMenu(anchor, menu);
-    bindModelMenuClicks(menu, anchor, seq);
-  };
-
-  // 首帧：仅主菜单（侧栏收起）
-  paint(modelsCache ?? FALLBACK_MODELS, false);
-
-  // 后台刷新模型列表；若用户已展开侧栏则保持
-  void fetchModelsList().then((list) => {
-    if (seq !== modelMenuSeq) return;
-    if (menu.classList.contains("hidden")) return;
-    paint(list, true);
-  });
+  ensureModelMenu().showMenu(anchor);
 }
 
 function currentGoalTitle(): string | null {
-  return goalProjection?.objective || pendingGoalTitle;
+  return ensureGoalBanner().currentTitle();
 }
 
 function goalPaused(): boolean {
-  if (!goalProjection) return false;
-  const s = goalProjection.status;
-  return (
-    s === "user_paused" ||
-    s === "back_off_paused" ||
-    s === "no_progress_paused" ||
-    s === "infra_paused" ||
-    s === "blocked" ||
-    s === "budget_limited"
-  );
+  return ensureGoalBanner().paused();
 }
 
 function goalCompleted(): boolean {
-  return goalProjection?.status === "complete";
+  return ensureGoalBanner().completed();
 }
 
-function parseGoalUiStatus(raw: string): GoalUiStatus | "cleared" {
-  const s = String(raw ?? "")
-    .toLowerCase()
-    .trim();
-  switch (s) {
-    case "active":
-      return "active";
-    case "user_paused":
-    case "paused":
-      return "user_paused";
-    case "back_off_paused":
-      return "back_off_paused";
-    case "no_progress_paused":
-      return "no_progress_paused";
-    case "infra_paused":
-      return "infra_paused";
-    case "blocked":
-      return "blocked";
-    case "budget_limited":
-      return "budget_limited";
-    case "complete":
-    case "completed":
-      return "complete";
-    case "cleared":
-    case "cancelled":
-    case "canceled":
-      return "cleared";
-    default:
-      return s ? "user_paused" : "user_paused";
-  }
-}
-
-function goalStatusKicker(st: GoalUiStatus): string {
-  switch (st) {
-    case "complete":
-      return tr("goal.kickerDone");
-    case "user_paused":
-      return tr("goal.kickerPaused");
-    case "back_off_paused":
-      return tr("goal.kickerBackOff");
-    case "no_progress_paused":
-      return tr("goal.kickerNoProgress");
-    case "infra_paused":
-      return tr("goal.kickerInfra");
-    case "blocked":
-      return tr("goal.kickerBlocked");
-    case "budget_limited":
-      return tr("goal.kickerBudget");
-    case "active":
-    default: {
-      if (goalProjection?.verifyingCompletion) return tr("goal.kickerVerifying");
-      if (goalProjection?.planning || goalProjection?.phase === "planning") {
-        return tr("goal.kickerPlanning");
-      }
-      return tr("goal.kicker");
-    }
-  }
-}
-
-/**
- * paused 状态的短提示（仅 i18n，不展示 agent pauseMessage / 错误全文）。
- * 目标条不挂错误文案；详细原因走 toast / resume 按钮 title。
- */
-function goalPauseHintText(st: GoalUiStatus): string {
-  switch (st) {
-    case "user_paused":
-      return tr("goal.hintUserPaused");
-    case "back_off_paused":
-      return tr("goal.hintBackOff");
-    case "no_progress_paused":
-      return tr("goal.hintNoProgress");
-    case "infra_paused":
-      return tr("goal.hintInfra");
-    case "blocked":
-      return tr("goal.hintBlocked");
-    case "budget_limited":
-      return tr("goal.hintBudget");
-    default:
-      return "";
-  }
-}
-
-/**
- * 声明输入栏 chip 互斥焦点（后激活优先），并刷新 chip。
- * 开 plan → focus plan（隐藏 goal chip）；开 goal → focus goal（隐藏 plan chip）。
- */
 function setSessionModeChipFocus(focus: SessionModeChipFocus): void {
-  sessionModeChipFocus = focus;
-  syncSessionModeChips();
+  ensureSessionPolicy().setChipFocus(focus);
 }
 
 /** 输入栏：计划 / 目标 chip **互斥**（只显示 focus 一侧） */
 function syncSessionModeChips(): void {
-  const planOn = isPlanOn();
-  const goalTitle = currentGoalTitle();
-  // /goal 进入编写态即算 goal 侧可见
-  const goalOn = Boolean(goalTitle) || goalComposeActive;
-
-  // 焦点与真实状态对齐：关掉的一侧不能继续占 focus
-  if (sessionModeChipFocus === "goal" && !goalOn) {
-    sessionModeChipFocus = planOn ? "plan" : null;
-  } else if (sessionModeChipFocus === "plan" && !planOn) {
-    sessionModeChipFocus = goalOn ? "goal" : null;
-  } else if (sessionModeChipFocus == null) {
-    // 冷加载 / 切会话：有哪侧亮就显示哪侧；两侧都亮时默认 goal
-    if (goalOn && planOn) sessionModeChipFocus = "goal";
-    else if (goalOn) sessionModeChipFocus = "goal";
-    else if (planOn) sessionModeChipFocus = "plan";
-  }
-
-  // 严格互斥：两侧都 on 时只显示 focus
-  const showGoal = goalOn && sessionModeChipFocus === "goal";
-  const showPlan = planOn && sessionModeChipFocus === "plan";
-
-  for (const id of ["chip-plan", "chip-plan-2"] as const) {
-    const el = document.getElementById(id);
-    if (!el) continue;
-    el.classList.toggle("hidden", !showPlan);
-    el.title = planOn ? tr("plan.modeChipOpen") : tr("plan.modeChip");
-  }
-  syncPlanPanelChrome();
-  for (const id of ["chip-goal", "chip-goal-2"] as const) {
-    const el = document.getElementById(id);
-    if (!el) continue;
-    el.classList.toggle("hidden", !showGoal);
-    el.classList.toggle("is-draft", goalComposeActive && !goalTitle);
-    if (goalTitle) {
-      const prefix = goalCompleted()
-        ? tr("goal.kickerDone")
-        : tr("composer.goal");
-      el.title = `${prefix}: ${goalTitle}`;
-    } else if (goalComposeActive) {
-      el.title = tr("goal.bannerActive");
-    }
-  }
+  ensureSessionPolicy().syncChips();
 }
 
 /**
@@ -5013,721 +3529,54 @@ async function syncSessionPolicyLive(opts?: {
   plan?: boolean;
   alwaysApprove?: boolean;
 }): Promise<{ ok: boolean; message?: string }> {
-  const plan = opts?.plan ?? isPlanOn();
-  const alwaysApprove =
-    opts?.alwaysApprove ?? accessMode === "always_approve";
-  if (!activeSessionId && !activeThreadId) {
-    // 尚无会话：仅 UI 标记，create 时带 meta
-    return { ok: true };
-  }
-  if (!activeCwd && activeSessionId) {
-    const row = threads.find((t) => t.sessionId === activeSessionId);
-    if (row?.cwd) setActiveCwd(row.cwd);
-  }
-  const threadId = await ensureLiveThread();
-  if (!threadId) {
-    return {
-      ok: false,
-      message: tr("mode.attachFail"),
-    };
-  }
-  const r = await inv("threads.setMode", {
-    threadId,
-    plan,
-    alwaysApprove,
-  });
-  if (!r.ok) {
-    return {
-      ok: false,
-      message: r.error?.message ?? tr("mode.syncFail"),
-    };
-  }
-  return { ok: true };
+  return ensureSessionPolicy().syncLive(opts);
 }
 
 /** @deprecated 兼容旧调用名 → 两维 sync */
 async function setThreadModeLive(
   mode: "plan" | "normal" | "always_approve",
 ): Promise<{ ok: boolean; message?: string }> {
-  if (mode === "plan") {
-    return syncSessionPolicyLive({ plan: true });
-  }
-  if (mode === "always_approve") {
-    return syncSessionPolicyLive({ plan: isPlanOn(), alwaysApprove: true });
-  }
-  // normal：仅关 plan？旧语义是整段重置。保留为关 plan + 默认确认。
-  return syncSessionPolicyLive({ plan: false, alwaysApprove: false });
+  return ensureSessionPolicy().setThreadModeLive(mode);
 }
 
 function exitPlanMode(): void {
-  if (!isPlanOn()) return;
-  planPhase = "off";
-  if (activeSessionId) {
-    patchSessionPlan(activeSessionId, {
-      planPhase: "off",
-      // 用户主动关模式：若仍有 exit_plan 挂起，保留 pending 供审批
-      pendingApproval: pendingPlanApproval,
-    });
-  }
-  // 退出 plan 不碰 accessMode（Build：yolo 标记在 plan 退出后重新露出）
-  // chip 互斥：plan 关后若仍有 goal，焦点回到 goal
-  if (sessionModeChipFocus === "plan") {
-    sessionModeChipFocus =
-      Boolean(currentGoalTitle()) || goalComposeActive ? "goal" : null;
-  }
-  syncPermLabels();
-  void syncSessionPolicyLive({ plan: false }).then((r) => {
-    if (!r.ok) {
-      showToast(r.message ?? tr("plan.exitSyncFail"), "error");
-    }
-  });
-  showToast(tr("plan.exited"));
+  ensureSessionPolicy().exitPlanMode();
 }
 
 /** 开启计划模式（UI + ACP session/set_mode plan）；保留当前 accessMode */
 async function enterPlanMode(): Promise<{ ok: boolean; message?: string }> {
-  planPhase = "pending";
-  if (activeSessionId) {
-    patchSessionPlan(activeSessionId, { planPhase: "pending" });
-  }
-  // UI 互斥：点 plan / /plan 时只显示 plan chip（goal 状态可仍在 banner）
-  sessionModeChipFocus = "plan";
-  syncPermLabels();
-  if (activeSessionId || activeThreadId) {
-    const r = await syncSessionPolicyLive({ plan: true });
-    if (!r.ok) {
-      planPhase = "off";
-      if (activeSessionId) {
-        patchSessionPlan(activeSessionId, { planPhase: "off" });
-      }
-      sessionModeChipFocus =
-        Boolean(currentGoalTitle()) || goalComposeActive ? "goal" : null;
-      syncPermLabels();
-      return {
-        ok: false,
-        message: r.message ?? tr("plan.markedSyncFail"),
-      };
-    }
-    // 已有会话：打开计划侧栏，便于立刻看/写 plan.md
-    if (activeSessionId) {
-      void openPlanPanel({ forceReload: true });
-    }
-  }
-  return {
-    ok: true,
-    message:
-      activeSessionId || activeThreadId
-        ? tr("plan.openedPending")
-        : tr("plan.openedNew"),
-  };
+  return ensureSessionPolicy().enterPlanMode();
 }
 
 /** /view-plan · chip：打开右栏计划面板（可编辑真源） */
 async function showViewPlan(): Promise<{ ok: boolean; message?: string }> {
-  if (!activeSessionId) {
-    return { ok: false, message: tr("plan.noSession") };
-  }
-  await openPlanPanel({ requestId: pendingPlanApproval?.requestId ?? null });
-  return { ok: true };
+  return ensureSessionPolicy().showViewPlan();
 }
 
 /**
- * 阶段一：把前台 plan 状态写入 per-session 投影（切走前调用）。
- * 对齐 CLI：切焦点不 resolve exit_plan waiter。
+ * 前台 plan 投影 / 侧栏面板 → PlanPanelUi。
+ * planPhase / pendingApproval 仍由 main 持有。
  */
-function snapshotActiveSessionPlan(
-  sessionId: string | null | undefined,
-): void {
-  const sid = sessionId?.trim();
-  if (!sid) return;
-  setSessionPlan(sid, {
-    planPhase,
-    pendingApproval: pendingPlanApproval
-      ? {
-          requestId: pendingPlanApproval.requestId,
-          sessionId: pendingPlanApproval.sessionId || sid,
-          planContent: pendingPlanApproval.planContent ?? "",
-        }
-      : null,
-  });
-}
-
-/**
- * 新建/切换会话时关闭计划侧栏，并清理前台 plan UI。
- * 默认 stash pending（不 abandoned）；硬离开且 abandonPending 时才 resolve waiter。
- */
-function closePlanPanelOnSessionChange(opts?: {
-  /** 写入 stash 的会话（切走时的 prev）；缺省用 pending/active */
+const snapshotActiveSessionPlan = (sessionId: string | null | undefined) =>
+  ensurePlanPanel().snapshotActive(sessionId);
+const closePlanPanelOnSessionChange = (opts?: {
   stashSessionId?: string | null;
-  /**
-   * true：对未决 exit_plan 发 abandoned（仅硬 detach / 删会话等）。
-   * false（默认）：只 stash，对齐方案 B 后台继续。
-   */
   abandonPending?: boolean;
-}): void {
-  const abandon = opts?.abandonPending === true;
-  const pending = pendingPlanApproval;
-  const stashSid =
-    (opts?.stashSessionId ?? pending?.sessionId ?? activeSessionId)?.trim() ||
-    null;
-
-  if (abandon && pending?.requestId) {
-    void inv("plans.respond", {
-      requestId: pending.requestId,
-      outcome: "abandoned",
-      sessionId: pending.sessionId,
-    });
-    if (stashSid) {
-      setSessionPlan(stashSid, {
-        planPhase: "off",
-        pendingApproval: null,
-      });
-    }
-  } else if (stashSid) {
-    // 先快照当前前台（含 pending），再清 UI
-    snapshotActiveSessionPlan(stashSid);
-  }
-
-  pendingPlanApproval = null;
-  planPhase = "off";
-  planPanelPath = null;
-  planPanelSavedContent = "";
-  planPanelBusy = false;
-  const ed = planEditorEl();
-  if (ed) ed.value = "";
-  const fb = planFeedbackEl();
-  if (fb) fb.value = "";
-  sidePane?.closePlanCategory();
-  syncPlanPanelChrome();
-  syncPlanRailActivity();
-}
-
-/**
- * 切回会话：从 per-session 投影恢复 planPhase / pending。
- * 有未决审批时打开计划侧栏（不抢其它会话焦点）。
- */
-async function rehydrateSessionPlan(
+}) => ensurePlanPanel().closeOnSessionChange(opts);
+const rehydrateSessionPlan = (
   sessionId: string,
   opts?: { viewGen?: number },
-): Promise<void> {
-  const sid = sessionId?.trim();
-  if (!sid) return;
-  const viewGen = opts?.viewGen;
-  const proj = getSessionPlan(sid);
-  planPhase = proj?.planPhase ?? "off";
-  pendingPlanApproval = proj?.pendingApproval
-    ? {
-        requestId: proj.pendingApproval.requestId,
-        sessionId: proj.pendingApproval.sessionId || sid,
-        planContent: proj.pendingApproval.planContent ?? "",
-      }
-    : null;
-  // 审批只属于该 session
-  if (
-    pendingPlanApproval &&
-    pendingPlanApproval.sessionId &&
-    pendingPlanApproval.sessionId !== sid
-  ) {
-    pendingPlanApproval = null;
-  }
-  syncPermLabels();
-  syncPlanPanelChrome();
-
-  if (!pendingPlanApproval?.requestId) return;
-  if (viewGen !== undefined && viewGen !== sessionViewGen) return;
-  if (activeSessionId !== sid) return;
-
-  await openPlanPanel({
-    requestId: pendingPlanApproval.requestId,
-    seedContent: pendingPlanApproval.planContent || null,
-    forceReload: true,
-    ownerSessionId: sid,
-  });
-  if (viewGen !== undefined && viewGen !== sessionViewGen) return;
-  if (activeSessionId !== sid) return;
-  setTurnStatus(tr("plan.awaiting") || "等待计划审批…");
-  showToast(tr("plan.reopenedAwaiting") || tr("plan.awaiting"), "info");
-}
-
-function planEditorEl(): HTMLTextAreaElement | null {
-  return document.getElementById("plan-panel-editor") as HTMLTextAreaElement | null;
-}
-
-function planFeedbackEl(): HTMLTextAreaElement | null {
-  return document.getElementById(
-    "plan-panel-feedback",
-  ) as HTMLTextAreaElement | null;
-}
-
-function planPanelDirty(): boolean {
-  const ed = planEditorEl();
-  if (!ed) return false;
-  return ed.value !== planPanelSavedContent;
-}
-
-function planPreviewEl(): HTMLElement | null {
-  return document.getElementById("plan-panel-preview");
-}
-
-/**
- * 方案 A：审批底栏仅在 exit_plan_mode reverse-RPC 挂起时可用。
- * 对齐 CLI PlanApprovalView（有 response_tx）；无 requestId 不显示 a/s/q。
- */
-function isPlanApprovalArmed(): boolean {
-  return Boolean(pendingPlanApproval?.requestId?.trim());
-}
-
-function syncPlanPanelChrome(): void {
-  const status = document.getElementById("plan-panel-status");
-  const pathEl = document.getElementById("plan-panel-path");
-  const empty = document.getElementById("plan-panel-empty");
-  const ed = planEditorEl();
-  const prev = planPreviewEl();
-  const modeBtn = document.getElementById("btn-plan-view-mode");
-  const footer = document.querySelector(
-    "#side-cat-plan .plan-panel-footer",
-  ) as HTMLElement | null;
-  const armed = isPlanApprovalArmed();
-  if (pathEl) {
-    pathEl.textContent = planPanelPath ?? tr("plan.noPlanMd");
-    pathEl.title = planPanelPath ?? "";
-  }
-  if (status) {
-    const bits: string[] = [];
-    if (isPlanOn()) {
-      bits.push(
-        planPhase === "pending"
-          ? "Pending"
-          : planPhase === "active"
-            ? "Active"
-            : tr("plan.modeChip"),
-      );
-    }
-    if (planPanelDirty()) bits.push(tr("plan.unsaved"));
-    if (armed) bits.push(tr("plan.awaiting"));
-    status.textContent = bits.join(" · ");
-  }
-  if (modeBtn) {
-    const isPreview = planPanelViewMode === "preview";
-    modeBtn.textContent = isPreview ? tr("common.source") : tr("common.preview");
-    modeBtn.title = tr("side.planToggleView");
-    modeBtn.setAttribute("aria-pressed", isPreview ? "true" : "false");
-  }
-  // 方案 A：无挂起 exit_plan 时隐藏批准/修改/放弃（非文档编辑区）
-  if (footer) {
-    footer.classList.toggle("hidden", !armed);
-    footer.setAttribute("aria-hidden", armed ? "false" : "true");
-  }
-  const text = ed?.value ?? "";
-  const hasBody = Boolean(text.trim()) || planPanelDirty();
-  empty?.classList.toggle("hidden", hasBody);
-  const showSource = planPanelViewMode === "source";
-  ed?.classList.toggle("hidden", !showSource || !hasBody);
-  prev?.classList.toggle("hidden", showSource || !hasBody);
-  // 预览模式下禁用保存焦点在编辑器；保存仍可用（写当前 draft）
-  if (ed) ed.readOnly = !showSource;
-  syncPlanRailActivity();
-}
-
-/** 右侧轨「计划」活动点：待批准 > 修订中 > 计划模式/有内容 */
-function syncPlanRailActivity(): void {
-  if (!sidePane) return;
-  const ed = planEditorEl();
-  const hasBody = Boolean((ed?.value ?? "").trim() || planPanelPath);
-  if (isPlanApprovalArmed()) {
-    sidePane.setPlanRailActivity("pending");
-    return;
-  }
-  const turn =
-    document.querySelector(".turn-status")?.textContent ??
-    document.getElementById("turn-status")?.textContent ??
-    "";
-  if (
-    isPlanOn() &&
-    (turn.includes(tr("plan.revising")) || /修订|revis/i.test(turn))
-  ) {
-    sidePane.setPlanRailActivity("revising");
-    return;
-  }
-  if (isPlanOn() || hasBody) {
-    sidePane.setPlanRailActivity("soft");
-    return;
-  }
-  sidePane.setPlanRailActivity("none");
-}
-
-/** 按当前 viewMode 刷新预览 DOM（从 editor 读源码） */
-function renderPlanPanelPreview(): void {
-  const ed = planEditorEl();
-  const prev = planPreviewEl();
-  if (!prev || !ed) return;
-  const raw = ed.value;
-  if (!raw.trim()) {
-    prev.innerHTML = "";
-    return;
-  }
-  try {
-    paintAssistantHtml(prev, raw, { highlight: true, cwd: activeCwd });
-  } catch {
-    prev.textContent = raw;
-  }
-}
-
-function setPlanPanelViewMode(mode: "source" | "preview"): void {
-  if (mode === planPanelViewMode) {
-    syncPlanPanelChrome();
-    return;
-  }
-  planPanelViewMode = mode;
-  if (mode === "preview") renderPlanPanelPreview();
-  syncPlanPanelChrome();
-}
-
-function bindPlanPanel(): void {
-  if (planPanelBound) return;
-  planPanelBound = true;
-  const ed = planEditorEl();
-  ed?.addEventListener("input", () => syncPlanPanelChrome());
-  document.getElementById("btn-plan-reload")?.addEventListener("click", () => {
-    void openPlanPanel({
-      requestId: pendingPlanApproval?.requestId ?? null,
-      forceReload: true,
-    });
-  });
-  document.getElementById("btn-plan-save")?.addEventListener("click", () => {
-    void savePlanPanel().then((ok) => {
-      if (ok) showToast(tr("plan.saved"));
-    });
-  });
-  document.getElementById("btn-plan-view-mode")?.addEventListener("click", () => {
-    setPlanPanelViewMode(
-      planPanelViewMode === "source" ? "preview" : "source",
-    );
-  });
-  document.getElementById("btn-plan-approve")?.addEventListener("click", () => {
-    void respondPlanPanel("approved");
-  });
-  document.getElementById("btn-plan-revise")?.addEventListener("click", () => {
-    void respondPlanPanel("cancelled");
-  });
-  document.getElementById("btn-plan-abandon")?.addEventListener("click", () => {
-    void respondPlanPanel("abandoned");
-  });
-  // Ctrl+S 在计划编辑器内保存
-  ed?.addEventListener("keydown", (e) => {
-    if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "s") {
-      e.preventDefault();
-      void savePlanPanel().then((ok) => {
-        if (ok) showToast(tr("plan.saved"));
-      });
-    }
-  });
-}
-
-/**
- * 打开右栏「计划」面板并加载 session plan.md。
- * 真源优先 session；空则镜像工作区 *plan* 产物。
- * ownerSessionId：审批归属会话（默认 active）；禁止把 pending 写到错误会话。
- */
-async function openPlanPanel(opts?: {
+) => ensurePlanPanel().rehydrate(sessionId, opts);
+const isPlanApprovalArmed = () => ensurePlanPanel().isApprovalArmed();
+const syncPlanPanelChrome = () => ensurePlanPanel().syncChrome();
+const syncPlanRailActivity = () => ensurePlanPanel().syncRailActivity();
+const bindPlanPanel = () => ensurePlanPanel().bind();
+const openPlanPanel = (opts?: {
   requestId?: string | null;
   forceReload?: boolean;
-  /** agent 刚写入的正文（exit_plan 参数） */
   seedContent?: string | null;
-  /** pending / 读写归属；须与 active 一致才改前台 */
   ownerSessionId?: string | null;
-}): Promise<void> {
-  bindPlanPanel();
-  if (!activeSessionId) {
-    showToast(tr("plan.noSession"), "error");
-    return;
-  }
-  const ownerSid =
-    (opts?.ownerSessionId ?? activeSessionId)?.trim() || activeSessionId;
-  // 禁止在错误前台打开他会话的审批面板
-  if (ownerSid !== activeSessionId) {
-    patchSessionPlan(ownerSid, {
-      planPhase: "active",
-      pendingApproval: opts?.requestId
-        ? {
-            requestId: opts.requestId,
-            sessionId: ownerSid,
-            planContent: opts.seedContent ?? "",
-          }
-        : getSessionPlan(ownerSid)?.pendingApproval ?? null,
-    });
-    return;
-  }
-  if (opts?.requestId) {
-    pendingPlanApproval = {
-      requestId: opts.requestId,
-      sessionId: ownerSid,
-      planContent: opts.seedContent ?? "",
-    };
-    patchSessionPlan(ownerSid, {
-      planPhase: planPhase === "off" ? "active" : planPhase,
-      pendingApproval: pendingPlanApproval,
-    });
-  }
-
-  sidePane?.openPlanCategory();
-
-  const res = await inv<{
-    sessionId: string;
-    status: string;
-    content: string;
-    path?: string | null;
-  } | null>("plans.get", { sessionId: ownerSid });
-
-  let content = (res.ok ? res.data?.content : "") ?? "";
-  let path = (res.ok ? res.data?.path : null) ?? null;
-
-  // seed（exit_plan 自带）优先填空文件
-  if (!content.trim() && opts?.seedContent?.trim()) {
-    content = opts.seedContent;
-  }
-
-  // session 空：从工作区计划产物镜像
-  if (!content.trim() && lastPlanArtifactPath) {
-    const fileRes = await inv<{
-      content?: string;
-      binary?: boolean;
-      isDirectory?: boolean;
-      absPath?: string;
-    }>("files.read", {
-      path: lastPlanArtifactPath,
-      cwd: activeCwd ?? undefined,
-      maxBytes: 512_000,
-    });
-    const body =
-      fileRes.ok && !fileRes.data?.binary && !fileRes.data?.isDirectory
-        ? (fileRes.data?.content ?? "")
-        : "";
-    if (body.trim()) {
-      content = body;
-      await inv("plans.write", {
-        sessionId: ownerSid,
-        content: body,
-      });
-      const again = await inv<{ path?: string | null } | null>("plans.get", {
-        sessionId: ownerSid,
-      });
-      path = again.ok ? again.data?.path ?? path : path;
-    }
-  }
-
-  // 异步期间可能已切走
-  if (activeSessionId !== ownerSid) {
-    if (opts?.requestId) {
-      patchSessionPlan(ownerSid, {
-        planPhase: "active",
-        pendingApproval: {
-          requestId: opts.requestId,
-          sessionId: ownerSid,
-          planContent: content || opts.seedContent || "",
-        },
-      });
-    }
-    return;
-  }
-
-  const ed = planEditorEl();
-  if (ed) {
-    // 有未保存修改且非强制重载时不覆盖
-    if (!opts?.forceReload && planPanelDirty() && ed.value.trim()) {
-      /* keep draft */
-    } else {
-      ed.value = content;
-      planPanelSavedContent = content;
-    }
-  }
-  planPanelPath = path;
-  if (planPanelViewMode === "preview") renderPlanPanelPreview();
-  syncPlanPanelChrome();
-  if (activeSessionId) snapshotActiveSessionPlan(activeSessionId);
-}
-
-async function savePlanPanel(): Promise<boolean> {
-  if (!activeSessionId) {
-    showToast(tr("plan.noSession"), "error");
-    return false;
-  }
-  const ed = planEditorEl();
-  if (!ed) return false;
-  const content = ed.value;
-  const r = await inv<{ path?: string }>("plans.write", {
-    sessionId: activeSessionId,
-    content,
-  });
-  if (!r.ok) {
-    showToast(r.error?.message ?? tr("plan.saveFailed"), "error");
-    return false;
-  }
-  planPanelSavedContent = content;
-  if (r.data?.path) planPanelPath = r.data.path;
-  syncPlanPanelChrome();
-  return true;
-}
-
-function setPlanPanelBusy(busy: boolean, approveLabel?: string): void {
-  planPanelBusy = busy;
-  for (const id of [
-    "btn-plan-approve",
-    "btn-plan-revise",
-    "btn-plan-abandon",
-    "btn-plan-save",
-    "btn-plan-reload",
-    "btn-plan-view-mode",
-  ]) {
-    const b = document.getElementById(id) as HTMLButtonElement | null;
-    if (b) b.disabled = busy;
-  }
-  const ap = document.getElementById("btn-plan-approve");
-  if (ap) {
-    ap.textContent = busy && approveLabel ? approveLabel : tr("plan.approveBtn");
-  }
-}
-
-/**
- * 计划面板底栏：批准 / 要求修改 / 放弃
- * 方案 A：仅 exit_plan 挂起（有 requestId）时可点；对齐 CLI PlanApprovalView a/s/q。
- * 可先改 plan.md 再批；无挂起时不人造 prompt / plans.approve。
- */
-async function respondPlanPanel(
-  outcome: "approved" | "cancelled" | "abandoned",
-): Promise<void> {
-  if (planPanelBusy) return;
-  if (!activeSessionId) {
-    showToast(tr("plan.noSession"), "error");
-    return;
-  }
-  const requestId = pendingPlanApproval?.requestId?.trim() || null;
-  const ownerSid =
-    (pendingPlanApproval?.sessionId || activeSessionId)?.trim() || null;
-  if (!requestId || !ownerSid) {
-    // 方案 A：非审批期无 a/s/q（底栏应已隐藏；防直接调/竞态）
-    showToast(tr("plan.approvalRequired"), "info");
-    syncPlanPanelChrome();
-    return;
-  }
-  // 禁止在错误会话上 resolve 他会话的 waiter
-  if (ownerSid !== activeSessionId) {
-    showToast(tr("plan.approvalRequired"), "info");
-    syncPlanPanelChrome();
-    return;
-  }
-  setPlanPanelBusy(
-    true,
-    outcome === "approved"
-      ? tr("plan.approving")
-      : outcome === "cancelled"
-        ? tr("plan.sending")
-        : tr("plan.processing"),
-  );
-  const feedback = (planFeedbackEl()?.value ?? "").trim();
-
-  try {
-    // 批准 / 要求修改前先落盘编辑器内容
-    if (outcome === "approved" || outcome === "cancelled") {
-      if (planPanelDirty() || (planEditorEl()?.value ?? "").trim()) {
-        const ok = await savePlanPanel();
-        if (!ok && outcome === "approved") {
-          setPlanPanelBusy(false);
-          return;
-        }
-      }
-    }
-
-    const r = await inv("plans.respond", {
-      requestId,
-      outcome,
-      feedback:
-        outcome === "cancelled" || outcome === "approved"
-          ? feedback || undefined
-          : undefined,
-      sessionId: ownerSid,
-    });
-    if (!r.ok) {
-      showToast(r.error?.message ?? tr("plan.respondFail"), "error");
-      setPlanPanelBusy(false);
-      return;
-    }
-
-    pendingPlanApproval = null;
-    if (planFeedbackEl()) planFeedbackEl()!.value = "";
-
-    // 清掉「等待计划审批」占位，避免 UI 假死
-    clearPlanApprovalWaitingUi(
-      outcome === "abandoned" ? tr("plan.abandoned") : tr("turn.thinking"),
-    );
-
-    if (outcome === "approved") {
-      // 退出 plan，保留 accessMode（Build：yolo 在 plan 下 armed，批准后继续）
-      planPhase = "off";
-      patchSessionPlan(ownerSid, {
-        planPhase: "off",
-        pendingApproval: null,
-      });
-      syncPermLabels();
-      await syncSessionPolicyLive({ plan: false });
-      setPlanPanelBusy(false);
-      sidePane?.closePlanCategory();
-      syncPlanPanelChrome();
-      // exit_plan reverse-RPC 已 resolve，agent 在同一回合继续实现
-      showToast(tr("plan.approvedToast"));
-      appendLine(tr("plan.approvedLine"), "system");
-    } else if (outcome === "abandoned") {
-      // 退出 plan；保留 accessMode
-      planPhase = "off";
-      patchSessionPlan(ownerSid, {
-        planPhase: "off",
-        pendingApproval: null,
-      });
-      syncPermLabels();
-      await syncSessionPolicyLive({ plan: false });
-      setPlanPanelBusy(false);
-      sidePane?.closePlanCategory();
-      syncPlanPanelChrome();
-      showToast(tr("plan.abandonToast"));
-      appendLine(tr("plan.abandonLine"), "system");
-    } else {
-      // cancelled = 要求修改：保持 plan；收起审批条；勿再 session/prompt
-      planPhase = "active";
-      patchSessionPlan(ownerSid, {
-        planPhase: "active",
-        pendingApproval: null,
-      });
-      syncPermLabels();
-      setPlanPanelBusy(false);
-      const reviseDisplay = feedback
-        ? `${tr("plan.reviseUser")}\n${feedback}`
-        : tr("plan.reviseUser");
-      showWelcome(false);
-      sidePane?.openPlanCategory();
-      syncPlanPanelChrome();
-      // reverse-RPC 已把 cancelled+feedback 交回 agent，本回合会 Continue。
-      paintUserMessage(reviseDisplay);
-      showToast(feedback ? tr("plan.reviseToastFb") : tr("plan.reviseToast"));
-      setTurnStatus(tr("plan.revising"));
-      syncPlanRailActivity();
-    }
-  } catch (err) {
-    showToast(err instanceof Error ? err.message : tr("plan.opFail"), "error");
-    setPlanPanelBusy(false);
-  }
-}
-
-/** 审批结束后清掉「等待计划审批」状态条 */
-function clearPlanApprovalWaitingUi(nextLabel?: string): void {
-  if (turnActive) {
-    if (nextLabel) setTurnStatus(nextLabel);
-    else removeTurnStatus();
-  } else {
-    removeTurnStatus();
-  }
-  if (activeSessionId) markSessionWorking(activeSessionId, true);
-  setComposerBusy(turnActive);
-}
+}) => ensurePlanPanel().open(opts);
 
 /** invoke 返回后若仍 turnActive，延迟 endTurn，并回补 history */
 function scheduleTurnSettle(turnId: number): void {
@@ -5820,83 +3669,12 @@ async function resyncMissingAssistantFromHistory(): Promise<void> {
   }
 }
 
-/** 从 write 类 tool raw 识别计划文档路径 */
 function notePlanArtifactFromTool(name: string | undefined, raw: unknown): void {
-  const meta = extractToolMeta(raw, name);
-  if (meta.kind !== "write" && !/write|edit|create/i.test(name ?? "")) return;
-  for (const p of meta.paths) {
-    const base = p.split(/[/\\]/).pop() ?? p;
-    if (
-      /^plan\.md$/i.test(base) ||
-      (/plan/i.test(base) && /\.(md|markdown|txt)$/i.test(base))
-    ) {
-      lastPlanArtifactPath = p;
-      return;
-    }
-  }
-  // title: Write `...\performance-optimization-plan.zh.md`
-  if (raw && typeof raw === "object") {
-    const title = String((raw as { title?: string }).title ?? "");
-    const m = title.match(/`([^`]+\.(?:md|markdown|txt))`/i);
-    if (m) {
-      const base = m[1].split(/[/\\]/).pop() ?? m[1];
-      if (/plan/i.test(base)) lastPlanArtifactPath = m[1];
-    }
-  }
+  ensurePlanPanel().noteArtifactFromTool(name, raw);
 }
 
-/**
- * 计划模式回合结束：
- * - 有 exit_plan 待批 → 已由 handlePlanApproval 打开面板
- * - 若 session plan.md / 工作区产物有正文 → 自动打开计划侧栏（加深工作流）
- * - 否则 toast 引导
- */
 async function maybeSurfacePlanAfterTurn(): Promise<void> {
-  if (!isPlanOn()) return;
-  if (!activeSessionId) return;
-  if (pendingPlanApproval) return;
-
-  const res = await inv<{ content?: string } | null>("plans.get", {
-    sessionId: activeSessionId,
-  });
-  let content = (res.ok ? res.data?.content : "")?.trim() ?? "";
-  if (!content && lastPlanArtifactPath) {
-    const fileRes = await inv<{
-      content?: string;
-      binary?: boolean;
-      isDirectory?: boolean;
-    }>("files.read", {
-      path: lastPlanArtifactPath,
-      cwd: activeCwd ?? undefined,
-      maxBytes: 512_000,
-    });
-    const body =
-      fileRes.ok && !fileRes.data?.binary && !fileRes.data?.isDirectory
-        ? (fileRes.data?.content ?? "").trim()
-        : "";
-    if (body) {
-      content = body;
-      await inv("plans.write", {
-        sessionId: activeSessionId,
-        content: body,
-      });
-    }
-  }
-  if (content) {
-    // 有计划正文：自动打开侧栏预览，减少「写完了找不到」
-    await openPlanPanel({ forceReload: false });
-    showToast(tr("chat.planReady"), "info");
-  } else if (lastPlanArtifactPath) {
-    showToast(
-      tr("chat.planArtifact", {
-        name:
-          lastPlanArtifactPath.split(/[/\\]/).pop() ?? lastPlanArtifactPath,
-      }),
-      "info",
-    );
-  } else {
-    showToast(tr("plan.waitingContent"), "info");
-  }
+  await ensurePlanPanel().maybeSurfaceAfterTurn();
 }
 
 /**
@@ -6014,75 +3792,14 @@ function markLastUserMessageSendFailed(): void {
 }
 
 function bindSessionModeChips(): void {
-  document.addEventListener("click", (e) => {
-    const t = e.target as HTMLElement;
-    const close = t.closest("[data-chip-close]") as HTMLElement | null;
-    if (close) {
-      e.preventDefault();
-      e.stopPropagation();
-      const kind = close.dataset.chipClose;
-      if (kind === "plan") exitPlanMode();
-      if (kind === "goal") {
-        // 编写中尚未落目标：只取消 compose
-        if (goalComposeActive && !currentGoalTitle()) {
-          goalComposeActive = false;
-          setComposerPlaceholders(false);
-          syncSessionModeChips();
-          showToast(tr("chat.goalCancelled"));
-        } else {
-          void runGoalCommand("clear").then((r) => {
-            if (r.message) showToast(r.message, r.ok ? "info" : "error");
-          });
-        }
-      }
-      return;
-    }
-    const planChip = t.closest("#chip-plan, #chip-plan-2");
-    if (planChip && !t.closest("[data-chip-close]")) {
-      void showViewPlan().then((r) => {
-        if (!r.ok && r.message) showToast(r.message, "error");
-      });
-      return;
-    }
-    const goalChip = t.closest("#chip-goal, #chip-goal-2");
-    if (goalChip && !t.closest("[data-chip-close]")) {
-      onGoalChipClick();
-    }
-  });
+  ensureSessionPolicy().bindModeChips();
 }
 
 /**
  * 目标 chip 点击（对齐 Codex：进 goal 模式时保留输入框正文）。
- * - 已在 compose：聚焦输入框
- * - 输入框有字：进入 compose，正文保留 → 发送即 /goal
- * - 无字但有 live/sticky goal：status
- * - 无字无 goal：进入空 compose
  */
 function onGoalChipClick(): void {
-  const ta = activeComposerInput();
-  const draft = (ta?.value ?? "").trim();
-
-  if (goalComposeActive) {
-    ta?.focus();
-    if (!draft) showToast(tr("slash.goalDesc"));
-    else showToast(tr("goal.composeArmed"));
-    return;
-  }
-
-  if (draft) {
-    // 保留正文，不 prefill 覆盖
-    beginGoalCompose(undefined, { toastKey: "goal.composeArmed" });
-    return;
-  }
-
-  if (currentGoalTitle()) {
-    void runGoalCommand("status").then((r) => {
-      if (r.message) showToast(r.message, r.ok ? "info" : "error");
-    });
-    return;
-  }
-
-  beginGoalCompose();
+  ensureSessionPolicy().onGoalChipClick();
 }
 
 /**
@@ -6095,41 +3812,7 @@ function promptText(opts: {
   placeholder?: string;
   okLabel?: string;
 }): Promise<string | null> {
-  return new Promise((resolve) => {
-    openModal(
-      opts.title,
-      `
-      ${opts.hint ? `<p class="prompt-dlg-hint">${esc(opts.hint)}</p>` : ""}
-      <input id="prompt-dlg-input" class="prompt-dlg-input" type="text"
-        value="${esc(opts.defaultValue ?? "")}"
-        placeholder="${esc(opts.placeholder ?? "")}" autocomplete="off" />
-      <div class="prompt-dlg-actions">
-        <button type="button" class="btn-ghost" id="prompt-dlg-cancel">取消</button>
-        <button type="button" class="btn-dark" id="prompt-dlg-ok">${esc(opts.okLabel ?? tr("dlg.ok"))}</button>
-      </div>`,
-    );
-    const input = $("prompt-dlg-input") as HTMLInputElement;
-    const finish = (v: string | null) => {
-      closeModal();
-      resolve(v);
-    };
-    $("prompt-dlg-cancel").onclick = () => finish(null);
-    $("prompt-dlg-ok").onclick = () => finish(input.value);
-    input.onkeydown = (ev) => {
-      if (ev.key === "Enter") {
-        ev.preventDefault();
-        finish(input.value);
-      }
-      if (ev.key === "Escape") {
-        ev.preventDefault();
-        finish(null);
-      }
-    };
-    requestAnimationFrame(() => {
-      input.focus();
-      input.select();
-    });
-  });
+  return promptTextDlg(opts);
 }
 
 function confirmText(opts: {
@@ -6138,40 +3821,11 @@ function confirmText(opts: {
   okLabel?: string;
   cancelLabel?: string;
 }): Promise<boolean> {
-  return new Promise((resolve) => {
-    openModal(
-      opts.title,
-      `
-      <p class="prompt-dlg-hint" style="white-space:pre-wrap">${esc(opts.message)}</p>
-      <div class="prompt-dlg-actions">
-        <button type="button" class="btn-ghost" id="prompt-dlg-cancel">${esc(opts.cancelLabel ?? tr("dlg.cancel"))}</button>
-        <button type="button" class="btn-dark" id="prompt-dlg-ok">${esc(opts.okLabel ?? tr("dlg.ok"))}</button>
-      </div>`,
-    );
-    const finish = (v: boolean) => {
-      closeModal();
-      resolve(v);
-    };
-    $("prompt-dlg-cancel").onclick = () => finish(false);
-    $("prompt-dlg-ok").onclick = () => finish(true);
-  });
+  return confirmTextDlg(opts);
 }
 
 function showToast(text: string, kind: "info" | "error" = "info"): void {
-  let el = document.getElementById("app-toast");
-  if (!el) {
-    el = document.createElement("div");
-    el.id = "app-toast";
-    el.className = "app-toast";
-    document.body.appendChild(el);
-  }
-  el.textContent = text;
-  el.classList.toggle("error", kind === "error");
-  el.classList.add("show");
-  window.clearTimeout((el as HTMLElement & { _t?: number })._t);
-  (el as HTMLElement & { _t?: number })._t = window.setTimeout(() => {
-    el?.classList.remove("show");
-  }, 3200);
+  showToastDlg(text, kind);
 }
 
 /**
@@ -6260,7 +3914,7 @@ async function ensureSessionForAgentSlash(opts?: {
   else {
     selectedProjectId = null;
     projectChoiceTouched = true;
-    expandedProjectIds.add(CHATS_GROUP_ID);
+    ensureSidebarList().expandedProjectIds.add(CHATS_GROUP_ID);
   }
   suspendLiveTranscript = false;
   startContextPolling();
@@ -6278,64 +3932,7 @@ async function runResolvedSkillSlash(
   skillArgs: string,
   opts?: { path?: string },
 ): Promise<{ handled: boolean; ok?: boolean; message?: string }> {
-  const n = name.replace(/^\//, "").toLowerCase();
-  const cachedPath =
-    opts?.path?.trim() || findSkillPathFromPaletteCache(n);
-  const resolved = await inv<{
-    mode: string;
-    prompt?: string;
-    name: string;
-    message?: string;
-  }>("skills.resolve", {
-    name: n,
-    cwd: activeCwd || selectedProject()?.path,
-    args: skillArgs || undefined,
-    path: cachedPath,
-  });
-
-  if (resolved.ok && resolved.data?.mode === "resolved" && resolved.data.prompt) {
-    const display = `/${n}${skillArgs ? " " + skillArgs : ""}`;
-    const body = skillArgs
-      ? `${resolved.data.prompt}\n\nUser request:\n${skillArgs}`
-      : resolved.data.prompt;
-
-    // 无 session（欢迎页）：先 create，再 dispatch
-    if (!activeSessionId || !activeCwd) {
-      const created = await ensureSessionForAgentSlash({ title: display });
-      if (!created.ok) {
-        showWelcome(false);
-        appendLine(created.error, "error");
-        return { handled: true, ok: false, message: created.error };
-      }
-    }
-
-    const sent = await dispatchAgentPrompt(body, display, { force: false });
-    return {
-      handled: true,
-      ok: sent.ok,
-      message: sent.ok
-        ? tr("slash.skillResolved", { name: n })
-        : sent.error,
-    };
-  }
-
-  if (
-    resolved.ok &&
-    resolved.data &&
-    (resolved.data.mode === "ambiguous" ||
-      resolved.data.mode === "read_error" ||
-      (resolved.data.mode === "not_found" && cachedPath))
-  ) {
-    return {
-      handled: true,
-      ok: false,
-      message:
-        resolved.data.message || tr("slash.skillNotFound", { name: n }),
-    };
-  }
-
-  // not_found 且无 path：不当 skill，交给上层当普通文本
-  return { handled: false };
+  return ensureSkillActions().runResolved(name, skillArgs, opts);
 }
 
 /**
@@ -6347,40 +3944,7 @@ async function runResolvedSkillSlash(
  * skill / 需 agent 的命令：无 session 时先 threads.create 再 dispatch。
  */
 async function tryRunComposerSlashLine(raw: string): Promise<boolean> {
-  const t = raw.trim();
-  if (!t.startsWith("/")) return false;
-  // 单 token 或 /cmd args — 先解析主命令
-  const m = t.match(/^\/([^\s]+)(?:\s+([\s\S]*))?$/);
-  if (!m) return false;
-  const name = (m[1] ?? "").toLowerCase();
-  if (!name) return false;
-  const staticCmd = resolveSlashCommand(getStaticSlashCommands(), name);
-  // 原生静态优先（与 CLI builtins first 一致）
-  if (staticCmd) {
-    const ta = activeComposerInput();
-    if (ta) ta.value = "";
-    slashPalette?.hide();
-    const res = await runSlashCommand(staticCmd, (m[2] ?? "").trim());
-    if (res.message) showToast(res.message, res.ok ? "info" : "error");
-    return true;
-  }
-  // skill：registry path-first resolve（CLI 式 envelope）
-  {
-    const skillArgs = (m[2] ?? "").trim();
-    const skillRes = await runResolvedSkillSlash(name, skillArgs);
-    if (skillRes.handled) {
-      const ta = activeComposerInput();
-      if (ta) ta.value = "";
-      slashPalette?.hide();
-      if (skillRes.message && !skillRes.ok) {
-        showToast(skillRes.message, "error");
-      } else if (skillRes.message && skillRes.ok) {
-        // resolve 成功 toast 可选；dispatch 已画气泡，不强制 toast
-      }
-      return true;
-    }
-  }
-  return false;
+  return ensureSkillActions().tryRunComposerLine(raw);
 }
 
 /** 从最近一次 palette 加载的 skill 命令中取 path（同名优先） */
@@ -6406,197 +3970,7 @@ async function runSlashCommand(
   cmd: SlashCommandDef,
   args = "",
 ): Promise<{ ok: boolean; message?: string }> {
-  const act = cmd.action;
-  switch (act.kind) {
-    case "set-perm":
-      // always-approve：toggle 访问权限，不退出 plan（Build：yolo armed underneath）
-      if (act.mode === "always_approve") {
-        const on = accessMode !== "always_approve";
-        accessMode = on ? "always_approve" : "normal";
-        const sync = await syncSessionPolicyLive({
-          alwaysApprove: on,
-          plan: isPlanOn(),
-        });
-        syncPermLabels();
-        return {
-          ok: sync.ok,
-          message: !sync.ok
-            ? sync.message
-            : on
-              ? tr("slash.fullOn")
-              : tr("slash.fullOff"),
-        };
-      }
-      if (act.mode === "plan") {
-        // /plan 再开一次：若已在 plan 则退出（toggle 感）；否则进入
-        if (isPlanOn()) {
-          exitPlanMode();
-          return { ok: true, message: tr("slash.exitPlan") };
-        }
-        return enterPlanMode();
-      }
-      // normal：只切访问权限为默认确认，不强制退 plan
-      accessMode = "normal";
-      await syncSessionPolicyLive({ alwaysApprove: false, plan: isPlanOn() });
-      syncPermLabels();
-      return { ok: true, message: tr("slash.permTo", { label: permLabel() }) };
-    case "view-plan":
-      return showViewPlan();
-    case "goal":
-      return runGoalCommand(act.sub ?? "set");
-    case "set-max-turns":
-      return promptSetMaxTurns(act.turns);
-    case "agent-command": {
-      const name = act.name.replace(/^\//, "").replace(/^skill:/i, "");
-      const skillPath =
-        act.path?.trim() || findSkillPathFromPaletteCache(name);
-      const skillRes = await runResolvedSkillSlash(name, args, {
-        path: skillPath,
-      });
-      if (skillRes.handled) {
-        return {
-          ok: Boolean(skillRes.ok),
-          message: skillRes.message,
-        };
-      }
-      // 无 path 且 not_found：当作 agent 广告命令，插入 `/name `
-      insertComposerText(`/${name} `);
-      return { ok: true, message: tr("slash.agentCmdInserted", { name }) };
-    }
-    case "memory":
-      return runMemoryCommand(act.sub ?? "list");
-    case "set-model":
-      return promptSetModel();
-    case "open-model-menu": {
-      const welcome = !$("welcome").classList.contains("hidden");
-      const anchor = (
-        welcome ? $("btn-model") : $("btn-model-2")
-      ) as HTMLElement;
-      showModelMenu(anchor);
-      return { ok: true };
-    }
-    case "show-context":
-      return showContextDetails();
-    case "set-effort": {
-      if (act.level) {
-        return applySessionModelAndEffort({
-          effort: act.level,
-          focus: "effort",
-        });
-      }
-      return promptSetEffort();
-    }
-    case "status": {
-      const p = selectedProject();
-      const projectLine = p
-        ? `${p.title} (${p.path})`
-        : tr("slash.none");
-      // 优先 agent session/info；失败回退本地简表
-      const info = await fetchSessionInfoForActive();
-      if (info) {
-        const lines = formatSessionInfoLines(info, {
-          project: projectLine,
-          effort: `${effortLabel()}（${effortLevel}）`,
-          perm: permLabel(),
-        });
-        openModal(
-          tr("slash.statusTitle"),
-          `<pre class="slash-status-pre">${esc(lines.join("\n"))}</pre>`,
-        );
-        // 顺带刷新 context chip
-        const c = info.context;
-        if (c.total > 0 || c.used > 0) {
-          lastContextUsage = {
-            sessionId: info.sessionId,
-            used: c.used,
-            total: c.total,
-            percent:
-              c.usagePct ||
-              (c.total > 0 ? Math.min(100, (c.used / c.total) * 100) : 0),
-            available: true,
-            source: "signals",
-          };
-          syncContextLabels();
-        }
-        return { ok: true };
-      }
-      const lines = [
-        tr("status.project", { project: projectLine }),
-        tr("status.thread", { id: activeThreadId ?? "—" }),
-        tr("status.sessionId", { id: activeSessionId ?? "—" }),
-        tr("status.cwd", { cwd: activeCwd ?? p?.path ?? "—" }),
-        tr("status.perm", { perm: permLabel() }),
-        tr("status.model", { model: modelLabel }),
-        tr("status.effort", {
-          effort: `${effortLabel()}（${effortLevel}）`,
-        }),
-        tr("status.openTarget", {
-          target:
-            !defaultOpenTarget || defaultOpenTarget === "explorer"
-              ? tr("slash.openExplorer")
-              : defaultOpenTarget === "editor"
-                ? tr("slash.openEditor")
-                : defaultOpenTarget,
-        }),
-        "",
-        tr("status.needAttach"),
-      ];
-      openModal(
-        tr("slash.statusTitle"),
-        `<pre class="slash-status-pre">${esc(lines.join("\n"))}</pre>`,
-      );
-      return { ok: true };
-    }
-    case "export-session":
-      return exportActiveSession({ destination: "clipboard" });
-    case "compact-session":
-      return compactActiveSession();
-    case "fork-session":
-      return forkActiveSession(args);
-    case "rewind-session":
-      return rewindViaSlash();
-    case "show-queue":
-      return showPromptQueueModal();
-    case "clear-queue": {
-      if (!promptQueue.length) {
-        return { ok: true, message: tr("queue.empty") };
-      }
-      clearPromptQueue();
-      return { ok: true, message: tr("queue.cleared") };
-    }
-    case "show-tasks":
-      return showTasksPanel();
-    case "show-prompt-history":
-      return showPromptHistorySearch();
-    case "btw":
-      return runBtwCommand(act.question);
-    case "interject":
-      return runInterjectCommand(act.text);
-    case "insert-text": {
-      const ta = document.activeElement as HTMLTextAreaElement | null;
-      const targets = [
-        $("composer-input") as HTMLTextAreaElement,
-        $("chat-input") as HTMLTextAreaElement,
-        $("focus-input") as HTMLTextAreaElement,
-      ];
-      const input =
-        ta && targets.includes(ta)
-          ? ta
-          : !$("chat").classList.contains("hidden")
-            ? targets[1]
-            : targets[0];
-      const cur = input.selectionStart ?? input.value.length;
-      const pad = cur > 0 && !/\s$/.test(input.value.slice(0, cur)) ? " " : "";
-      const ins = pad + act.text;
-      input.value = input.value.slice(0, cur) + ins + input.value.slice(cur);
-      const pos = cur + ins.length;
-      input.setSelectionRange(pos, pos);
-      input.focus();
-      return { ok: true };
-    }
-    default:
-      return { ok: false, message: tr("slash.unknown") };
-  }
+  return ensureSlashDispatch().run(cmd, args);
 }
 
 function composerCwd(): string | null {
@@ -6612,181 +3986,24 @@ function activeThreadRefId(): string | null {
 }
 
 async function renameThread(t: ThreadRow): Promise<void> {
-  const next = await promptText({
-    title: tr("slash.renameTitle"),
-    hint: tr("slash.renameHint"),
-    defaultValue: t.title || "",
-    placeholder: tr("slash.renamePh"),
-  });
-  if (next == null) return;
-  const title = next.trim();
-  if (!title) {
-    showToast(tr("slash.renameEmpty"), "error");
-    return;
-  }
-  const res = await inv("threads.rename", { threadId: t.id, title });
-  if (!res.ok) {
-    showToast(res.error?.message ?? tr("slash.renameFail"), "error");
-    return;
-  }
-  await refreshProjectsAndThreads();
-  showToast(`已重命名为「${title}」`);
+  return ensureSessionOps().renameThread(t);
 }
 
 async function exportActiveSession(opts?: {
   destination?: "clipboard" | "file";
-  /** 指定线程；默认当前活动会话 */
   threadId?: string;
 }): Promise<{ ok: boolean; message?: string }> {
-  const tid = opts?.threadId ?? activeThreadRefId();
-  if (!tid) return { ok: false, message: tr("slash.needSession") };
-  const destination = opts?.destination ?? "clipboard";
-  const res = await inv<{
-    canceled?: boolean;
-    path?: string | null;
-    destination?: "clipboard" | "file";
-  }>("threads.export", { threadId: tid, destination });
-  if (!res.ok) return { ok: false, message: res.error?.message ?? tr("slash.exportFail") };
-  if (res.data?.canceled) return { ok: true, message: tr("slash.exportCancel") };
-  if (res.data?.destination === "clipboard" || destination === "clipboard") {
-    return { ok: true, message: tr("slash.exportClipboardOk") };
-  }
-  return {
-    ok: true,
-    message: res.data?.path
-      ? tr("slash.exported", { path: res.data.path })
-      : tr("slash.exportedOk"),
-  };
+  return ensureSessionOps().exportActiveSession(opts);
 }
 
-/**
- * 真压缩：ACP `_x.ai/compact_conversation`（对齐 CLI CompactSession）。
- * 可选 userContext 作为 two-pass「保留说明」。
- */
 async function compactActiveSession(): Promise<{ ok: boolean; message?: string }> {
-  if (!activeThreadId && !activeSessionId) {
-    return { ok: false, message: tr("slash.needSession") };
-  }
-  if (turnActive) return { ok: false, message: tr("slash.waitTurn") };
-
-  const userContext = await promptCompactUserContext();
-  if (userContext === null) {
-    return { ok: true, message: tr("slash.cancelled") };
-  }
-
-  const threadId = await ensureLiveThread();
-  if (!threadId) {
-    return { ok: false, message: tr("slash.compactAttachFail") };
-  }
-
-  appendLine(tr("slash.compactRunning"), "system");
-  const pr = await inv<{ sessionId: string; ok: true }>("threads.compact", {
-    threadId,
-    userContext: userContext || undefined,
-  });
-  if (!pr.ok) {
-    return {
-      ok: false,
-      message: pr.error?.message ?? tr("slash.compactFail"),
-    };
-  }
-  refreshContextAfterCompact({});
-  appendLine(
-    userContext ? tr("slash.compactDoneWithCtx") : tr("slash.compactDone"),
-    "system",
-  );
-  return {
-    ok: true,
-    message: userContext
-      ? tr("slash.compactDoneWithCtx")
-      : tr("slash.compactDone"),
-  };
-}
-
-/** compact 确认 + 可选保留说明（对齐 CLI `/compact [user_context]`） */
-function promptCompactUserContext(): Promise<string | null> {
-  return new Promise((resolve) => {
-    openModal(
-      tr("slash.compactTitle"),
-      `<p class="prompt-dlg-hint">${esc(tr("slash.compactBody"))}</p>
-       <label class="prompt-dlg-label" for="compact-ctx">${esc(tr("slash.compactCtxLabel"))}</label>
-       <textarea id="compact-ctx" class="prompt-dlg-input" rows="3"
-         placeholder="${esc(tr("slash.compactCtxPh"))}"></textarea>
-       <div class="prompt-dlg-actions">
-         <button type="button" class="btn-ghost" id="prompt-dlg-cancel">${esc(tr("common.cancel"))}</button>
-         <button type="button" class="btn-dark" id="prompt-dlg-ok">${esc(tr("slash.compactOk"))}</button>
-       </div>`,
-    );
-    const ta = $("compact-ctx") as HTMLTextAreaElement;
-    $("prompt-dlg-cancel").onclick = () => {
-      closeModal();
-      resolve(null);
-    };
-    $("prompt-dlg-ok").onclick = () => {
-      const v = ta.value.trim();
-      closeModal();
-      resolve(v);
-    };
-    requestAnimationFrame(() => ta.focus());
-  });
+  return ensureSessionOps().compactActiveSession();
 }
 
 async function promptSetMaxTurns(
   preset?: number,
 ): Promise<{ ok: boolean; message?: string }> {
-  if (preset != null && Number.isFinite(preset) && preset > 0) {
-    maxTurnsLimit = Math.floor(preset);
-    return {
-      ok: true,
-      message: tr("slash.maxTurnsSet", { n: String(maxTurnsLimit) }),
-    };
-  }
-  return new Promise((resolve) => {
-    const cur = maxTurnsLimit != null ? String(maxTurnsLimit) : "";
-    openModal(
-      tr("slash.maxTurns"),
-      `<p class="prompt-dlg-hint">${esc(tr("slash.maxTurnsHint"))}</p>
-       <input id="max-turns-input" class="prompt-dlg-input" type="number" min="0" step="1"
-         value="${esc(cur)}" placeholder="${esc(tr("slash.maxTurnsPh"))}" />
-       <div class="prompt-dlg-actions">
-         <button type="button" class="btn-ghost" id="prompt-dlg-cancel">${esc(tr("common.cancel"))}</button>
-         <button type="button" class="btn-ghost" id="max-turns-clear">${esc(tr("slash.maxTurnsClear"))}</button>
-         <button type="button" class="btn-dark" id="prompt-dlg-ok">${esc(tr("common.ok"))}</button>
-       </div>`,
-    );
-    $("prompt-dlg-cancel").onclick = () => {
-      closeModal();
-      resolve({ ok: true, message: tr("slash.cancelled") });
-    };
-    $("max-turns-clear").onclick = () => {
-      maxTurnsLimit = null;
-      closeModal();
-      resolve({ ok: true, message: tr("slash.maxTurnsCleared") });
-    };
-    $("prompt-dlg-ok").onclick = () => {
-      const raw = ($("max-turns-input") as HTMLInputElement).value.trim();
-      if (!raw) {
-        maxTurnsLimit = null;
-        closeModal();
-        resolve({ ok: true, message: tr("slash.maxTurnsCleared") });
-        return;
-      }
-      const n = Number(raw);
-      if (!Number.isFinite(n) || n < 1) {
-        showToast(tr("slash.maxTurnsInvalid"), "error");
-        return;
-      }
-      maxTurnsLimit = Math.floor(n);
-      closeModal();
-      resolve({
-        ok: true,
-        message: tr("slash.maxTurnsSet", { n: String(maxTurnsLimit) }),
-      });
-    };
-    requestAnimationFrame(() =>
-      ($("max-turns-input") as HTMLInputElement).focus(),
-    );
-  });
+  return ensureSessionOps().promptSetMaxTurns(preset);
 }
 
 /** 向当前可见 composer 插入文本 */
@@ -6807,122 +4024,19 @@ function insertComposerText(text: string): void {
 }
 
 /**
- * CLI 对齐 Memory（A18/E5）：GROK_HOME/memory Global/Workspace/Sessions。
+ * CLI 对齐 Memory（A18/E5）→ MemoryBrowserUi。
  * /memory 浏览；/remember 写入；/flush /dream 指挥 agent。
  */
 async function runMemoryCommand(
   sub: "list" | "add" | "search" | "status" | "flush" | "dream",
 ): Promise<{ ok: boolean; message?: string }> {
-  if (sub === "status") {
-    const st = await inv<{
-      enabled: boolean;
-      fileCount: number;
-      storePath: string;
-      productNote?: string;
-      message?: string;
-    }>("memory.status");
-    if (!st.ok) return { ok: false, message: st.error?.message };
-    const s = st.data!;
-    return {
-      ok: true,
-      message: `${s.enabled ? tr("settings.memoryOn") : tr("settings.memoryOff")} · ${tr("settings.memoryFileCount", { n: s.fileCount })} · ${s.storePath}`,
-    };
-  }
-  if (sub === "add") {
-    return promptAddMemory();
-  }
-  if (sub === "flush") {
-    return runMemoryFlush();
-  }
-  if (sub === "dream") {
-    return runMemoryDream();
-  }
-  return showMemoryBrowser(sub === "search");
+  return ensureMemoryBrowser().runCommand(sub);
 }
 
-async function runMemoryFlush(): Promise<{ ok: boolean; message?: string }> {
-  const threadId = await ensureLiveThread();
-  if (!threadId) return { ok: false, message: tr("memory.needAttach") };
-  const st = await inv<{ enabled: boolean }>("memory.status");
-  if (st.ok && !st.data?.enabled) {
-    return { ok: false, message: tr("memory.needEnable") };
-  }
-  const res = await inv("threads.memoryFlush", { threadId });
-  if (!res.ok) return { ok: false, message: res.error?.message ?? tr("memory.flushFail") };
-  return { ok: true, message: tr("memory.flushOk") };
-}
-
-async function runMemoryDream(): Promise<{ ok: boolean; message?: string }> {
-  const threadId = await ensureLiveThread();
-  if (!threadId) return { ok: false, message: tr("memory.needAttach") };
-  const st = await inv<{ enabled: boolean }>("memory.status");
-  if (st.ok && !st.data?.enabled) {
-    return { ok: false, message: tr("memory.needEnable") };
-  }
-  const res = await inv("threads.memoryDream", { threadId });
-  if (!res.ok) return { ok: false, message: res.error?.message ?? tr("memory.dreamFail") };
-  return { ok: true, message: tr("memory.dreamOk") };
-}
-
-async function promptAddMemory(): Promise<{ ok: boolean; message?: string }> {
-  return new Promise((resolve) => {
-    openModal(
-      tr("slash.remember"),
-      `<p class="prompt-dlg-hint">${esc(tr("memory.addHint"))}</p>
-       <textarea id="mem-add-text" class="prompt-dlg-input" rows="4"
-         placeholder="${esc(tr("memory.addPh"))}"></textarea>
-       <div class="memory-scope-row">
-         <label><input type="radio" name="mem-scope" value="global" checked /> ${esc(tr("memory.scopeGlobal"))}</label>
-         <label><input type="radio" name="mem-scope" value="workspace" /> ${esc(tr("memory.scopeWorkspace"))}</label>
-       </div>
-       <div class="prompt-dlg-actions">
-         <button type="button" class="btn-ghost" id="prompt-dlg-cancel">${esc(tr("common.cancel"))}</button>
-         <button type="button" class="btn-dark" id="prompt-dlg-ok">${esc(tr("memory.addOk"))}</button>
-       </div>`,
-    );
-    const ta = $("mem-add-text") as HTMLTextAreaElement;
-    $("prompt-dlg-cancel").onclick = () => {
-      closeModal();
-      resolve({ ok: true, message: tr("slash.cancelled") });
-    };
-    $("prompt-dlg-ok").onclick = async () => {
-      const text = ta.value.trim();
-      if (!text) {
-        showToast(tr("memory.addEmpty"), "error");
-        return;
-      }
-      const scopeEl = document.querySelector(
-        'input[name="mem-scope"]:checked',
-      ) as HTMLInputElement | null;
-      const scope = scopeEl?.value === "workspace" ? "workspace" : "global";
-      const cwd = getActiveCwd?.() ?? undefined;
-      const res = await inv<{ path: string; scope: string }>("memory.remember", {
-        text,
-        scope,
-        cwd,
-        threadId: activeThreadId && !activeThreadId.startsWith("disk_")
-          ? activeThreadId
-          : undefined,
-        rewrite: Boolean(activeThreadId && !activeThreadId.startsWith("disk_")),
-      });
-      closeModal();
-      if (!res.ok) {
-        resolve({ ok: false, message: res.error?.message ?? tr("memory.addFail") });
-        return;
-      }
-      resolve({
-        ok: true,
-        message: tr("memory.addedTo", {
-          scope:
-            res.data?.scope === "workspace"
-              ? tr("memory.scopeWorkspace")
-              : tr("memory.scopeGlobal"),
-          path: res.data?.path ?? "",
-        }),
-      });
-    };
-    requestAnimationFrame(() => ta.focus());
-  });
+async function showMemoryBrowser(
+  focusSearch: boolean,
+): Promise<{ ok: boolean; message?: string }> {
+  return ensureMemoryBrowser().showBrowser(focusSearch);
 }
 
 function getActiveCwd(): string | undefined {
@@ -6930,365 +4044,16 @@ function getActiveCwd(): string | undefined {
   return selectedProject()?.path;
 }
 
-async function showMemoryBrowser(
-  focusSearch: boolean,
-): Promise<{ ok: boolean; message?: string }> {
-  const st = await inv<{
-    enabled: boolean;
-    fileCount: number;
-    storePath: string;
-    productNote?: string;
-    message?: string;
-    legacyEntryCount?: number;
-  }>("memory.status");
-  if (!st.ok) return { ok: false, message: st.error?.message };
-
-  const cwd = getActiveCwd();
-
-  openModal(
-    tr("memory.browserTitle"),
-    `<p class="prompt-dlg-hint">${esc(st.data?.productNote || tr("memory.productNote"))}</p>
-     <p class="prompt-dlg-hint mono-sm">${esc(tr("memory.storePath", { path: st.data?.storePath ?? "—" }))}</p>
-     <div class="memory-toolbar">
-       <input id="mem-q" class="prompt-dlg-input" type="search"
-         placeholder="${esc(tr("memory.searchPh"))}" autocomplete="off" />
-       <button type="button" class="btn-dark sm" id="mem-add-btn">${esc(tr("memory.addBtn"))}</button>
-     </div>
-     <div class="memory-split">
-       <div id="mem-list" class="memory-list"></div>
-       <pre id="mem-preview" class="memory-preview mono-sm">${esc(tr("memory.previewEmpty"))}</pre>
-     </div>
-     <div class="prompt-dlg-actions">
-       <button type="button" class="btn-ghost" id="prompt-dlg-cancel">${esc(tr("common.close"))}</button>
-     </div>`,
-  );
-
-  let selectedPath = "";
-
-  const renderList = async () => {
-    const q = ($("mem-q") as HTMLInputElement).value.trim();
-    const browse = await inv<{
-      files: Array<{
-        id: string;
-        source: string;
-        label: string;
-        path: string;
-        deletable: boolean;
-        current?: boolean;
-        mtimeMs: number;
-      }>;
-      currentWorkspaceKey?: string;
-    }>("memory.browse", { cwd });
-    let files = browse.data?.files ?? [];
-    if (q) {
-      const ql = q.toLowerCase();
-      files = files.filter(
-        (f) =>
-          f.label.toLowerCase().includes(ql) ||
-          f.path.toLowerCase().includes(ql) ||
-          f.source.toLowerCase().includes(ql),
-      );
-    }
-    const el = $("mem-list");
-    if (!files.length) {
-      el.innerHTML = `<div class="item-sub">${esc(
-        st.data?.enabled === false
-          ? tr("memory.disabledHint")
-          : tr("memory.empty"),
-      )}</div>`;
-      return;
-    }
-    const groups: Record<string, typeof files> = {
-      global: [],
-      workspace: [],
-      session: [],
-    };
-    for (const f of files) {
-      (groups[f.source] ?? groups.session).push(f);
-    }
-    const parts: string[] = [];
-    for (const src of ["global", "workspace", "session"] as const) {
-      const list = groups[src];
-      if (!list.length) continue;
-      parts.push(
-        `<div class="memory-group-h">${esc(tr(`memory.group.${src}`))}</div>`,
-      );
-      for (const f of list.slice(0, 80)) {
-        parts.push(`<div class="memory-row${f.path === selectedPath ? " on" : ""}${f.current ? " current" : ""}" data-mem-path="${esc(f.path)}" data-mem-id="${esc(f.id)}">
-          <div class="memory-row-text" title="${esc(f.path)}">${esc(f.label)}${f.current ? ` · ${esc(tr("memory.currentWs"))}` : ""}</div>
-          <div class="memory-row-meta">
-            <span>${esc(formatAge(new Date(f.mtimeMs).toISOString()) || "")}</span>
-            ${
-              f.deletable
-                ? `<button type="button" class="btn-ghost sm" data-mem-del-path="${esc(f.path)}">${esc(tr("common.delete"))}</button>`
-                : ""
-            }
-          </div>
-        </div>`);
-      }
-    }
-    el.innerHTML = parts.join("");
-
-    for (const row of Array.from(el.querySelectorAll("[data-mem-path]"))) {
-      (row as HTMLElement).onclick = async (ev) => {
-        if ((ev.target as HTMLElement).closest("[data-mem-del-path]")) return;
-        selectedPath = (row as HTMLElement).dataset.memPath ?? "";
-        await showPreview(selectedPath);
-        void renderList();
-      };
-    }
-    for (const btn of Array.from(el.querySelectorAll("[data-mem-del-path]"))) {
-      (btn as HTMLElement).onclick = async (ev) => {
-        ev.stopPropagation();
-        const pth = (btn as HTMLElement).dataset.memDelPath ?? "";
-        if (!pth) return;
-        if (!window.confirm(tr("memory.deleteConfirm"))) return;
-        await inv("memory.deletePath", { path: pth });
-        if (selectedPath === pth) {
-          selectedPath = "";
-          $("mem-preview").textContent = tr("memory.previewEmpty");
-        }
-        await renderList();
-        showToast(tr("memory.deleted"));
-      };
-    }
-  };
-
-  const showPreview = async (filePath: string) => {
-    if (!filePath) return;
-    const res = await inv<{ content: string; truncated: boolean }>(
-      "memory.read",
-      { path: filePath },
-    );
-    const pre = $("mem-preview");
-    if (!res.ok) {
-      pre.textContent = res.error?.message ?? tr("memory.readFail");
-      return;
-    }
-    pre.textContent =
-      (res.data?.content ?? "") +
-      (res.data?.truncated ? `\n\n… (${tr("memory.truncated")})` : "");
-  };
-
-  $("mem-q").oninput = () => void renderList();
-  $("mem-add-btn").onclick = async () => {
-    closeModal();
-    const r = await promptAddMemory();
-    if (r.message) showToast(r.message, r.ok ? "info" : "error");
-    if (r.ok && r.message !== tr("slash.cancelled")) {
-      void showMemoryBrowser(false);
-    }
-  };
-  $("prompt-dlg-cancel").onclick = () => closeModal();
-  await renderList();
-  if (focusSearch) {
-    requestAnimationFrame(() => ($("mem-q") as HTMLInputElement).focus());
-  }
-  return { ok: true };
-}
-
-type SessionInfoRow = {
-  sessionId: string;
-  cwd?: string;
-  agentName?: string;
-  model?: string;
-  modelDisplayName?: string;
-  resolvedModelId?: string;
-  modelFingerprint?: string;
-  showModelFingerprint?: boolean;
-  apiBackend?: string;
-  conversationId?: string;
-  turns: number;
-  turnIndex: number;
-  context: {
-    used: number;
-    total: number;
-    systemPromptTokens: number;
-    toolDefinitionsCount: number;
-    toolDefinitionsTokens: number;
-    compactionCount: number;
-    turnCount: number;
-    toolCallCount: number;
-    messageCount: number;
-    messageTokens: number;
-    freeTokens: number;
-    usagePct: number;
-    autoCompactThresholdPercent: number;
-    usageCategories: Array<{ label: string; tokens: number; detail?: string }>;
-  };
-};
-
-function formatSessionInfoLines(
-  info: SessionInfoRow,
-  extras?: { project?: string; effort?: string; perm?: string },
-): string[] {
-  const c = info.context;
-  const model =
-    info.modelDisplayName || info.model || tr("slash.none");
-  const lines = [
-    tr("status.sessionId", { id: info.sessionId }),
-    extras?.project
-      ? tr("status.project", { project: extras.project })
-      : null,
-    info.cwd ? tr("status.cwd", { cwd: info.cwd }) : null,
-    info.agentName
-      ? tr("status.agent", { name: info.agentName })
-      : null,
-    tr("status.model", { model }),
-    info.resolvedModelId && info.resolvedModelId !== info.model
-      ? tr("status.resolvedModel", { id: info.resolvedModelId })
-      : null,
-    info.showModelFingerprint && info.modelFingerprint
-      ? tr("status.fingerprint", { fp: info.modelFingerprint })
-      : null,
-    extras?.effort ? tr("status.effort", { effort: extras.effort }) : null,
-    extras?.perm ? tr("status.perm", { perm: extras.perm }) : null,
-    info.apiBackend
-      ? tr("status.backend", { backend: info.apiBackend })
-      : null,
-    tr("status.turns", {
-      turns: info.turns,
-      turnIndex: info.turnIndex,
-    }),
-    "",
-    tr("status.contextHeader"),
-    tr("status.contextUsed", {
-      used: c.used.toLocaleString(),
-      total: c.total.toLocaleString(),
-      pct: c.usagePct || (c.total > 0 ? Math.round((c.used / c.total) * 100) : 0),
-    }),
-    tr("status.contextFree", { free: c.freeTokens.toLocaleString() }),
-    tr("status.contextSystem", {
-      tokens: c.systemPromptTokens.toLocaleString(),
-    }),
-    tr("status.contextTools", {
-      count: c.toolDefinitionsCount,
-      tokens: c.toolDefinitionsTokens.toLocaleString(),
-    }),
-    tr("status.contextMessages", {
-      count: c.messageCount,
-      tokens: c.messageTokens.toLocaleString(),
-    }),
-    tr("status.contextTurnsTools", {
-      turns: c.turnCount,
-      tools: c.toolCallCount,
-      compact: c.compactionCount,
-    }),
-    tr("status.autoCompactAt", {
-      pct: c.autoCompactThresholdPercent || 85,
-    }),
-  ].filter((x): x is string => x != null);
-
-  if (c.usageCategories?.length) {
-    lines.push("", tr("status.categoriesHeader"));
-    for (const cat of c.usageCategories) {
-      const detail = cat.detail ? ` (${cat.detail})` : "";
-      lines.push(`  ${cat.label}${detail}: ${cat.tokens.toLocaleString()}`);
-    }
-  }
-  return lines;
-}
-
 async function fetchSessionInfoForActive(): Promise<SessionInfoRow | null> {
-  if (!activeSessionId && !activeThreadId) return null;
-  const threadId = await ensureLiveThread();
-  if (!threadId) return null;
-  const res = await inv<SessionInfoRow>("threads.sessionInfo", { threadId });
-  if (!res.ok || !res.data) return null;
-  return res.data;
+  return ensureSessionOps().fetchSessionInfoForActive();
 }
 
 
 /** /rewind：列出可回退点并确认后执行（对齐 CLI slash 入口） */
 async function rewindViaSlash(): Promise<{ ok: boolean; message?: string }> {
-  if (turnActive) {
-    return { ok: false, message: tr("chat.rewindWait") };
-  }
-  if (!activeSessionId) {
-    return { ok: false, message: tr("chat.rewindNeedSession") };
-  }
-  const threadId = await ensureLiveThread();
-  if (!threadId) {
-    return { ok: false, message: tr("chat.rewindAttachFail2") };
-  }
-  const pts = await inv<{
-    rewindPoints: Array<{
-      promptIndex: number;
-      promptPreview?: string;
-      hasFileChanges?: boolean;
-      numFileSnapshots?: number;
-    }>;
-  }>("threads.rewindPoints", { threadId });
-  if (!pts.ok) {
-    return {
-      ok: false,
-      message: pts.error?.message ?? tr("chat.rewindPreviewFail"),
-    };
-  }
-  const list = pts.data?.rewindPoints ?? [];
-  if (!list.length) {
-    // 回退到 transcript 中最近一条用户消息
-    const blocks = Array.from(
-      document.querySelectorAll(".user-msg-block[data-prompt-index]"),
-    ) as HTMLElement[];
-    if (!blocks.length) {
-      return { ok: false, message: tr("slash.rewindNone") };
-    }
-    const last = blocks[blocks.length - 1]!;
-    const idx = Number(last.dataset.promptIndex);
-    const preview =
-      last.querySelector(".msg-user-text")?.textContent?.trim() ||
-      tr("chat.rewindConfirmBodyEmpty");
-    await rewindToUserPrompt(idx, preview);
-    return { ok: true, message: tr("slash.rewindStarted") };
-  }
-  // 展示最近若干点，让用户选编号
-  const recent = list.slice(-12).reverse();
-  const lines = recent
-    .map((p, i) => {
-      const prev = (p.promptPreview || "").trim().replace(/\s+/g, " ");
-      const short = prev.length > 48 ? prev.slice(0, 48) + "…" : prev || "(empty)";
-      const files = p.hasFileChanges || (p.numFileSnapshots ?? 0) > 0 ? " 📎" : "";
-      return `${i + 1}. #${p.promptIndex}${files}  ${short}`;
-    })
-    .join("\n");
-  const pick = await promptText({
-    title: tr("slash.rewindPickTitle"),
-    hint: tr("slash.rewindPickHint"),
-    defaultValue: "1",
-    placeholder: "1",
-  });
-  if (pick == null) return { ok: true, message: tr("slash.cancelled") };
-  const n = Number(String(pick).trim());
-  if (!Number.isFinite(n) || n < 1 || n > recent.length) {
-    return { ok: false, message: tr("slash.rewindBadPick") };
-  }
-  const chosen = recent[n - 1]!;
-  const preview = (chosen.promptPreview || "").trim() || tr("chat.rewindConfirmBodyEmpty");
-  // 也显示列表摘要在 toast 区（confirm 内已有正文）
-  void lines;
-  await rewindToUserPrompt(chosen.promptIndex, preview);
-  return { ok: true, message: tr("slash.rewindStarted") };
+  return ensureRewindActions().viaSlash();
 }
 
-/** 解析会话展示标题（列表 / toast） */
-function threadDisplayTitle(t: ThreadRow | undefined, fallbackId?: string): string {
-  if (t?.title?.trim()) return t.title.trim();
-  const id = t?.sessionId || fallbackId || "";
-  return id ? id.slice(0, 8) : tr("slash.forkDefaultTitle");
-}
-
-/** 父会话标题（用于「来自：xxx」） */
-function parentThreadTitle(parentSessionId: string | undefined): string | null {
-  if (!parentSessionId) return null;
-  const p = threads.find((x) => x.sessionId === parentSessionId);
-  return threadDisplayTitle(p, parentSessionId);
-}
-
-/**
- * 从指定会话派生（侧栏 ⋯ / slash 共用）。
- * confirm：侧栏入口会确认；slash 可跳过以保持快捷。
- */
 async function forkSessionFrom(
   source: ThreadRow,
   opts?: {
@@ -7297,383 +4062,30 @@ async function forkSessionFrom(
     worktreeMode?: "use_main" | "create_new";
   },
 ): Promise<{ ok: boolean; message?: string }> {
-  const cwd = source.cwd || activeCwd || selectedProject()?.path;
-  if (!cwd) return { ok: false, message: tr("slash.forkNeedProject") };
-  if (!source.sessionId) {
-    return { ok: false, message: tr("slash.forkNeedSession") };
-  }
-
-  const baseTitle = threadDisplayTitle(source);
-  // 侧栏确认框只选工作区；directive 仅 slash `/fork …` 传入
-  let directive = opts?.directive?.trim() ?? "";
-  let worktreeMode = opts?.worktreeMode ?? "use_main";
-
-  if (opts?.confirm) {
-    const dlg = await openForkDialog({ worktreeMode });
-    if (!dlg) return { ok: false };
-    worktreeMode = dlg.worktreeMode;
-  }
-
-  // 若正在该会话上跑 turn，先停
-  if (
-    turnActive &&
-    (source.sessionId === activeSessionId || source.id === activeThreadId)
-  ) {
-    void cancelTurn();
-  }
-
-  const projectId = source.projectId || selectedProject()?.id;
-  const forkTitle = tr("slash.forkTitle", { title: baseTitle }).slice(0, 48);
-  // fork 前卸下前台 plan UI；源会话 pending 仅 stash（新会话无该 waiter）
-  closePlanPanelOnSessionChange({
-    stashSessionId: activeSessionId,
-    abandonPending: false,
-  });
-  const res = await inv<{
-    threadId: string;
-    sessionId: string;
-    cwd: string;
-    historyCopied?: boolean;
-    parentSessionId?: string;
-    directiveSent?: boolean;
-    historyCopyError?: string;
-    directiveError?: string;
-    sourceHistoryLines?: number;
-  }>("threads.fork", {
-    sourceSessionId: source.sessionId,
-    cwd,
-    projectId,
-    title: forkTitle,
-    model: source.model || modelLabel,
-    effort: source.effort || effortLevel,
-    directive: directive || undefined,
-    worktree:
-      worktreeMode === "create_new"
-        ? { mode: "create_new" as const }
-        : { mode: "use_main" as const },
-  });
-  if (!res.ok) {
-    return { ok: false, message: res.error?.message ?? tr("slash.forkFail") };
-  }
-
-  const row: ThreadRow = {
-    id: res.data!.threadId,
-    sessionId: res.data!.sessionId,
-    title: forkTitle,
-    cwd: res.data!.cwd,
-    status: "idle",
-    updatedAt: new Date().toISOString(),
-    projectId,
-    sessionKind: "fork",
-    parentSessionId: res.data!.parentSessionId || source.sessionId,
-    model: source.model || modelLabel,
-    effort: source.effort || effortLevel,
-  };
-  if (!threads.some((t) => t.sessionId === row.sessionId)) {
-    threads = [row, ...threads];
-  }
-  await openThread(row);
-  await refreshProjectsAndThreads();
-  const d = res.data!;
-  let msg = d.historyCopied
-    ? tr("slash.forkOkCopied")
-    : (d.sourceHistoryLines ?? 0) > 0 || d.historyCopyError
-      ? tr("slash.forkOkCopyFailed", {
-          err: d.historyCopyError || tr("slash.forkCopyUnknown"),
-        })
-      : tr("slash.forkOkEmpty");
-  if (d.directiveSent) {
-    msg += " · " + tr("slash.forkDirectiveSent");
-  } else if (directive && d.directiveError) {
-    msg += " · " + tr("slash.forkDirectiveFail", { err: d.directiveError });
-  }
-  // 复制失败时用 error toast 更醒目（会话仍已打开）
-  if (!d.historyCopied && ((d.sourceHistoryLines ?? 0) > 0 || d.historyCopyError)) {
-    showToast(msg, "error");
-  }
-  return { ok: true, message: msg };
+  return ensureForkActions().forkFrom(source, opts);
 }
 
-/** Fork 确认：仅工作区（HTML 见 fork-session-ui） */
 function openForkDialog(initial: {
   worktreeMode: "use_main" | "create_new";
 }): Promise<{ worktreeMode: "use_main" | "create_new" } | null> {
-  return new Promise((resolve) => {
-    openModal(tr("session.forkConfirmTitle"), buildForkDialogHtml());
-    const radios = document.querySelectorAll('input[name="fork-wt"]');
-    for (const r of Array.from(radios)) {
-      const input = r as HTMLInputElement;
-      if (input.value === initial.worktreeMode) input.checked = true;
-    }
-    $("fork-dlg-ok").onclick = () => {
-      const result = readForkDialogResult();
-      closeModal();
-      resolve(result);
-    };
-    $("prompt-dlg-cancel").onclick = () => {
-      closeModal();
-      resolve(null);
-    };
-  });
+  return ensureForkActions().openDialog(initial);
 }
 
 /** slash `/fork [directive]`：解析 --worktree / --no-worktree */
 async function forkActiveSession(
   rawArg?: string,
 ): Promise<{ ok: boolean; message?: string }> {
-  const p = selectedProject();
-  const cwd = activeCwd || p?.path;
-  if (!cwd) return { ok: false, message: tr("slash.forkNeedProject") };
-  if (!activeSessionId) {
-    return { ok: false, message: tr("slash.forkNeedSession") };
-  }
-  const { directive: arg, worktreeMode } = parseForkSlashArgs(rawArg ?? "");
-  const source =
-    threads.find((t) => t.sessionId === activeSessionId) ??
-    ({
-      id: activeThreadId || `disk_${activeSessionId}`,
-      sessionId: activeSessionId,
-      title: threadDisplayTitle(
-        threads.find((t) => t.sessionId === activeSessionId),
-        activeSessionId,
-      ),
-      cwd,
-      status: "idle",
-      projectId: p?.id,
-      model: modelLabel,
-      effort: effortLevel,
-    } satisfies ThreadRow);
-  return forkSessionFrom(source, {
-    confirm: false,
-    directive: arg || undefined,
-    worktreeMode,
-  });
+  return ensureForkActions().forkActive(rawArg);
 }
 
-function arrayBufferToBase64(buf: ArrayBuffer): string {
-  const bytes = new Uint8Array(buf);
-  let binary = "";
-  const chunk = 0x8000;
-  for (let i = 0; i < bytes.length; i += chunk) {
-    binary += String.fromCharCode(...bytes.subarray(i, i + chunk));
-  }
-  return btoa(binary);
-}
-
-/**
- * 粘贴图片：
- * - 从资源管理器复制的文件可能带 path → 直接附件
- * - 截图 / 网页复制的图片通常只有内存 Blob、无 path → 落盘到 Desktop 临时目录再附件
- * 原先只认 path，所以「粘贴图片无效」。
- */
+/** 粘贴图片 → 附件（实现见 composer-bind-ui） */
 function bindImagePaste(): void {
-  const onPaste = (e: ClipboardEvent) => {
-    const items = e.clipboardData?.items;
-    if (!items?.length && !e.clipboardData?.files?.length) return;
-
-    const pathSet = new Set<string>();
-    const blobs: File[] = [];
-    const blobKeys = new Set<string>();
-
-    const considerFile = (f: File | null) => {
-      if (!f || !f.type.startsWith("image/")) return;
-      const localPath = resolveLocalFilePath(f);
-      if (localPath) {
-        pathSet.add(localPath);
-        return;
-      }
-      if (f.size <= 0) return;
-      // items + files 常是同一张图的两份 File，按 size|type|name 去重
-      const key = `${f.size}|${f.type}|${f.name || "image"}`;
-      if (blobKeys.has(key)) return;
-      blobKeys.add(key);
-      blobs.push(f);
-    };
-
-    // 优先 DataTransferItemList；有图时不要再扫 files，避免重复
-    let fromItems = 0;
-    for (const it of Array.from(items ?? [])) {
-      if (it.kind === "file" && it.type.startsWith("image/")) {
-        considerFile(it.getAsFile());
-        fromItems++;
-      }
-    }
-    if (fromItems === 0 && e.clipboardData?.files) {
-      for (const f of Array.from(e.clipboardData.files)) {
-        considerFile(f);
-      }
-    }
-
-    if (!pathSet.size && !blobs.length) return;
-
-    // 有图片要处理：阻止默认（避免把乱码/空内容塞进 textarea）
-    e.preventDefault();
-    e.stopPropagation();
-
-    void (async () => {
-      const paths: string[] = [...pathSet];
-      const previewMap: Record<string, string> = {};
-      let tooLarge = 0;
-      let writeFail = 0;
-      for (const blob of blobs) {
-        if (blob.size > MAX_PASTE_IMAGE_BYTES_UI) {
-          tooLarge++;
-          continue;
-        }
-        try {
-          const buf = await blob.arrayBuffer();
-          if (buf.byteLength > MAX_PASTE_IMAGE_BYTES_UI) {
-            tooLarge++;
-            continue;
-          }
-          const base64 = arrayBufferToBase64(buf);
-          const mime = blob.type || "image/png";
-          const res = await inv<{ path: string; name: string }>(
-            "files.writePasteImage",
-            { base64, mime },
-          );
-          if (res.ok && res.data?.path) {
-            if (!paths.includes(res.data.path)) {
-              paths.push(res.data.path);
-            }
-            previewMap[res.data.path] = `data:${mime};base64,${base64}`;
-          } else {
-            writeFail++;
-            showToast(
-              res.error?.message ?? tr("attach.pasteFail"),
-              "error",
-            );
-          }
-        } catch (err) {
-          writeFail++;
-          showToast(String(err), "error");
-        }
-      }
-      if (tooLarge > 0) {
-        showToast(tr("attach.imageTooLarge", { max: "20" }), "error");
-      }
-      if (!paths.length) {
-        if (!tooLarge && !writeFail) {
-          showToast(tr("attach.pasteNone"), "error");
-        }
-        return;
-      }
-      const added = addAttachments(paths, { kind: "image", previewMap });
-      if (added > 0) {
-        showToast(
-          added === 1
-            ? tr("attach.pastedOne")
-            : tr("attach.pastedN", { n: String(added) }),
-        );
-      }
-    })();
-  };
-
-  for (const id of [
-    "composer-input",
-    "chat-input",
-    "focus-input",
-    "btw-side-input",
-  ] as const) {
-    document
-      .getElementById(id)
-      ?.addEventListener("paste", onPaste as EventListener, true);
-  }
+  ensureComposerBind().bindImagePaste();
 }
 
 /** 拖放文件/图片到主输入区 */
 function bindComposerDrop(): void {
-  const hosts = [
-    document.getElementById("welcome"),
-    document.getElementById("chat"),
-  ].filter(Boolean) as HTMLElement[];
-
-  const onDragOver = (e: DragEvent) => {
-    if (!e.dataTransfer?.types?.includes("Files")) return;
-    e.preventDefault();
-    e.dataTransfer.dropEffect = "copy";
-    (e.currentTarget as HTMLElement).classList.add("is-drag-over");
-  };
-  const onDragLeave = (e: DragEvent) => {
-    (e.currentTarget as HTMLElement).classList.remove("is-drag-over");
-  };
-  const onDrop = (e: DragEvent) => {
-    (e.currentTarget as HTMLElement).classList.remove("is-drag-over");
-    const files = e.dataTransfer?.files;
-    if (!files?.length) return;
-    e.preventDefault();
-    e.stopPropagation();
-
-    void (async () => {
-      const paths: string[] = [];
-      const previewMap: Record<string, string> = {};
-      let tooLarge = 0;
-      let skippedNoPath = 0;
-      for (const f of Array.from(files)) {
-        // Electron 35：必须用 webUtils.getPathForFile；File.path 常为空
-        const localPath = resolveLocalFilePath(f);
-        if (localPath) {
-          if (!paths.includes(localPath)) paths.push(localPath);
-          continue;
-        }
-        // 无本地路径：仅图片可落盘为临时附件，其它类型无法挂路径上下文
-        if (!f.type.startsWith("image/") || f.size <= 0) {
-          skippedNoPath++;
-          continue;
-        }
-        if (f.size > MAX_PASTE_IMAGE_BYTES_UI) {
-          tooLarge++;
-          continue;
-        }
-        try {
-          const buf = await f.arrayBuffer();
-          const base64 = arrayBufferToBase64(buf);
-          const mime = f.type || "image/png";
-          const res = await inv<{ path: string; name: string }>(
-            "files.writePasteImage",
-            { base64, mime },
-          );
-          if (res.ok && res.data?.path) {
-            if (!paths.includes(res.data.path)) paths.push(res.data.path);
-            previewMap[res.data.path] = `data:${mime};base64,${base64}`;
-          } else {
-            showToast(
-              res.error?.message ?? tr("attach.pasteFail"),
-              "error",
-            );
-          }
-        } catch (err) {
-          showToast(String(err), "error");
-        }
-      }
-      if (tooLarge > 0) {
-        showToast(tr("attach.imageTooLarge", { max: "20" }), "error");
-      }
-      if (!paths.length) {
-        showToast(
-          skippedNoPath > 0
-            ? tr("attach.dropNoPath")
-            : tr("attach.dropNone"),
-          "error",
-        );
-        return;
-      }
-      const added = addAttachments(paths, {
-        previewMap: Object.keys(previewMap).length ? previewMap : undefined,
-      });
-      if (added > 0) {
-        showToast(tr("attach.addedN", { n: String(added) }));
-      } else if (skippedNoPath > 0) {
-        showToast(tr("attach.dropPartialNoPath", { n: String(skippedNoPath) }), "info");
-      }
-    })();
-  };
-
-  for (const host of hosts) {
-    host.addEventListener("dragover", onDragOver);
-    host.addEventListener("dragleave", onDragLeave);
-    host.addEventListener("drop", onDrop);
-  }
+  ensureComposerBind().bindComposerDrop();
 }
 
 function bindSlashPalette(): void {
@@ -7694,7 +4106,7 @@ function bindSlashPalette(): void {
       const staticIds = new Set(staticCmds.map((c) => c.id.toLowerCase()));
       // 尝试刷新 live 广告（若已附着）
       await refreshAgentAvailableCommands();
-      const acpCmds = agentAdvertisedCommands(agentAvailableCommands, staticIds);
+      const acpCmds = agentAdvertisedCommands(ensureAvailableCommands().list() as Array<{ name: string; description?: string; input?: { hint?: string } }>, staticIds);
       return [
         ...staticCmds,
         ...acpCmds,
@@ -7763,155 +4175,6 @@ function bindAtFilePalette(): void {
 
 // ── 附件 / + 菜单 ─────────────────────────────────────────
 
-/** 与 CLI IMAGE_EXTENSIONS 对齐（无 SVG；含 tiff/tif） */
-const IMAGE_EXT = new Set([
-  "png",
-  "jpg",
-  "jpeg",
-  "gif",
-  "webp",
-  "bmp",
-  "tiff",
-  "tif",
-]);
-/** 与 Host MAX_COMPOSER_ATTACHMENTS 对齐 */
-const MAX_COMPOSER_ATTACHMENTS = 20;
-/** 与 Host MAX_COMPOSER_IMAGES / CLI IMAGE_CAP 对齐 */
-const MAX_COMPOSER_IMAGES = 10;
-/** 粘贴单图客户端预检（Host 再验 20MB） */
-const MAX_PASTE_IMAGE_BYTES_UI = 20 * 1024 * 1024;
-
-/**
- * 解析拖放/剪贴板 File 的本地绝对路径。
- * Electron 35 渲染进程不再可靠暴露 File.path，须走 preload webUtils.getPathForFile。
- */
-function resolveLocalFilePath(file: File): string {
-  try {
-    const viaBridge = window.grokDesktop?.getPathForFile?.(file);
-    if (typeof viaBridge === "string" && viaBridge.trim()) {
-      return viaBridge.trim();
-    }
-  } catch {
-    /* ignore */
-  }
-  const legacy = (file as File & { path?: string }).path;
-  if (typeof legacy === "string" && legacy.trim()) return legacy.trim();
-  return "";
-}
-
-function attachmentKind(filePath: string): "file" | "image" | "folder" {
-  const base = filePath.split(/[/\\]/).pop() ?? filePath;
-  const ext = base.includes(".")
-    ? base.slice(base.lastIndexOf(".") + 1).toLowerCase()
-    : "";
-  return IMAGE_EXT.has(ext) ? "image" : "file";
-}
-
-function attachIcon(kind: ComposerAttachment["kind"]): string {
-  if (kind === "image") return "🖼";
-  if (kind === "folder") return "📁";
-  return "📄";
-}
-
-/**
- * 添加附件；超上限跳过并 toast。返回实际新增个数。
- */
-function addAttachments(
-  paths: string[],
-  opts?: {
-    kind?: ComposerAttachment["kind"];
-    /** path → data URL，粘贴时直接带预览 */
-    previewMap?: Record<string, string>;
-  },
-): number {
-  let added = 0;
-  let skippedDup = 0;
-  let skippedCap = 0;
-  let skippedImageCap = 0;
-  for (const p of paths) {
-    if (!p) continue;
-    const abs = p.replace(/[/\\]+$/, "") || p;
-    if (composerAttachments.some((a) => a.path === abs || a.path === p)) {
-      skippedDup++;
-      continue;
-    }
-    if (composerAttachments.length >= MAX_COMPOSER_ATTACHMENTS) {
-      skippedCap++;
-      continue;
-    }
-    const name = abs.split(/[/\\]/).pop() || abs;
-    const kind = opts?.kind ?? attachmentKind(abs);
-    if (kind === "image") {
-      const imageCount = composerAttachments.filter((a) => a.kind === "image")
-        .length;
-      if (imageCount >= MAX_COMPOSER_IMAGES) {
-        skippedImageCap++;
-        continue;
-      }
-    }
-    const pathKey = kind === "folder" ? abs : p;
-    composerAttachments.push({
-      path: pathKey,
-      name: kind === "folder" ? `${name}/` : name,
-      kind,
-      previewUrl:
-        opts?.previewMap?.[pathKey] ??
-        opts?.previewMap?.[p] ??
-        opts?.previewMap?.[abs],
-    });
-    added++;
-  }
-  if (skippedCap > 0) {
-    showToast(
-      tr("attach.maxReached", { max: String(MAX_COMPOSER_ATTACHMENTS) }),
-      "error",
-    );
-  } else if (skippedImageCap > 0) {
-    showToast(
-      tr("attach.imageMaxReached", { max: String(MAX_COMPOSER_IMAGES) }),
-      "error",
-    );
-  } else if (skippedDup > 0 && added === 0 && paths.length > 0) {
-    showToast(tr("attach.alreadyAdded"), "info");
-  }
-  renderAttachmentChips();
-  void loadMissingImagePreviews();
-  return added;
-}
-
-function removeAttachment(path: string): void {
-  composerAttachments = composerAttachments.filter((a) => a.path !== path);
-  renderAttachmentChips();
-}
-
-function clearAttachments(): void {
-  composerAttachments = [];
-  renderAttachmentChips();
-}
-
-/** 无 previewUrl 的图片附件：Host 读成 data URL */
-async function loadMissingImagePreviews(): Promise<void> {
-  const need = composerAttachments.filter(
-    (a) => a.kind === "image" && !a.previewUrl && a.path,
-  );
-  if (!need.length) return;
-  let changed = false;
-  await Promise.all(
-    need.map(async (a) => {
-      const res = await inv<{ dataUrl: string }>("files.readDataUrl", {
-        path: a.path,
-        sessionId: activeSessionId || undefined,
-      });
-      if (res.ok && res.data?.dataUrl) {
-        a.previewUrl = res.data.dataUrl;
-        changed = true;
-      }
-    }),
-  );
-  if (changed) renderAttachmentChips();
-}
-
-/** P1：工作区路径统一打开（附件 / file-link / 搜索 / 插件） */
 function openPathInWorkspace(
   opts: OpenWorkspacePathOpts,
 ): Promise<"lightbox" | "side-pane" | "system" | "noop"> {
@@ -7934,105 +4197,9 @@ function openPathInWorkspace(
   );
 }
 
-function openComposerImagePreview(a: ComposerAttachment): void {
-  void openPathInWorkspace({
-    path: a.path,
-    kind: "image",
-    previewUrl: a.previewUrl,
-    name: a.name,
-    sessionId: activeSessionId,
-  });
-}
 
-function renderAttachmentChips(): void {
-  for (const id of ["composer-attachments", "chat-attachments"] as const) {
-    const el = document.getElementById(id);
-    if (!el) continue;
-    if (!composerAttachments.length) {
-      el.classList.add("hidden");
-      el.innerHTML = "";
-      continue;
-    }
-    el.classList.remove("hidden");
-    el.innerHTML = composerAttachments
-      .map((a) => {
-        if (a.kind === "image") {
-          const src = a.previewUrl
-            ? a.previewUrl.replace(/"/g, "&quot;")
-            : "";
-          return `<button type="button" class="attach-thumb" data-path="${esc(a.path)}" title="${esc(a.name)} · 点击查看">
-            ${
-              src
-                ? `<img class="attach-thumb-img" src="${src}" alt="${esc(a.name)}" draggable="false" />`
-                : `<span class="attach-thumb-ph">${attachIcon("image")}</span>`
-            }
-            <span class="attach-chip-x" data-path="${esc(a.path)}" aria-label=tr("plug.remove")>×</span>
-          </button>`;
-        }
-        return `<span class="attach-chip" data-path="${esc(a.path)}" title="${esc(a.path)}">
-            <span class="attach-chip-ico">${attachIcon(a.kind)}</span>
-            <span class="attach-chip-name">${esc(a.name)}</span>
-            <button type="button" class="attach-chip-x" data-path="${esc(a.path)}" aria-label=tr("plug.remove")>×</button>
-          </span>`;
-      })
-      .join("");
 
-    for (const btn of Array.from(el.querySelectorAll(".attach-chip-x"))) {
-      (btn as HTMLElement).onclick = (e) => {
-        e.stopPropagation();
-        e.preventDefault();
-        removeAttachment((btn as HTMLElement).dataset.path ?? "");
-      };
-    }
-    for (const thumb of Array.from(el.querySelectorAll(".attach-thumb"))) {
-      (thumb as HTMLElement).onclick = (e) => {
-        if ((e.target as HTMLElement).closest(".attach-chip-x")) return;
-        const p = (thumb as HTMLElement).dataset.path ?? "";
-        const a = composerAttachments.find((x) => x.path === p);
-        if (a) openComposerImagePreview(a);
-      };
-    }
-  }
-}
 
-/** 用户可见消息 + 发给 agent 的完整内容（含附件上下文） */
-function buildPromptWithAttachments(userText: string): {
-  display: string;
-  content: string;
-} {
-  const display = userText.trim();
-  if (!composerAttachments.length) {
-    return { display, content: display };
-  }
-  const block = composerAttachments
-    .map((a) => {
-      const label =
-        a.kind === "image" ? "image" : a.kind === "folder" ? "folder" : "file";
-      return `- ${label}: ${a.path}`;
-    })
-    .join("\n");
-  const content = display
-    ? `${display}\n\n[Attachments — include these paths in context; for folders, consider the directory tree]\n${block}`
-    : `[Attachments — include these paths in context; for folders, consider the directory tree]\n${block}`;
-  return { display: display || `（${composerAttachments.length} 个附件）`, content };
-}
-
-async function pickAndAddAttachments(): Promise<void> {
-  const p = selectedProject();
-  const res = await inv<{ paths: string[]; canceled?: boolean }>(
-    "system.pickFiles",
-    {
-      title: tr("attach.pickTitle"),
-      defaultPath: p?.path,
-      multi: true,
-    },
-  );
-  if (!res.ok || res.data?.canceled || !res.data?.paths?.length) return;
-  const added = addAttachments(res.data.paths);
-  if (added > 0) {
-    showToast(tr("attach.addedN", { n: String(added) }));
-  }
-}
 
 function activeComposerInput(): HTMLTextAreaElement {
   const welcomeHidden = $("welcome").classList.contains("hidden");
@@ -8058,314 +4225,25 @@ function setComposerPlaceholders(goalMode: boolean): void {
 
 /**
  * /goal 或 +目标 / 点目标 chip：进入 compose。
- * prefill 有值才写入；undefined 保留输入框已有正文（Codex open goal editor 同款）。
+ * prefill 有值才写入；undefined 保留输入框已有正文。
  */
 function beginGoalCompose(
   prefill?: string,
   opts?: { toastKey?: "slash.goalDesc" | "goal.composeArmed" | null },
 ): void {
-  goalComposeActive = true;
-  // UI 互斥：开 goal 时只显示 goal chip（plan 状态可仍在 session）
-  sessionModeChipFocus = "goal";
-  setComposerPlaceholders(true);
-  syncSessionModeChips();
-  const ta = activeComposerInput();
-  if (prefill != null) ta.value = prefill;
-  requestAnimationFrame(() => {
-    ta.focus();
-    const n = ta.value.length;
-    ta.setSelectionRange(n, n);
-  });
-  const toastKey = opts?.toastKey === null ? null : (opts?.toastKey ?? "slash.goalDesc");
-  if (toastKey) showToast(tr(toastKey));
+  ensureGoalRuntime().beginCompose(prefill, opts);
 }
 
-/**
- * 编辑目标：弹窗改写 objective（不占用主输入框）。
- * 确认后 optimistic 更新 banner；若已有未完成 goal 则立刻 `/goal …` 重设（对齐 CLI 再设目标）。
- */
-function promptEditGoal(): Promise<void> {
-  const prefill = currentGoalTitle() ?? "";
-  return new Promise((resolve) => {
-    openModal(
-      tr("goal.edit"),
-      `<p class="prompt-dlg-hint">${esc(tr("goal.editHint"))}</p>
-       <textarea id="goal-edit-input" class="prompt-dlg-input prompt-dlg-textarea" rows="4"
-         placeholder="${esc(tr("goal.editPlaceholder"))}">${esc(prefill)}</textarea>
-       <div class="prompt-dlg-actions">
-         <button type="button" class="btn-ghost" id="prompt-dlg-cancel">${esc(tr("common.cancel"))}</button>
-         <button type="button" class="btn-dark" id="prompt-dlg-ok">${esc(tr("common.ok"))}</button>
-       </div>`,
-    );
-    const input = $("goal-edit-input") as HTMLTextAreaElement;
-    const finish = (v: string | null) => {
-      closeModal();
-      if (v == null) {
-        resolve();
-        return;
-      }
-      void (async () => {
-        const hadLive =
-          Boolean(goalProjection) && !goalCompleted();
-        const r = await applyGoalTitle(v);
-        if (!r.ok) {
-          if (r.message) showToast(r.message, "error");
-          resolve();
-          return;
-        }
-        // 已有 agent 侧目标：立刻重设；仅 pending/草稿则等下次发送拼 /goal
-        if (hadLive && pendingGoalTitle) {
-          const line = agentContentForSend("", pendingGoalTitle);
-          const ok = await sendAgentGoalSlash(line);
-          showToast(
-            ok ? tr("goal.editedToast") : tr("goal.setFail"),
-            ok ? "info" : "error",
-          );
-        } else {
-          showToast(tr("goal.editedToast"));
-        }
-        resolve();
-      })();
-    };
-    $("prompt-dlg-cancel").onclick = () => finish(null);
-    $("prompt-dlg-ok").onclick = () => finish(input.value);
-    input.onkeydown = (ev) => {
-      if (ev.key === "Escape") {
-        ev.preventDefault();
-        finish(null);
-      }
-      // Ctrl/Cmd+Enter 确认；单独 Enter 换行
-      if (ev.key === "Enter" && (ev.ctrlKey || ev.metaKey)) {
-        ev.preventDefault();
-        finish(input.value);
-      }
-    };
-    requestAnimationFrame(() => {
-      input.focus();
-      const n = input.value.length;
-      input.setSelectionRange(n, n);
-    });
-  });
-}
-
-function formatGoalElapsed(ms: number): string {
-  const s = Math.max(0, Math.floor(ms / 1000));
-  if (s < 60) return `· ${s}s`;
-  const m = Math.floor(s / 60);
-  const r = s % 60;
-  if (m < 60) return `· ${m}m${r ? ` ${r}s` : ""}`;
-  const h = Math.floor(m / 60);
-  const rm = m % 60;
-  return `· ${h}h${rm ? ` ${rm}m` : ""}`;
-}
-
-/** live elapsed：floor 与 wire 基线 + active 时 wall 外推（对齐 pager） */
-function goalElapsedMsNow(): number {
-  if (!goalProjection) return 0;
-  const base = Math.max(
-    goalProjection.elapsedFloorMs,
-    goalProjection.elapsedMs,
-  );
-  if (goalPaused() || goalCompleted()) return base;
-  if (goalElapsedAnchorAt == null) return base;
-  return base + (Date.now() - goalElapsedAnchorAt);
-}
-
-function stopGoalElapsedTimer(): void {
-  if (goalElapsedTimer) {
-    clearInterval(goalElapsedTimer);
-    goalElapsedTimer = null;
-  }
-}
-
-function startGoalElapsedTimer(): void {
-  stopGoalElapsedTimer();
-  if (!goalProjection || goalPaused() || goalCompleted()) return;
-  const tick = () => {
-    const el = formatGoalElapsed(goalElapsedMsNow());
-    for (const node of Array.from(
-      document.querySelectorAll("[data-goal-elapsed]"),
-    )) {
-      node.textContent = el;
-    }
-  };
-  tick();
-  goalElapsedTimer = setInterval(tick, 1000);
-}
-
-function stopGoalSyncTimer(): void {
-  if (goalSyncTimer) {
-    clearInterval(goalSyncTimer);
-    goalSyncTimer = null;
-  }
-}
-
-function ensureGoalSyncTimer(): void {
-  if (goalSyncTimer) return;
-  if (!goalProjection || goalCompleted()) return;
-  goalSyncTimer = setInterval(() => {
-    if (!goalProjection || goalCompleted()) {
-      stopGoalSyncTimer();
-      return;
-    }
-    void syncGoalFromAgent();
-  }, 1500);
-}
-
-/** 从 agent updates.jsonl bootstrap / 校准投影 */
-async function syncGoalFromAgent(): Promise<void> {
-  if (!activeSessionId) return;
-  const res = await inv<{
-    projection?: GoalUiProjection | null;
-    agent?: {
-      objective?: string;
-      status?: string;
-      lastEvent?: string;
-      lastEventDetail?: string;
-      elapsedMs?: number;
-      goalId?: string;
-      phase?: string;
-      tokenBudget?: number | null;
-      tokensUsed?: number;
-      message?: string;
-      verifyingCompletion?: boolean;
-      planning?: boolean;
-    } | null;
-  }>("goals.sync", { sessionId: activeSessionId });
-  if (!res.ok) return;
-  const agent = res.data?.agent;
-  if (agent?.status) {
-    applyAgentGoalEvent({
-      sessionId: activeSessionId,
-      goalId: agent.goalId,
-      objective: agent.objective,
-      status: agent.status,
-      phase: agent.phase,
-      tokenBudget: agent.tokenBudget,
-      tokensUsed: agent.tokensUsed,
-      lastEvent: agent.lastEvent,
-      lastEventDetail: agent.lastEventDetail,
-      elapsedMs: agent.elapsedMs,
-      message: agent.message,
-      verifyingCompletion: agent.verifyingCompletion,
-      planning: agent.planning,
-    });
-  }
-  // jsonl 无条目时不清除 live 投影（防 ACP 尾读漏扫误清）
-}
-
-/**
- * 清掉目标 UI 内存态（不弹 toast）。
- * 用于：cleared、换会话、用户 clear。
- */
-function resetGoalUiState(): void {
-  pendingGoalTitle = null;
-  goalProjection = null;
-  goalElapsedAnchorAt = null;
-  goalComposeActive = false;
-  if (sessionModeChipFocus === "goal") {
-    sessionModeChipFocus = isPlanOn() ? "plan" : null;
-  }
-  if (goalCompleteHideTimer) {
-    clearTimeout(goalCompleteHideTimer);
-    goalCompleteHideTimer = null;
-  }
-  stopGoalSyncTimer();
-  stopGoalElapsedTimer();
-  setComposerPlaceholders(false);
-}
-
-function renderGoalBanner(): void {
-  const title = currentGoalTitle();
-  const on = Boolean(title) || goalComposeActive;
-  const paused = goalPaused();
-  const done = goalCompleted();
-  for (const id of ["goal-banner-welcome", "goal-banner-chat"] as const) {
-    const el = document.getElementById(id);
-    if (!el) continue;
-    // compose 草稿：chip 已显，banner 仅有投影时显
-    el.classList.toggle("hidden", !goalProjection && !pendingGoalTitle);
-    el.classList.toggle("is-paused", paused && !done);
-    el.classList.toggle("is-completed", done);
-    const t = el.querySelector("[data-goal-title]");
-    if (t) t.textContent = title ?? "";
-    const kicker = el.querySelector(".goal-banner-kicker");
-    if (kicker) {
-      kicker.textContent = goalProjection
-        ? goalStatusKicker(goalProjection.status)
-        : pendingGoalTitle
-          ? tr("goal.kicker")
-          : tr("goal.kicker");
-    }
-    // 目标条只保留 kicker + 标题 + 耗时；phase/hint 与 kicker 重复且撑爆单行
-    const phaseEl = el.querySelector("[data-goal-phase]");
-    if (phaseEl) phaseEl.textContent = "";
-    const hintEl = el.querySelector("[data-goal-hint]");
-    if (hintEl) hintEl.textContent = "";
-    const pauseBtn = el.querySelector(
-      "[data-goal-pause]",
-    ) as HTMLElement | null;
-    const resumeBtn = el.querySelector(
-      "[data-goal-resume]",
-    ) as HTMLElement | null;
-    const editBtn = el.querySelector(
-      '[data-goal-act="edit"]',
-    ) as HTMLElement | null;
-    pauseBtn?.classList.toggle("hidden", paused || done || !goalProjection);
-    resumeBtn?.classList.toggle("hidden", !paused || done);
-    resumeBtn?.classList.toggle("is-primary", Boolean(paused && !done));
-    // complete：保留 banner 看 objective；暂停/恢复无意义，编辑仍可开新目标文案
-    if (resumeBtn) {
-      if (paused && !done && goalProjection) {
-        // hover 给短状态提示；不把 agent 错误贴进 title 全文
-        resumeBtn.title =
-          goalPauseHintText(goalProjection.status) || tr("goal.resumeHint");
-      } else {
-        resumeBtn.title = tr("goal.resume");
-      }
-    }
-    if (editBtn && done) {
-      editBtn.title = tr("goal.edit");
-    }
-  }
-  const canTick =
-    Boolean(goalProjection) &&
-    !paused &&
-    !done &&
-    goalElapsedAnchorAt != null;
-  if (canTick) {
-    startGoalElapsedTimer();
-    ensureGoalSyncTimer();
-  } else {
-    stopGoalElapsedTimer();
-    if (goalProjection && !done) ensureGoalSyncTimer();
-    else stopGoalSyncTimer();
-    const base = goalProjection
-      ? Math.max(goalProjection.elapsedFloorMs, goalProjection.elapsedMs)
-      : 0;
-    const el = formatGoalElapsed(goalElapsedMsNow());
-    for (const node of Array.from(
-      document.querySelectorAll("[data-goal-elapsed]"),
-    )) {
-      node.textContent = goalProjection && base > 0 ? el : "";
-    }
-  }
-  syncSessionModeChips();
-}
-
-/** 向 agent 发送 CLI 同源斜杠（激活/暂停/恢复/清除 goal 模式） */
-async function sendAgentGoalSlash(slashLine: string): Promise<boolean> {
-  const line = slashLine.trim();
-  if (!line.startsWith("/goal")) return false;
-  try {
-    const threadId = await ensureLiveThread();
-    if (!threadId) return false;
-    const res = await inv("turns.prompt", { threadId, content: line });
-    return res.ok;
-  } catch {
-    return false;
-  }
-}
+const promptEditGoal = () => ensureGoalSlashActions().promptEditGoal();
+const goalElapsedMsNow = () => ensureGoalBanner().elapsedMsNow();
+const stopGoalElapsedTimer = () => ensureGoalBanner().stopElapsedTimer();
+const stopGoalSyncTimer = () => ensureGoalBanner().stopSyncTimer();
+const ensureGoalSyncTimer = () => ensureGoalBanner().ensureSyncTimer();
+const syncGoalFromAgent = () => ensureGoalRuntime().syncFromAgent();
+const resetGoalUiState = () => ensureGoalRuntime().resetUiState();
+const renderGoalBanner = () => ensureGoalBanner().render();
+const sendAgentGoalSlash = (slashLine: string) =>
+  ensureGoalRuntime().sendAgentSlash(slashLine);
 
 /**
  * 应用 agent 运行时 goal_updated（同源状态机）
@@ -8375,581 +4253,29 @@ async function sendAgentGoalSlash(slashLine: string): Promise<boolean> {
  * 不可把已完成状态打回进行中。
  */
 
-/** 父会话 subagent 进度：轻量 toast + 过程区提示（完整树可后续做侧栏） */
-function handleSubagentUpdated(ev: {
-  sessionId?: string;
-  parentSessionId?: string;
-  subagentId: string;
-  phase: string;
-  status: string;
-  subagentType?: string;
-  description?: string;
-  error?: string;
-  childSessionId?: string;
-}): void {
-  const parent = ev.parentSessionId || ev.sessionId;
-  if (
-    activeSessionId &&
-    parent &&
-    parent !== activeSessionId &&
-    ev.sessionId &&
-    ev.sessionId !== activeSessionId
-  ) {
-    return;
-  }
-  // 侧栏树增量（与 Host subagents.json 投影对齐）
-  sidePane?.applySubagentUpdate(ev);
-  const short = (ev.subagentId || "").slice(0, 8);
-  const kind = ev.subagentType || "subagent";
-  if (ev.phase === "spawned") {
-    showToast(
-      tr("subagent.spawned", { type: kind, id: short }),
-      "info",
-    );
-    return;
-  }
-  if (ev.phase === "finished") {
-    const st = String(ev.status || "").toLowerCase();
-    if (st === "failed" || st === "error") {
-      showToast(
-        ev.error ||
-          tr("subagent.failed", { type: kind, id: short }),
-        "error",
-      );
-    } else if (st === "cancelled" || st === "canceled") {
-      showToast(tr("subagent.cancelled", { id: short }));
-    } else {
-      showToast(tr("subagent.completed", { type: kind, id: short }));
-    }
-  }
-}
+/** 父会话 subagent 进度 / 后台 task → SubagentTaskEventHandlers */
+const handleSubagentUpdated = (
+  ev: Parameters<SubagentTaskEventHandlers["handleSubagentUpdated"]>[0],
+) => ensureSubagentTaskHandlers().handleSubagentUpdated(ev);
 
+const handleTaskUpdated = (
+  ev: Parameters<SubagentTaskEventHandlers["handleTaskUpdated"]>[0],
+) => ensureSubagentTaskHandlers().handleTaskUpdated(ev);
 
-/** 后台任务 / monitor：过程区 + toast（对齐 CLI TaskCompleted / TaskBackgrounded） */
-function handleTaskUpdated(ev: {
-  sessionId?: string;
-  taskId: string;
-  phase: string;
-  command?: string;
-  description?: string;
-  isMonitor?: boolean;
-  success?: boolean;
-  willWake?: boolean;
-  exitCode?: number | null;
-  signal?: string;
-  durationMs?: number;
-  eventText?: string;
-  staleOnLoad?: boolean;
-}): void {
-  rememberTaskSnap(ev);
-  if (
-    activeSessionId &&
-    ev.sessionId &&
-    ev.sessionId !== activeSessionId
-  ) {
-    return;
-  }
-  const short = (ev.taskId || "").slice(0, 8);
-  const label =
-    (ev.description || ev.command || "").trim() ||
-    (ev.isMonitor ? "monitor" : "task");
-  const kind = ev.isMonitor ? "monitor" : "task";
-
-  if (ev.phase === "backgrounded") {
-    const line = ev.isMonitor
-      ? tr("task.monitorStarted", { desc: label, id: short })
-      : tr("task.started", { cmd: label, id: short });
-    appendProcessText(line);
-    showToast(line, "info");
-    return;
-  }
-
-  if (ev.phase === "monitor") {
-    const text = (ev.eventText || "").trim();
-    if (text) {
-      appendProcessText(
-        tr("task.monitorEvent", {
-          desc: label,
-          text: text.length > 200 ? text.slice(0, 200) + "…" : text,
-        }),
-      );
-    }
-    return;
-  }
-
-  if (ev.phase === "completed") {
-    if (ev.staleOnLoad) {
-      // 冷加载合成完成：只写过程区，不 toast
-      appendProcessText(
-        tr("task.staleOnLoad", { desc: label, id: short }),
-      );
-      return;
-    }
-    const ok = ev.success !== false;
-    let line: string;
-    if (ok) {
-      line = tr("task.completed", { desc: label, id: short });
-      if (ev.willWake) {
-        line += " · " + tr("task.willWake");
-      }
-      appendProcessText(line);
-      showToast(line, "info");
-    } else {
-      const detail =
-        ev.signal ||
-        (ev.exitCode != null ? `exit ${ev.exitCode}` : "") ||
-        "";
-      line = tr("task.failed", {
-        desc: label,
-        id: short,
-        detail: detail || "error",
-      });
-      appendProcessText(line);
-      showToast(line, "error");
-    }
-  }
-}
-
-/**
- * 应用 agent goal_updated（唯一抬起/更新目标 UI 的路径）。
- * 无 opt-in 锁：有 wire 投影就显示（对齐 CLI pager）。
- * 迟到同 goalId after clear → 丢弃。
- */
-function applyAgentGoalEvent(ev: {
-  sessionId?: string;
-  goalId?: string;
-  objective?: string;
-  status: string;
-  phase?: string;
-  tokenBudget?: number | null;
-  tokensUsed?: number;
-  elapsedMs?: number;
-  message?: string;
-  lastEvent?: string;
-  lastEventDetail?: string;
-  verifyingCompletion?: boolean;
-  planning?: boolean;
-}): void {
-  if (
-    activeSessionId &&
-    ev.sessionId &&
-    ev.sessionId !== activeSessionId
-  ) {
-    return;
-  }
-
-  const st = parseGoalUiStatus(ev.status);
-  const goalId = String(ev.goalId ?? "").trim();
-  const last = String(ev.lastEvent ?? "").toLowerCase();
-
-  if (st === "cleared" || last === "goal_cleared" || last === "goal_cancelled") {
-    const had = Boolean(goalProjection || pendingGoalTitle);
-    if (goalId) goalLocalClearedIds.add(goalId);
-    if (goalProjection?.goalId) goalLocalClearedIds.add(goalProjection.goalId);
-    resetGoalUiState();
-    renderGoalBanner();
-    // goal 轴变了：Working 条可能从 draining 回到「工作中」
-    refreshTurnPhaseActivityLabel();
-    if (activeSessionId) {
-      void inv("goals.clear", { sessionId: activeSessionId });
-    }
-    if (had && (String(ev.status).toLowerCase() === "cancelled" ||
-      String(ev.status).toLowerCase() === "canceled") && last) {
-      showToast(tr("goal.cancelledToast"));
-    }
-    return;
-  }
-
-  // clear 后同 id 迟到 → 丢弃
-  if (goalId && goalLocalClearedIds.has(goalId)) {
-    return;
-  }
-
-  const sameGoal =
-    Boolean(
-      goalProjection &&
-        ((goalId && goalProjection.goalId === goalId) ||
-          (!goalId && goalProjection.goalId)),
-    );
-  const newGoal =
-    Boolean(goalId && goalProjection && goalProjection.goalId !== goalId);
-
-  // 对齐 CLI GoalTracker：complete 后 pause 为 no-op。
-  // 已 complete / budget_limited 时拒绝同 goal 被 active/paused 等降级
-  //（rate-limit 迟到 goal_updated 会把「已完成」打成「已暂停(错误)」）。
-  // cleared 已在上方 early-return，此处 st 仅为 GoalUiStatus。
-  if (
-    sameGoal &&
-    goalProjection &&
-    ((goalProjection.status === "complete" && st !== "complete") ||
-      (goalProjection.status === "budget_limited" &&
-        st !== "complete" &&
-        st !== "budget_limited"))
-  ) {
-    return;
-  }
-
-  // 已 complete 时忽略滞后 active（classifier 前）— 上块已覆盖；保留 goal_created 特判
-  if (
-    goalProjection?.status === "complete" &&
-    (st === "active" || last === "goal_created")
-  ) {
-    return;
-  }
-
-  const wireElapsed =
-    typeof ev.elapsedMs === "number" && ev.elapsedMs >= 0
-      ? Math.floor(ev.elapsedMs)
-      : (goalProjection?.elapsedMs ?? 0);
-
-  let elapsedFloorMs = wireElapsed;
-  if (sameGoal && goalProjection) {
-    elapsedFloorMs = Math.max(
-      goalProjection.elapsedFloorMs,
-      goalProjection.elapsedMs,
-      wireElapsed,
-    );
-  } else if (newGoal) {
-    elapsedFloorMs = wireElapsed;
-    goalElapsedAnchorAt = null;
-  }
-
-  const objective =
-    (ev.objective ?? "").trim() ||
-    goalProjection?.objective ||
-    pendingGoalTitle ||
-    "Goal";
-
-  const prevStatus = goalProjection?.status;
-  goalProjection = {
-    goalId: goalId || goalProjection?.goalId || `anon-${Date.now()}`,
-    objective,
-    status: st,
-    phase:
-      ev.phase === "planning" || ev.phase === "executing" || ev.phase === "idle"
-        ? ev.phase
-        : (goalProjection?.phase ?? "idle"),
-    tokenBudget:
-      ev.tokenBudget !== undefined
-        ? ev.tokenBudget
-        : (goalProjection?.tokenBudget ?? goalTokenBudget),
-    tokensUsed:
-      typeof ev.tokensUsed === "number"
-        ? ev.tokensUsed
-        : (goalProjection?.tokensUsed ?? 0),
-    elapsedMs: wireElapsed,
-    elapsedFloorMs,
-    pauseMessage: ev.message ?? goalProjection?.pauseMessage,
-    lastEvent: ev.lastEvent ?? goalProjection?.lastEvent,
-    verifyingCompletion: Boolean(
-      ev.verifyingCompletion ?? goalProjection?.verifyingCompletion,
-    ),
-    planning: Boolean(ev.planning ?? goalProjection?.planning),
-  };
-
-  if (goalId) goalLocalClearedIds.delete(goalId);
-  pendingGoalTitle = null;
-  goalComposeActive = false;
-  setComposerPlaceholders(false);
-
-  if (goalProjection.tokenBudget != null && goalProjection.tokenBudget > 0) {
-    goalTokenBudget = goalProjection.tokenBudget;
-  }
-
-  if (st === "complete") {
-    goalElapsedAnchorAt = null;
-    // 保留投影 + banner，直到用户 clear / 新 goal；不自动 8s 清空
-    //（否则重进已完成会话看不到「之前的目标是什么」）
-    // toast 仅 live 从非 complete → complete；冷加载 / 重复 complete 不弹
-    markGoalCompletedUi(objective || tr("composer.goal"), {
-      // 冷加载 prevStatus 为 null：不 toast；live 首次 complete：toast
-      toast: prevStatus != null && prevStatus !== "complete",
-    });
-    // complete 后 turn 仍 busy → 过程条「收尾中」；并对账 Host 是否真仍 in-flight
-    refreshTurnPhaseActivityLabel();
-    if (prevStatus !== "complete") {
-      scheduleReconcileTurnAfterGoalStopped();
-    }
-    return;
-  }
-
-  if (goalCompleteHideTimer) {
-    clearTimeout(goalCompleteHideTimer);
-    goalCompleteHideTimer = null;
-  }
-
-  const becamePaused =
-    st === "user_paused" ||
-    st === "back_off_paused" ||
-    st === "no_progress_paused" ||
-    st === "infra_paused" ||
-    st === "blocked" ||
-    st === "budget_limited";
-
-  if (becamePaused) {
-    goalElapsedAnchorAt = null;
-    if (st === "blocked" && prevStatus !== "blocked") {
-      showToast(ev.message?.trim() || tr("goal.blocked"), "error");
-    } else if (
-      st === "budget_limited" &&
-      prevStatus !== "budget_limited"
-    ) {
-      showToast(tr("goal.budgetLimitedToast"), "error");
-    } else if (st === "infra_paused" && prevStatus !== "infra_paused") {
-      // 不冒充 complete：toast 写明「尚未标记完成」+ 可恢复
-      const msg = (ev.message ?? "").trim();
-      showToast(
-        msg
-          ? msg.length > 160
-            ? `${msg.slice(0, 160)}…`
-            : msg
-          : tr("goal.infraPausedToast"),
-        "error",
-      );
-    }
-  } else if (st === "active") {
-    // live active：从现在外推；冷加载无 anchor 时只显示 wire base
-    if (goalElapsedAnchorAt == null && prevStatus != null) {
-      goalElapsedAnchorAt = Date.now();
-    } else if (prevStatus && prevStatus !== "active") {
-      goalElapsedAnchorAt = Date.now();
-    } else if (prevStatus === "active" && goalElapsedAnchorAt == null) {
-      // live 更新：开始外推
-      goalElapsedAnchorAt = Date.now();
-    }
-  }
-
-  renderGoalBanner();
-  // P1：pause/active 切换时刷新过程条（paused+busy → 收尾中）
-  refreshTurnPhaseActivityLabel();
-  // 进入 pause 族：与 Host 对账，避免「目标已停 + 假工作中/假 tool」
-  if (becamePaused && prevStatus !== st) {
-    scheduleReconcileTurnAfterGoalStopped();
-  }
-}
-
-/**
- * 进入 complete UI：banner 持续展示 objective（kicker=已完成），
- * 不自动清投影。toast 仅在状态从非 complete → complete 时弹出。
- */
-function markGoalCompletedUi(
-  message: string,
-  opts?: { toast?: boolean },
-): void {
-  if (goalCompleteHideTimer) {
-    clearTimeout(goalCompleteHideTimer);
-    goalCompleteHideTimer = null;
-  }
-  if (!goalProjection) {
-    goalProjection = {
-      goalId: "complete",
-      objective: message || tr("composer.goal"),
-      status: "complete",
-      phase: "idle",
-      tokenBudget: goalTokenBudget,
-      tokensUsed: 0,
-      elapsedMs: 0,
-      elapsedFloorMs: 0,
-      verifyingCompletion: false,
-      planning: false,
-    };
-  } else {
-    goalProjection = {
-      ...goalProjection,
-      status: "complete",
-      // 保留 objective；不要用 toast 文案盖掉目标标题
-      objective:
-        goalProjection.objective?.trim() ||
-        message ||
-        tr("composer.goal"),
-    };
-  }
-  goalElapsedAnchorAt = null;
-  goalComposeActive = false;
-  stopGoalSyncTimer();
-  setComposerPlaceholders(false);
-  sessionModeChipFocus = "goal";
-  renderGoalBanner();
-  if (opts?.toast) {
-    showToast(tr("goal.completedToast"));
-  }
-}
-
-async function pauseGoal(opts?: { fromStop?: boolean }): Promise<void> {
-  if (!currentGoalTitle() || goalPaused() || goalCompleted()) return;
-  // 乐观：本地标 pause；真源以 wire 为准
-  if (goalProjection) {
-    goalProjection = {
-      ...goalProjection,
-      status: "user_paused",
-      elapsedMs: goalElapsedMsNow(),
-      elapsedFloorMs: Math.max(
-        goalProjection.elapsedFloorMs,
-        goalElapsedMsNow(),
-      ),
-    };
-  }
-  goalElapsedAnchorAt = null;
-  renderGoalBanner();
-  showToast(
-    opts?.fromStop ? tr("goal.pausedStop") : tr("goal.pausedToast"),
-  );
-  // 仅 slash，不写本地 setStatus
-  if (activeThreadId && !activeThreadId.startsWith("disk_")) {
-    const ok = await sendAgentGoalSlash("/goal pause");
-    if (!ok) showToast(tr("goal.pauseFail"), "error");
-  } else {
-    void sendAgentGoalSlash("/goal pause");
-  }
-}
-
-async function resumeGoal(): Promise<void> {
-  if (!currentGoalTitle() || !goalPaused()) return;
-  if (goalProjection) {
-    goalProjection = { ...goalProjection, status: "active" };
-  }
-  goalElapsedAnchorAt = Date.now();
-  renderGoalBanner();
-  showToast(tr("goal.resumedToast"));
-  const ok = await sendAgentGoalSlash("/goal resume");
-  if (!ok) showToast(tr("goal.resumeFail"), "error");
-}
-
-function bindGoalBanner(): void {
-  document.addEventListener("click", (e) => {
-    const btn = (e.target as HTMLElement).closest("[data-goal-act]") as HTMLElement | null;
-    if (!btn) return;
-    const act = btn.dataset.goalAct;
-    if (act === "edit") {
-      void promptEditGoal();
-    }
-    if (act === "pause") {
-      void pauseGoal();
-    }
-    if (act === "resume") {
-      void resumeGoal();
-    }
-    if (act === "clear") {
-      void runGoalCommand("clear").then((r) => {
-        if (r.message) showToast(r.message, r.ok ? "info" : "error");
-      });
-    }
-  });
-}
-
-/**
- * 解析输入中的 goal：
- * - forceGoal / goalComposeActive 时整段文本为目标（只走 /goal，不当普通消息）
- * - `/goal 内容` 或单独 `/goal`
- *
- * forceGoal：发送路径在 await 前快照 compose 标志，避免确认框等异步后标志被清掉。
- */
-function parseGoalInput(
-  raw: string,
-  opts?: { forceGoal?: boolean },
-): {
-  /** 纯 `/goal` 无正文 → 进入 compose，不发送 */
-  enterComposeOnly: boolean;
-  /** 解析出的目标标题 */
-  goalTitle: string | null;
-  /** 去掉 /goal 前缀后的发送正文 */
-  message: string;
-} {
-  const text = raw.trim();
-  const m = text.match(/^\/goal(?:\s+([\s\S]+))?$/i);
-  if (m) {
-    const body = (m[1] ?? "").trim();
-    if (!body) return { enterComposeOnly: true, goalTitle: null, message: "" };
-    const parsed = parseGoalBudget(body);
-    if (parsed.budget != null) goalTokenBudget = parsed.budget;
-    return {
-      enterComposeOnly: false,
-      goalTitle: parsed.objective,
-      message: parsed.objective,
-    };
-  }
-  // 目标模式：正文 = objective，绝不回落成普通消息
-  if ((opts?.forceGoal || goalComposeActive) && text) {
-    const parsed = parseGoalBudget(text);
-    if (parsed.budget != null) goalTokenBudget = parsed.budget;
-    return {
-      enterComposeOnly: false,
-      goalTitle: parsed.objective,
-      message: parsed.objective,
-    };
-  }
-  return { enterComposeOnly: false, goalTitle: null, message: text };
-}
-
-/**
- * 已有不同 objective 的 goal 投影时，替换前确认（对齐 Codex Replace current goal?）。
- * complete 粘性条 / paused / active 均适用。
- */
-async function confirmGoalReplaceIfNeeded(
-  newTitle: string,
-): Promise<boolean> {
-  const prev = goalProjection?.objective?.trim();
-  const next = newTitle.trim();
-  if (!prev || !next || prev === next) return true;
-  return confirmText({
-    title: tr("goal.replaceTitle"),
-    message: tr("goal.replaceBody", { prev, next }),
-    okLabel: tr("goal.replaceConfirm"),
-  });
-}
-
-/** 当前输入若作为新目标，是否会触发替换确认（同步探测，供入队路径） */
-function composerNeedsGoalReplaceConfirm(raw?: string): boolean {
-  const text = (raw ?? activeComposerInput()?.value ?? "").trim();
-  if (!text) return false;
-  const g = parseGoalInput(text, { forceGoal: goalComposeActive });
-  if (!g.goalTitle) return false;
-  const prev = goalProjection?.objective?.trim();
-  const next = g.goalTitle.trim();
-  return Boolean(prev && next && prev !== next);
-}
-
-/**
- * 用户确认目标标题：仅 optimistic pending + 发送时拼 /goal。
- * 不写 goals.set 权威；投影等 agent goal_updated。
- */
-async function applyGoalTitle(title: string): Promise<{ ok: boolean; message?: string }> {
-  const parsed = parseGoalBudget(title.trim());
-  const t = parsed.objective;
-  if (parsed.budget != null) goalTokenBudget = parsed.budget;
-  if (!t) return { ok: false, message: tr("goal.emptyTitle") };
-  goalComposeActive = false;
-  setComposerPlaceholders(false);
-  pendingGoalTitle = t;
-  // 设置/编辑目标：chip 焦点到 goal（与 plan chip 互斥）
-  sessionModeChipFocus = "goal";
-  // optimistic banner：pending 标题，status 未从 wire 确认前不算 harness active
-  if (goalCompleteHideTimer) {
-    clearTimeout(goalCompleteHideTimer);
-    goalCompleteHideTimer = null;
-  }
-  renderGoalBanner();
-  return { ok: true };
-}
-
-/**
- * 发给 agent 的正文：新建/重设目标用 CLI 同源 `/goal …`。
- * 只要明确 goalJustSet，即走 /goal（含 paused/complete 后重设），
- * 不再用 goalPaused() 短路成普通消息。
- */
-function agentContentForSend(
-  userContent: string,
-  goalJustSet: string | null,
-): string {
-  if (goalJustSet) {
-    const budget =
-      goalTokenBudget != null && goalTokenBudget > 0
-        ? ` --budget ${goalTokenBudget}`
-        : "";
-    return `/goal ${goalJustSet}${budget}`;
-  }
-  return userContent;
-}
+/** 应用 agent goal_updated（归约 + 投影副作用 → GoalRuntimeActions） */
+const applyAgentGoalEvent = (ev: AgentGoalEvent) =>
+  ensureGoalRuntime().applyAgentEvent(ev);
+const pauseGoal = (opts?: { fromStop?: boolean }) =>
+  ensureGoalRuntime().pause(opts);
+const resumeGoal = () => ensureGoalRuntime().resume();
+const bindGoalBanner = () => ensureGoalRuntime().bindBannerClicks();
+const confirmGoalReplaceIfNeeded = (newTitle: string) =>
+  ensureGoalRuntime().confirmReplaceIfNeeded(newTitle);
+const composerNeedsGoalReplaceConfirm = (raw?: string) =>
+  ensureGoalRuntime().composerNeedsReplaceConfirm(raw);
+const applyGoalTitle = (title: string) => ensureGoalRuntime().applyTitle(title);
+const agentContentForSend = (userContent: string, goalJustSet: string | null) =>
+  ensureGoalRuntime().agentContentForSend(userContent, goalJustSet);
 
 /**
  * Stop/Esc 后下一条发送前：
@@ -8996,126 +4322,9 @@ async function prepareAgentContentAfterCancel(
   return userContent;
 }
 
-/**
- * 解析目标正文与 `--budget N`（对齐 CLI parse_goal_budget）
- */
-function parseGoalBudget(body: string): {
-  objective: string;
-  budget: number | null;
-} {
-  const m = body.match(/^(.*?)\s+--budget\s+(\d+)\s*$/i);
-  if (m) {
-    const n = Number(m[2]);
-    if (Number.isFinite(n) && n > 0) {
-      return { objective: m[1].trim(), budget: Math.floor(n) };
-    }
-  }
-  return { objective: body.trim(), budget: null };
-}
-
-async function runGoalCommand(
+const runGoalCommand = (
   sub: "set" | "status" | "clear" | "pause" | "resume" | "budget",
-): Promise<{ ok: boolean; message?: string }> {
-  if (sub === "status") {
-    const t = currentGoalTitle();
-    if (!t) return { ok: true, message: tr("goal.noneActive") };
-    const budget =
-      (goalProjection?.tokenBudget ?? goalTokenBudget) != null
-        ? tr("goal.budgetLine", {
-            n: String(goalProjection?.tokenBudget ?? goalTokenBudget),
-          })
-        : "";
-    const st = goalProjection
-      ? goalStatusKicker(goalProjection.status)
-      : tr("goal.kicker");
-    return {
-      ok: true,
-      message: `${st}：${t}${budget ? ` · ${budget}` : ""}`,
-    };
-  }
-  if (sub === "pause") {
-    await pauseGoal();
-    return { ok: true, message: tr("goal.pausedToast") };
-  }
-  if (sub === "resume") {
-    await resumeGoal();
-    return { ok: true, message: tr("goal.resumedToast") };
-  }
-  if (sub === "budget") {
-    return promptGoalBudget();
-  }
-  if (sub === "clear") {
-    if (goalProjection?.goalId) {
-      goalLocalClearedIds.add(goalProjection.goalId);
-    }
-    goalTokenBudget = null;
-    resetGoalUiState();
-    if (activeSessionId) {
-      await inv("goals.clear", { sessionId: activeSessionId });
-    }
-    renderGoalBanner();
-    // 先 optimistic hide，再 slash（对齐 CLI clear 世代）
-    void sendAgentGoalSlash("/goal clear");
-    return { ok: true, message: tr("goal.cleared") };
-  }
-  // set：不弹窗，聚焦输入框写目标
-  beginGoalCompose();
-  return { ok: true };
-}
-
-async function promptGoalBudget(): Promise<{ ok: boolean; message?: string }> {
-  return new Promise((resolve) => {
-    const cur = goalTokenBudget != null ? String(goalTokenBudget) : "";
-    openModal(
-      tr("slash.goalBudget"),
-      `<p class="prompt-dlg-hint">${esc(tr("slash.goalBudgetHint"))}</p>
-       <input id="goal-budget-input" class="prompt-dlg-input" type="number" min="1" step="1000"
-         value="${esc(cur)}" placeholder="${esc(tr("slash.goalBudgetPh"))}" />
-       <div class="prompt-dlg-actions">
-         <button type="button" class="btn-ghost" id="prompt-dlg-cancel">${esc(tr("common.cancel"))}</button>
-         <button type="button" class="btn-ghost" id="goal-budget-clear">${esc(tr("slash.goalBudgetClear"))}</button>
-         <button type="button" class="btn-dark" id="prompt-dlg-ok">${esc(tr("common.ok"))}</button>
-       </div>`,
-    );
-    $("prompt-dlg-cancel").onclick = () => {
-      closeModal();
-      resolve({ ok: true, message: tr("slash.cancelled") });
-    };
-    $("goal-budget-clear").onclick = () => {
-      goalTokenBudget = null;
-      closeModal();
-      resolve({ ok: true, message: tr("slash.goalBudgetCleared") });
-    };
-    $("prompt-dlg-ok").onclick = () => {
-      const raw = ($("goal-budget-input") as HTMLInputElement).value.trim();
-      if (!raw) {
-        goalTokenBudget = null;
-        closeModal();
-        resolve({ ok: true, message: tr("slash.goalBudgetCleared") });
-        return;
-      }
-      const n = Number(raw);
-      if (!Number.isFinite(n) || n < 1) {
-        showToast(tr("slash.goalBudgetInvalid"), "error");
-        return;
-      }
-      goalTokenBudget = Math.floor(n);
-      closeModal();
-      // 已有进行中目标时，通过 /goal 再设一遍带 budget（agent 侧）
-      const t = currentGoalTitle();
-      if (t && !goalCompleted()) {
-        void sendAgentGoalSlash(`/goal ${t} --budget ${goalTokenBudget}`);
-      }
-      resolve({
-        ok: true,
-        message: tr("slash.goalBudgetSet", { n: String(goalTokenBudget) }),
-      });
-    };
-    requestAnimationFrame(() =>
-      ($("goal-budget-input") as HTMLInputElement).focus(),
-    );
-  });
-}
+) => ensureGoalSlashActions().runCommand(sub);
 
 /**
  * 建会话后不再 goals.set。
@@ -9206,202 +4415,22 @@ function maybeGoalFromToolRaw(name?: string, raw?: unknown): void {
 }
 
 function hidePlusMenu(): void {
-  document.getElementById("plus-menu")?.classList.add("hidden");
+  ensurePlusMenu().hide();
 }
 
 function showPlusMenu(anchor: HTMLElement): void {
-  const menu = $("plus-menu");
-  const r = anchor.getBoundingClientRect();
-  menu.classList.remove("hidden");
-  const mw = menu.offsetWidth || 220;
-  let left = r.left;
-  if (left + mw > window.innerWidth - 8) left = window.innerWidth - mw - 8;
-  menu.style.left = `${Math.max(8, left)}px`;
-  // 优先显示在按钮上方（对齐 Codex 浮层）
-  const mh = menu.offsetHeight || 160;
-  if (r.top > mh + 12) {
-    menu.style.top = `${r.top - mh - 6}px`;
-  } else {
-    menu.style.top = `${r.bottom + 6}px`;
-  }
+  ensurePlusMenu().show(anchor);
 }
 
 function bindPlusMenu(): void {
-  for (const id of ["btn-attach", "btn-attach-chat", "btn-focus-attach"] as const) {
-    const btn = document.getElementById(id);
-    if (!btn) continue;
-    btn.addEventListener("click", (e) => {
-      e.stopPropagation();
-      const menu = $("plus-menu");
-      if (!menu.classList.contains("hidden") && menu.dataset.anchor === id) {
-        hidePlusMenu();
-        return;
-      }
-      menu.dataset.anchor = id;
-      showPlusMenu(btn as HTMLElement);
-    });
-  }
-  $("plus-menu").onclick = (e) => {
-    const t = (e.target as HTMLElement).closest("[data-plus]") as HTMLElement | null;
-    if (!t) return;
-    const act = t.dataset.plus;
-    hidePlusMenu();
-    if (act === "files") void pickAndAddAttachments();
-    if (act === "plan") {
-      void runSlashCommand({
-        id: "plan",
-        title: tr("plan.modeChip"),
-        description: "",
-        action: { kind: "set-perm", mode: "plan" },
-      }).then((r) => {
-        if (r.message) showToast(r.message, r.ok ? "info" : "error");
-      });
-    }
-    if (act === "goal") {
-      void runGoalCommand("set");
-    }
-  };
-  document.addEventListener("click", (e) => {
-    const t = e.target as HTMLElement;
-    if (
-      !t.closest("#plus-menu, #btn-attach, #btn-attach-chat, #btn-focus-attach")
-    ) {
-      hidePlusMenu();
-    }
-  });
+  ensurePlusMenu().bind();
 }
 
 // ── Sidebar ────────────────────────────────────────────────
 
-function hideThreadMenu(): void {
-  document.getElementById("thread-ctx-menu")?.remove();
-}
 
-function showThreadMenu(
-  anchor: HTMLElement,
-  t: ThreadRow,
-  mode: "active" | "archived",
-): void {
-  hideThreadMenu();
-  const menu = document.createElement("div");
-  menu.id = "thread-ctx-menu";
-  menu.className = "thread-ctx-menu";
-  menu.setAttribute("role", "menu");
 
-  const addItem = (label: string, danger: boolean, onClick: () => void) => {
-    const item = document.createElement("button");
-    item.type = "button";
-    item.className = `thread-ctx-item${danger ? " danger" : ""}`;
-    item.textContent = label;
-    item.onclick = (e) => {
-      e.stopPropagation();
-      hideThreadMenu();
-      onClick();
-    };
-    menu.appendChild(item);
-  };
 
-  addItem(tr("session.menuRename"), false, () => {
-    void renameThread(t);
-  });
-  addItem(tr("session.menuExportClipboard"), false, () => {
-    void (async () => {
-      const r = await exportActiveSession({
-        destination: "clipboard",
-        threadId: t.id,
-      });
-      if (r.message) showToast(r.message, r.ok ? "info" : "error");
-    })();
-  });
-  addItem(tr("session.menuExportFile"), false, () => {
-    void (async () => {
-      const r = await exportActiveSession({
-        destination: "file",
-        threadId: t.id,
-      });
-      if (r.message) showToast(r.message, r.ok ? "info" : "error");
-    })();
-  });
-  if (mode === "active") {
-    addItem(tr("session.menuFork"), false, () => {
-      void (async () => {
-        const r = await forkSessionFrom(t, { confirm: true });
-        if (r.message) showToast(r.message, r.ok ? "info" : "error");
-      })();
-    });
-    const parentId = t.parentSessionId;
-    if (parentId) {
-      addItem(tr("session.menuOpenParent"), false, () => {
-        const parent = threads.find((x) => x.sessionId === parentId);
-        if (!parent) {
-          showToast(tr("session.parentMissing"), "error");
-          return;
-        }
-        selectedProjectId = parent.projectId || projectIdOfThread(parent) || selectedProjectId;
-        if (selectedProjectId) expandedProjectIds.add(selectedProjectId);
-        void openThread(parent);
-      });
-    }
-    addItem(tr("session.menuArchive"), false, () => {
-      void archiveThread(t, true);
-    });
-    addItem(tr("session.menuDelete"), true, () => {
-      void deleteThread(t);
-    });
-  } else {
-    addItem(tr("session.menuRestore"), false, () => {
-      void archiveThread(t, false);
-    });
-    addItem(tr("session.menuDelete"), true, () => {
-      void deleteThread(t);
-    });
-  }
-
-  document.body.appendChild(menu);
-  const rect = anchor.getBoundingClientRect();
-  const mw = 160;
-  let left = rect.right - mw;
-  let top = rect.bottom + 4;
-  if (left < 8) left = 8;
-  if (top + 160 > window.innerHeight) top = Math.max(8, rect.top - 160);
-  menu.style.left = `${left}px`;
-  menu.style.top = `${top}px`;
-  menu.style.minWidth = `${mw}px`;
-
-  const onDoc = (ev: MouseEvent) => {
-    if (!menu.contains(ev.target as Node)) {
-      hideThreadMenu();
-      document.removeEventListener("mousedown", onDoc, true);
-    }
-  };
-  window.setTimeout(() => {
-    document.addEventListener("mousedown", onDoc, true);
-  }, 0);
-}
-
-/** 当前打开的会话是否就是 t */
-function isThreadOpen(t: ThreadRow): boolean {
-  return (
-    t.id === activeThreadId ||
-    (!!activeSessionId && t.sessionId === activeSessionId)
-  );
-}
-
-function isLiveThreadId(id: string | null | undefined): id is string {
-  return Boolean(id && !id.startsWith("disk_"));
-}
-
-/**
- * 离开当前会话 → 欢迎页。
- * 产品约定：此处不 threads.create；用户在欢迎页输入并发送后才 startNewChat。
- *
- * keepBackground=false：停 turn、detach live agent（硬离开）。
- * keepBackground=true：对齐切会话——只清 UI，后台 agent 继续。
- * 「新对话」默认 keepBackground=true（不弹确认）。
- *
- * 队列：默认 **保留** 各 session 的 L1 落盘队列（再打开该会话可继续）；
- * 仅 UI 镜像清空。删除会话时 Host 会删队列文件，无需此处 clear。
- */
 async function leaveCurrentSessionToWelcome(opts?: {
   /** true：连 L1 队列一并清空；默认 false 只清 UI 镜像 */
   clearQueue?: boolean;
@@ -9434,9 +4463,7 @@ async function leaveCurrentSessionToWelcome(opts?: {
     if (clearQueue) {
       clearPromptQueue({ silent: true });
     } else {
-      promptQueue.length = 0;
-      queuePausedByInterrupt = false;
-      syncPromptQueueBar();
+      ensurePromptQueue().clearLocal();
     }
     if (turnActive) {
       endTurn({ skipQueueDrain: true, skipSessionStoreSync: true });
@@ -9454,9 +4481,7 @@ async function leaveCurrentSessionToWelcome(opts?: {
       clearPromptQueue({ silent: true });
     } else {
       // 仅卸下 UI 投影，磁盘 queues/{sessionId}.json 保留
-      promptQueue.length = 0;
-      queuePausedByInterrupt = false;
-      syncPromptQueueBar();
+      ensurePromptQueue().clearLocal();
     }
 
     // cancel 失败或竞态时仍强制 UI 空闲
@@ -9494,7 +4519,7 @@ async function leaveCurrentSessionToWelcome(opts?: {
   sidePane?.onSessionChanged();
   applyDefaultToChip();
   stopContextPolling();
-  lastContextUsage = null;
+  setLastContextUsage(null);
   syncContextLabels();
   lateStreamUntil = 0;
   suspendLiveTranscript = false;
@@ -9544,565 +4569,47 @@ function leaveThreadIfOpen(t: ThreadRow): void {
 }
 
 async function archiveThread(t: ThreadRow, archived: boolean): Promise<void> {
-  const res = await inv<ThreadRow>("threads.archive", {
-    threadId: t.id,
-    archived,
-  });
-  if (!res.ok) {
-    showToast(res.error?.message ?? (archived ? "归档失败" : "恢复失败"), "error");
-    return;
-  }
-  if (archived) {
-    leaveThreadIfOpen(t);
-    if (t.projectId) expandedArchiveIds.add(t.projectId);
-    showToast("已收进归档");
-  } else {
-    showToast("已恢复到项目列表");
-  }
-  await refreshProjectsAndThreads();
+  return ensureSessionOps().archiveThread(t, archived);
 }
 
 async function deleteThread(t: ThreadRow): Promise<void> {
-  const title = t.title || t.sessionId.slice(0, 8);
-  const ok = await confirmText({
-    title: tr("session.deleteTitle"),
-    message: tr("archive.deleteConfirm", { title }),
-    okLabel: tr("common.delete"),
-  });
-  if (!ok) return;
-  const res = await inv<{ deleted: true; sessionId: string }>("threads.delete", {
-    threadId: t.id,
-  });
-  if (!res.ok) {
-    showToast(res.error?.message ?? tr("session.deleteFail"), "error");
-    return;
-  }
-  leaveThreadIfOpen(t);
-  showToast(tr("archive.deleted"));
-  await refreshProjectsAndThreads();
-}
-
-function projectIdOfThread(t: ThreadRow): string | undefined {
-  return t.projectId;
-}
-
-/** 侧栏会话树节点（fork 子会话挂在父会话下） */
-type ThreadTreeNode = {
-  thread: ThreadRow;
-  children: ThreadTreeNode[];
-};
-
-function threadUpdatedAt(t: ThreadRow): string {
-  return t.updatedAt ?? "";
-}
-
-function subtreeMaxUpdated(node: ThreadTreeNode): string {
-  let max = threadUpdatedAt(node.thread);
-  for (const c of node.children) {
-    const m = subtreeMaxUpdated(c);
-    if (m > max) max = m;
-  }
-  return max;
-}
-
-/**
- * 将扁平会话列表建成森林：有 parent 且父在同一列表内 → 子节点；否则为根。
- * 父不在列表 / 成环时抬升为根，避免丢会话。
- */
-function buildThreadForest(list: ThreadRow[]): ThreadTreeNode[] {
-  const byId = new Map(list.map((t) => [t.sessionId, t] as const));
-  const childIds = new Set<string>();
-  const childrenOf = new Map<string, ThreadRow[]>();
-
-  const wouldCycle = (childId: string, parentId: string): boolean => {
-    let cur: string | undefined = parentId;
-    const seen = new Set<string>();
-    while (cur) {
-      if (cur === childId) return true;
-      if (seen.has(cur)) return true;
-      seen.add(cur);
-      const row = byId.get(cur);
-      cur = row?.parentSessionId;
-      if (cur && !byId.has(cur)) break;
-    }
-    return false;
-  };
-
-  for (const t of list) {
-    const p = t.parentSessionId?.trim();
-    if (
-      p &&
-      p !== t.sessionId &&
-      byId.has(p) &&
-      !wouldCycle(t.sessionId, p)
-    ) {
-      const arr = childrenOf.get(p) ?? [];
-      arr.push(t);
-      childrenOf.set(p, arr);
-      childIds.add(t.sessionId);
-    }
-  }
-
-  const sortByUpdated = (a: ThreadRow, b: ThreadRow) =>
-    threadUpdatedAt(b).localeCompare(threadUpdatedAt(a));
-
-  const buildNode = (t: ThreadRow): ThreadTreeNode => {
-    const kids = (childrenOf.get(t.sessionId) ?? [])
-      .slice()
-      .sort(sortByUpdated)
-      .map(buildNode);
-    return { thread: t, children: kids };
-  };
-
-  const roots = list
-    .filter((t) => !childIds.has(t.sessionId))
-    .map(buildNode)
-    .sort((a, b) =>
-      subtreeMaxUpdated(b).localeCompare(subtreeMaxUpdated(a)),
-    );
-  return roots;
-}
-
-function flattenThreadForest(
-  forest: ThreadTreeNode[],
-): Array<{ thread: ThreadRow; depth: number }> {
-  const out: Array<{ thread: ThreadRow; depth: number }> = [];
-  const walk = (node: ThreadTreeNode, depth: number) => {
-    out.push({ thread: node.thread, depth });
-    for (const c of node.children) walk(c, depth + 1);
-  };
-  for (const n of forest) walk(n, 0);
-  return out;
-}
-
-/** 预览：按「根会话」条数截断，子 fork 始终跟在父下 */
-function visibleThreadForest(
-  list: ThreadRow[],
-  showAll: boolean,
-  limit: number,
-): { flat: Array<{ thread: ThreadRow; depth: number }>; rootCount: number } {
-  const forest = buildThreadForest(list);
-  const roots = showAll ? forest : forest.slice(0, limit);
-  return { flat: flattenThreadForest(roots), rootCount: forest.length };
-}
-
-function makeThreadRow(
-  t: ThreadRow,
-  projectId: string,
-  mode: "active" | "archived",
-  depth = 0,
-): HTMLElement {
-  const row = document.createElement("div");
-  const isActive = isThreadOpen(t);
-  const isWorking =
-    t.status === "working" || workingSessions.has(t.sessionId);
-  const isFork =
-    t.sessionKind === "fork" ||
-    (!!t.parentSessionId && t.parentSessionId.length > 0);
-  const depthClamped = Math.max(0, Math.min(depth, 6));
-  row.className = `thread-item depth-${depthClamped}${isActive ? " active" : ""}${isWorking ? " working" : ""}${mode === "archived" ? " is-archived" : ""}${isFork ? " is-fork" : ""}`;
-  row.dataset.sessionId = t.sessionId;
-  row.dataset.depth = String(depthClamped);
-  // 每层额外缩进 14px；归档夹基础左内边距更大
-  if (depthClamped > 0) {
-    const base = mode === "archived" ? 36 : 28;
-    row.style.paddingLeft = `${base + depthClamped * 14}px`;
-  }
-
-  const main = document.createElement("button");
-  main.type = "button";
-  main.className = "thread-item-main";
-  const spin = isWorking ? `<span class="thread-spin"></span>` : "";
-  const titleText = esc(t.title || t.sessionId.slice(0, 8));
-  // 已缩进挂在父下时不再重复「来自：」行，仅保留小标签
-  const badge = isFork
-    ? `<span class="thread-fork-badge" title="${esc(tr("session.forkBadgeTitle"))}">${esc(tr("session.forkBadge"))}</span>`
-    : "";
-  const nested = depthClamped > 0;
-  const fromLabel =
-    isFork && !nested ? parentThreadTitle(t.parentSessionId) : null;
-  const fromHtml = fromLabel
-    ? `<span class="thread-fork-from">${esc(tr("session.forkFrom", { title: fromLabel }))}</span>`
-    : "";
-  const nestMark =
-    nested
-      ? `<span class="thread-nest-mark" aria-hidden="true">└</span>`
-      : "";
-  main.innerHTML = `${spin}<span class="thread-item-text"><span class="thread-title-row">${nestMark}${badge}<span class="thread-title">${titleText}</span></span>${fromHtml}</span><span class="thread-age">${esc(formatAge(t.updatedAt))}</span>`;
-  if (fromLabel) {
-    main.title = tr("session.forkFrom", { title: fromLabel });
-  } else if (nested && t.parentSessionId) {
-    const pTitle = parentThreadTitle(t.parentSessionId);
-    if (pTitle) main.title = tr("session.forkFrom", { title: pTitle });
-  }
-  main.onclick = (e) => {
-    e.stopPropagation();
-    hideThreadMenu();
-    if (projectId === CHATS_GROUP_ID) {
-      selectedProjectId = null;
-      projectChoiceTouched = true;
-      expandedProjectIds.add(CHATS_GROUP_ID);
-    } else {
-      selectedProjectId = projectId;
-      expandedProjectIds.add(projectId);
-    }
-    void openThread(t);
-  };
-
-  const more = document.createElement("button");
-  more.type = "button";
-  more.className = "thread-act-btn";
-  more.title = tr("side.more");
-  more.setAttribute("aria-label", tr("side.more"));
-  more.textContent = "⋯";
-  more.onclick = (e) => {
-    e.stopPropagation();
-    showThreadMenu(more, t, mode);
-  };
-
-  row.appendChild(main);
-  row.appendChild(more);
-  return row;
-}
-
-function makeArchiveFolder(
-  projectId: string,
-  archivedThreads: ThreadRow[],
-): HTMLElement {
-  const wrap = document.createElement("div");
-  const open = expandedArchiveIds.has(projectId);
-  wrap.className = `project-archive${open ? " is-open" : ""}`;
-
-  const head = document.createElement("button");
-  head.type = "button";
-  head.className = `project-archive-head${open ? " is-open" : ""}`;
-  head.setAttribute("aria-expanded", open ? "true" : "false");
-  const count = archivedThreads.length;
-  // 箭头固定 chevronRight，用 CSS rotate 做展开动画
-  head.innerHTML =
-    `${sidebarIcon("folder", "archive-ico")}<span class="archive-label">归档</span>${count ? `<span class="archive-count">${count}</span>` : ""}` +
-    `${sidebarIcon("chevronRight", "proj-chev archive-chev")}`;
-  head.onclick = (e) => {
-    e.stopPropagation();
-    const next = !expandedArchiveIds.has(projectId);
-    if (next) expandedArchiveIds.add(projectId);
-    else expandedArchiveIds.delete(projectId);
-    wrap.classList.toggle("is-open", next);
-    head.classList.toggle("is-open", next);
-    head.setAttribute("aria-expanded", next ? "true" : "false");
-  };
-  wrap.appendChild(head);
-
-  const body = document.createElement("div");
-  body.className = "project-archive-body";
-  const inner = document.createElement("div");
-  inner.className = "project-archive-body-inner";
-  if (!archivedThreads.length) {
-    const empty = document.createElement("div");
-    empty.className = "empty-threads archive-empty";
-    empty.textContent = "暂无归档";
-    inner.appendChild(empty);
-  } else {
-    const { flat } = visibleThreadForest(archivedThreads, true, archivedThreads.length);
-    for (const { thread, depth } of flat) {
-      inner.appendChild(makeThreadRow(thread, projectId, "archived", depth));
-    }
-  }
-  body.appendChild(inner);
-  wrap.appendChild(body);
-  return wrap;
-}
-
-async function refreshProjectsAndThreads(): Promise<void> {
-  const [pRes, tRes] = await Promise.all([
-    inv<Project[]>("projects.list"),
-    inv<ThreadRow[]>("threads.list"),
-  ]);
-  projects = pRes.data ?? [];
-  threads = tRes.data ?? [];
-  // 列表刷新后同步会话顶栏标题（agent 可能改写 title）
-  syncChatTopTitle();
-
-  if (!projectChoiceTouched && !selectedProjectId && projects.length) {
-    selectedProjectId = projects[0].id;
-  }
-
-  // Codex：项目可展开/收起；主列表默认 5 条；固定「归档」夹
-  // 「对话」与「项目」同级：#chats-list / #project-list 各一块
-  const chatsList = $("chats-list");
-  const list = $("project-list");
-  chatsList.innerHTML = "";
-  list.innerHTML = "";
-  hideThreadMenu();
-
-  // 清理已删除项目的状态（保留虚拟「对话」组 id，供归档/展开更多）
-  for (const id of [...expandedProjectIds]) {
-    if (id !== CHATS_GROUP_ID && !projects.some((p) => p.id === id)) {
-      expandedProjectIds.delete(id);
-    }
-  }
-  for (const id of [...projectShowAllThreads]) {
-    if (id !== CHATS_GROUP_ID && !projects.some((p) => p.id === id)) {
-      projectShowAllThreads.delete(id);
-    }
-  }
-  for (const id of [...expandedArchiveIds]) {
-    if (id !== CHATS_GROUP_ID && !projects.some((p) => p.id === id)) {
-      expandedArchiveIds.delete(id);
-    }
-  }
-
-  // 仅首次渲染：默认展开当前选中 / 含活动会话 / 第一个有会话的项目
-  if (!projectExpandInitialized) {
-    projectExpandInitialized = true;
-    for (const p of projects) {
-      const related = threadsForProject(p.id);
-      const hasActive = related.some(
-        (t) =>
-          !t.archived &&
-          (t.id === activeThreadId ||
-            (!!activeSessionId && t.sessionId === activeSessionId)),
-      );
-      if (p.id === selectedProjectId || hasActive) {
-        expandedProjectIds.add(p.id);
-      }
-    }
-    if (expandedProjectIds.size === 0 && projects.length) {
-      const firstWith = projects.find(
-        (p) => threadsForProject(p.id).some((t) => !t.archived),
-      );
-      if (firstWith) expandedProjectIds.add(firstWith.id);
-      else expandedProjectIds.add(projects[0].id);
-    }
-  }
-
-  // 「对话」区：与「项目」同级，下列无项目会话历史
-  {
-    const chatsRelated = threadsForChatsGroup();
-    const activeList = chatsRelated.filter((t) => !t.archived);
-    const archivedList = chatsRelated.filter((t) => t.archived);
-
-    chatsList.appendChild(makeArchiveFolder(CHATS_GROUP_ID, archivedList));
-    if (!activeList.length) {
-      const empty = document.createElement("div");
-      empty.className = "empty-threads";
-      empty.textContent = tr("chats.empty");
-      chatsList.appendChild(empty);
-    } else {
-      const showAll = projectShowAllThreads.has(CHATS_GROUP_ID);
-      const { flat, rootCount } = visibleThreadForest(
-        activeList,
-        showAll,
-        THREADS_PREVIEW_LIMIT,
-      );
-      for (const { thread, depth } of flat) {
-        chatsList.appendChild(
-          makeThreadRow(thread, CHATS_GROUP_ID, "active", depth),
-        );
-      }
-      if (rootCount > THREADS_PREVIEW_LIMIT) {
-        const more = document.createElement("button");
-        more.type = "button";
-        more.className = "project-threads-more";
-        if (showAll) {
-          more.textContent = "收起";
-          more.onclick = (e) => {
-            e.stopPropagation();
-            projectShowAllThreads.delete(CHATS_GROUP_ID);
-            void refreshProjectsAndThreads();
-          };
-        } else {
-          const rest = rootCount - THREADS_PREVIEW_LIMIT;
-          more.textContent = `展开更多（${rest}）`;
-          more.onclick = (e) => {
-            e.stopPropagation();
-            projectShowAllThreads.add(CHATS_GROUP_ID);
-            void refreshProjectsAndThreads();
-          };
-        }
-        chatsList.appendChild(more);
-      }
-    }
-  }
-
-  for (const p of projects) {
-    const group = document.createElement("div");
-    const isExpanded = expandedProjectIds.has(p.id);
-    group.className = `project-group${isExpanded ? " is-expanded" : " is-collapsed"}`;
-    group.dataset.projectId = p.id;
-
-    const b = document.createElement("button");
-    b.type = "button";
-    b.className = `project-item${p.id === selectedProjectId ? " active" : ""}`;
-    b.setAttribute("aria-expanded", isExpanded ? "true" : "false");
-    // 箭头固定 chevronRight + CSS rotate；文件夹图标随展开态切换
-    b.innerHTML =
-      `${sidebarIcon("chevronRight", "proj-chev")}` +
-      `${sidebarIcon(isExpanded ? "folderOpen" : "folder", "folder-ico")}` +
-      `<span class="proj-title">${esc(p.title)}</span>` +
-      `<span class="proj-remove" data-remove-project="${esc(p.id)}" title="从列表移除" aria-label="移除项目">${sidebarIcon("x", "proj-remove-x")}</span>`;
-    b.onclick = (e) => {
-      const rm = (e.target as HTMLElement).closest("[data-remove-project]") as HTMLElement | null;
-      if (rm) {
-        e.preventDefault();
-        e.stopPropagation();
-        void removeProjectFromList(p.id, p.title, p.path);
-        return;
-      }
-      const next = !expandedProjectIds.has(p.id);
-      if (next) expandedProjectIds.add(p.id);
-      else expandedProjectIds.delete(p.id);
-
-      // 就地切换展开态，保留 CSS 高度/箭头动画（避免整表重绘打断）
-      group.classList.toggle("is-expanded", next);
-      group.classList.toggle("is-collapsed", !next);
-      b.setAttribute("aria-expanded", next ? "true" : "false");
-      const folderEl = b.querySelector(".folder-ico");
-      if (folderEl) {
-        folderEl.outerHTML = sidebarIcon(next ? "folderOpen" : "folder", "folder-ico");
-      }
-
-      const needSelectPaint = selectedProjectId !== p.id;
-      selectedProjectId = p.id;
-      projectChoiceTouched = true;
-      if (!activeThreadId && !activeSessionId) {
-        setWelcomeTitle();
-        showWelcome(true);
-      }
-      // 仅选中项高亮变化时才局部更新 active，不整表刷新
-      if (needSelectPaint) {
-        list.querySelectorAll(".project-item").forEach((item) => {
-          const row = item as HTMLElement;
-          const gid = row.closest(".project-group")?.getAttribute("data-project-id");
-          row.classList.toggle("active", gid === p.id);
-        });
-      }
-    };
-    group.appendChild(b);
-
-    const related = threadsForProject(p.id);
-    const activeList = related.filter((t) => !t.archived);
-    const archivedList = related.filter((t) => t.archived);
-    const threadBox = document.createElement("div");
-    threadBox.className = "project-threads";
-    const threadInner = document.createElement("div");
-    threadInner.className = "project-threads-inner";
-    // 始终渲染内容，收起态由 CSS grid 0fr 裁切并动画
-    threadInner.appendChild(makeArchiveFolder(p.id, archivedList));
-    if (!activeList.length) {
-      const empty = document.createElement("div");
-      empty.className = "empty-threads";
-      empty.textContent = "暂无聊天";
-      threadInner.appendChild(empty);
-    } else {
-      const showAll = projectShowAllThreads.has(p.id);
-      // 按根会话截断预览；fork 子节点始终挂在父会话下
-      const { flat, rootCount } = visibleThreadForest(
-        activeList,
-        showAll,
-        THREADS_PREVIEW_LIMIT,
-      );
-      for (const { thread, depth } of flat) {
-        threadInner.appendChild(makeThreadRow(thread, p.id, "active", depth));
-      }
-      if (rootCount > THREADS_PREVIEW_LIMIT) {
-        const more = document.createElement("button");
-        more.type = "button";
-        more.className = "project-threads-more";
-        if (showAll) {
-          more.textContent = "收起";
-          more.onclick = (e) => {
-            e.stopPropagation();
-            projectShowAllThreads.delete(p.id);
-            void refreshProjectsAndThreads();
-          };
-        } else {
-          const rest = rootCount - THREADS_PREVIEW_LIMIT;
-          more.textContent = `展开更多（${rest}）`;
-          more.onclick = (e) => {
-            e.stopPropagation();
-            projectShowAllThreads.add(p.id);
-            expandedProjectIds.add(p.id);
-            void refreshProjectsAndThreads();
-          };
-        }
-        threadInner.appendChild(more);
-      }
-    }
-    threadBox.appendChild(threadInner);
-    group.appendChild(threadBox);
-    list.appendChild(group);
-  }
-  setWelcomeTitle();
+  return ensureSessionOps().deleteThread(t);
 }
 
 
-/** CLI `-c`：打开最近一次用户会话并加载历史（发送时再 attach） */
+
+
+
+
+
+
+
 async function continueRecentSession(): Promise<void> {
-  const res = await inv<{
-    sessionId: string;
-    cwd: string;
-    title: string;
-    threadId?: string;
-  } | null>("threads.continueRecent");
-  if (!res.ok) {
-    showToast(res.error?.message ?? tr("nav.continueFail"), "error");
-    return;
-  }
-  if (!res.data) {
-    showToast(tr("nav.continueNone"));
-    return;
-  }
-  const row = {
-    id: res.data.threadId ?? `disk_${res.data.sessionId}`,
-    sessionId: res.data.sessionId,
-    title: res.data.title,
-    cwd: res.data.cwd,
-    status: "inactive" as const,
-    updatedAt: new Date().toISOString(),
-    createdAt: new Date().toISOString(),
-  };
-  // 若列表里已有更完整的 ThreadRow，优先用它
-  const hit =
-    threads.find((t) => t.sessionId === res.data!.sessionId) ??
-    (row as ThreadRow);
-  if (hit.projectId) {
-    selectedProjectId = hit.projectId;
-    expandedProjectIds.add(hit.projectId);
-  } else {
-    const byPath = projects.find((p) => {
-      const cwd = hit.cwd.replace(/\\/g, "/").toLowerCase();
-      const root = p.path.replace(/\\/g, "/").toLowerCase();
-      return cwd === root || cwd.startsWith(root + "/");
-    });
-    if (byPath) {
-      selectedProjectId = byPath.id;
-      expandedProjectIds.add(byPath.id);
-    }
-  }
-  await openThread(hit);
-  showToast(tr("nav.continueOk", { title: hit.title || hit.sessionId.slice(0, 8) }));
+  return ensureSessionOps().continueRecentSession();
 }
 
 async function openThread(t: ThreadRow): Promise<void> {
   // 加载 history 期间挂起直播事件，避免与磁盘回放叠双份
   suspendLiveTranscript = true;
   const viewGen = ++sessionViewGen;
-  const prevSid = activeSessionId;
-  const sameSession =
-    (!!activeSessionId && t.sessionId === activeSessionId) ||
-    (!!activeThreadId && t.id === activeThreadId);
   // 方案 B（对齐 CLI switch_to_agent）：切走只换焦点，快照 turn 投影，不 cancel
-  const wasActivelyTurning = turnActive;
-  const keepBgWorking =
-    !sameSession &&
-    !!prevSid &&
-    (wasActivelyTurning ||
-      workingSessions.has(prevSid) ||
-      threads.some(
-        (x) => x.sessionId === prevSid && x.status === "working",
-      ));
-  if (!sameSession && prevSid) {
+  const leave = planOpenThreadLeave({
+    activeSessionId,
+    activeThreadId,
+    targetSessionId: t.sessionId,
+    targetThreadId: t.id,
+    turnActive,
+    isSidebarWorking: (sid) => workingSessions.has(sid),
+    isThreadListedWorking: (sid) =>
+      threads.some((x) => x.sessionId === sid && x.status === "working"),
+  });
+  const {
+    sameSession,
+    prevSid,
+    wasActivelyTurning,
+    keepBgWorking,
+  } = leave;
+  if (leave.shouldSnapshot && prevSid) {
     // 必须在 endTurn 之前快照（含 turnActive=true）
     snapshotActiveSessionTurn(prevSid);
     snapshotActiveSessionPlan(prevSid);
@@ -10113,7 +4620,13 @@ async function openThread(t: ThreadRow): Promise<void> {
     markSessionWorking(prevSid, true);
     // 确保投影仍为 running（markSessionWorking 会补 background 槽）
     const snap = getSessionTurn(prevSid);
-    if (snap && !snap.turnActive) {
+    if (
+      shouldForceBackgroundTurnActive({
+        keepBgWorking,
+        prevSid,
+        snapTurnActive: snap?.turnActive,
+      })
+    ) {
       patchSessionTurn(prevSid, {
         turnActive: true,
         turnUiPhase: "working",
@@ -10125,8 +4638,8 @@ async function openThread(t: ThreadRow): Promise<void> {
     }
   }
   hideAgentCrashBanner();
-  agentAvailableCommands = [];
-  if (!sameSession) {
+  ensureAvailableCommands().clear();
+  if (leave.shouldResetCrossSessionUi) {
     // 阶段一：切走 stash plan/pending，不 abandoned
     closePlanPanelOnSessionChange({
       stashSessionId: prevSid,
@@ -10145,18 +4658,12 @@ async function openThread(t: ThreadRow): Promise<void> {
   syncChatTopTitle();
   // 先套上目标会话的 plan 投影（避免全局 planPhase 残留导致误 surface）
   if (!sameSession) {
-    const planProj = getSessionPlan(t.sessionId);
-    planPhase = planProj?.planPhase ?? "off";
-    pendingPlanApproval = planProj?.pendingApproval
-      ? { ...planProj.pendingApproval }
-      : null;
-    if (
-      pendingPlanApproval &&
-      pendingPlanApproval.sessionId &&
-      pendingPlanApproval.sessionId !== t.sessionId
-    ) {
-      pendingPlanApproval = null;
-    }
+    const bound = bindPlanProjectionForOpen(
+      getSessionPlan(t.sessionId),
+      t.sessionId,
+    );
+    planPhase = bound.planPhase;
+    pendingPlanApproval = bound.pendingApproval;
     syncPermLabels();
   }
   // 默认 history_only；按 sessionId 同步真实附着（disk_ 也可能已有 live）
@@ -10175,16 +4682,17 @@ async function openThread(t: ThreadRow): Promise<void> {
     if (viewGen !== sessionViewGen) return st;
     if (!st.ok || !st.data?.state) return st;
     const s = st.data.state as AttachState;
-    if (s === "live" || s === "attaching" || s === "failed") {
+    if (shouldApplyAttachUiState(s)) {
       setAttachUiState(s, st.data.lastError);
     }
     // 列表是 disk_ 但 Host 已 live：回写 live threadId，事件路由更准
-    if (
-      st.data.threadId &&
-      (s === "live" || s === "attaching") &&
-      activeThreadId?.startsWith("disk_")
-    ) {
-      activeThreadId = st.data.threadId;
+    const nextTid = resolveThreadIdAfterAttachState({
+      activeThreadId,
+      attachThreadId: st.data.threadId,
+      attachState: s,
+    });
+    if (nextTid && nextTid !== activeThreadId) {
+      activeThreadId = nextTid;
     }
     return st;
   });
@@ -10200,12 +4708,12 @@ async function openThread(t: ThreadRow): Promise<void> {
   startContextPolling();
   if (t.projectId) {
     selectedProjectId = t.projectId;
-    expandedProjectIds.add(t.projectId);
+    ensureSidebarList().expandedProjectIds.add(t.projectId);
   } else {
     // 无项目会话：归「对话」组，不按 cwd 误选项目
     selectedProjectId = null;
     projectChoiceTouched = true;
-    expandedProjectIds.add(CHATS_GROUP_ID);
+    ensureSidebarList().expandedProjectIds.add(CHATS_GROUP_ID);
   }
   showWelcome(false);
   clearTranscript();
@@ -10249,50 +4757,17 @@ async function openThread(t: ThreadRow): Promise<void> {
       promptInFlight: promptInFlightEarly,
     });
 
-    const userTexts: string[] = [];
     // S15：连贯回放 — user / thought / tool / assistant 同一时间线
-    for (const e of hist.data?.entries ?? []) {
-      endStreamBubble();
-      const role = (e.role || "").toLowerCase();
-      if (role === "user" || role === "human") {
-        if (!e.text?.trim()) continue;
-        const parsed = parseUserHistoryPayload(e.text);
-        if (parsed.text || parsed.attachments.length) {
-          // 历史条目通常无可靠时间戳，只显示复制按钮
-          paintUserMessage(parsed.text, parsed.attachments, null);
-          if (parsed.text.trim()) userTexts.push(parsed.text.trim());
-        }
-      } else if (role === "tool") {
-        // 无 in-flight：incomplete/running 历史 tool 一律当失败收口，勿画 spinner
-        if (
-          !willBusyEarly &&
-          (e.toolStatus === "incomplete" ||
-            e.toolStatus === "running" ||
-            !e.toolStatus)
-        ) {
-          replayHistoryTool({ ...e, toolStatus: "failed" });
-        } else {
-          replayHistoryTool(e);
-        }
-      } else if (
-        role === "thought" ||
-        role === "thinking" ||
-        role === "reasoning"
-      ) {
-        if (e.text?.trim()) {
-          // 历史思考并入过程块，与直播 thought.delta 一致
-          appendProcessText(e.text.trim());
-        }
-      } else if (role === "system") {
-        if (e.text?.trim()) appendLine(e.text, "system");
-      } else if (role === "assistant" || role === "ai") {
-        if (!e.text?.trim()) continue;
-        appendLine(e.text, "assistant");
-      }
-      endStreamBubble();
-    }
+    const userTexts = paintHistoryEntries(hist.data?.entries, {
+      willBusyEarly,
+      endStreamBubble,
+      paintUserMessage,
+      replayHistoryTool,
+      appendProcessText,
+      appendLine,
+    });
     // S17：从磁盘 user 消息 seed（最新在前）
-    if (!sameSession || !promptHistory.length) {
+    if (!sameSession || !ensurePromptHistory().length) {
       seedPromptHistoryFromUserTexts(userTexts);
     }
     // 与直播回合结束一致：过程块默认折叠（历史无精确耗时，不写 Worked for）
@@ -10576,32 +5051,7 @@ async function removeProjectFromList(
   title: string,
   projectPath: string,
 ): Promise<void> {
-  const ok = window.confirm(
-    `从列表移除项目「${title}」？\n\n不会删除磁盘上的文件夹：\n${projectPath}`,
-  );
-  if (!ok) return;
-  const res = await inv("projects.remove", { id });
-  if (!res.ok) {
-    showToast(res.error?.message ?? "移除失败", "error");
-    return;
-  }
-  expandedProjectIds.delete(id);
-  projectShowAllThreads.delete(id);
-  expandedArchiveIds.delete(id);
-  if (selectedProjectId === id) {
-    selectedProjectId = null;
-    projectChoiceTouched = true;
-    // 若当前会话属于该项目，仅清选中；会话仍可继续
-  }
-  await refreshProjectsAndThreads();
-  if (!selectedProjectId && projects.length) {
-    selectedProjectId = projects[0].id;
-  }
-  setWelcomeTitle();
-  if (!activeThreadId && !activeSessionId) {
-    showWelcome(true);
-  }
-  showToast(`已移除「${title}」`);
+  return ensureProjectActions().removeFromList(id, title, projectPath);
 }
 
 async function startNewChat(prompt?: string): Promise<void> {
@@ -10651,7 +5101,7 @@ async function startNewChat(prompt?: string): Promise<void> {
       return;
     }
   }
-  const attachSnap = [...composerAttachments];
+  const attachSnap = [...ensureAttachUi().list()];
   const { display, content } = buildPromptWithAttachments(goalParse.message);
   if (!content.trim()) {
     showToast(
@@ -10723,7 +5173,7 @@ async function startNewChat(prompt?: string): Promise<void> {
   else {
     selectedProjectId = null;
     projectChoiceTouched = true;
-    expandedProjectIds.add(CHATS_GROUP_ID);
+    ensureSidebarList().expandedProjectIds.add(CHATS_GROUP_ID);
   }
   suspendLiveTranscript = false;
   if (activeSessionId) markSessionWorking(activeSessionId, true);
@@ -10745,7 +5195,7 @@ async function startNewChat(prompt?: string): Promise<void> {
       patchSessionPlan(activeSessionId, { planPhase: "active" });
     }
   }
-  lastPlanArtifactPath = null;
+  ensurePlanPanel().clearLastArtifactPath();
   setTurnStatus(tr("turn.thinking"));
   // 与继续对话相同：直播流式事件，首包即可显示
   const pr = await inv("turns.prompt", {
@@ -10790,7 +5240,7 @@ function takeComposerPrompt(opts?: { forceGoal?: boolean }): {
     beginGoalCompose();
     return null;
   }
-  const attachSnap = [...composerAttachments];
+  const attachSnap = [...ensureAttachUi().list()];
   const { display, content } = buildPromptWithAttachments(goalParse.message);
   if (!content.trim()) return null;
   input.value = "";
@@ -10811,70 +5261,12 @@ function takeComposerPrompt(opts?: { forceGoal?: boolean }): {
   };
 }
 
-/** 解析 composer 内联 `/btw …` / `/interject …`（完整行） */
-function parseInlineBtwOrInterject(
-  text: string,
-): { kind: "btw" | "interject"; body: string } | null {
-  const t = text.replace(/^\s+/, "");
-  const m = t.match(/^\/(btw|interject)(?:\s+([\s\S]*))?$/i);
-  if (!m) return null;
-  return {
-    kind: m[1]!.toLowerCase() as "btw" | "interject",
-    body: (m[2] ?? "").trim(),
-  };
-}
-
-/** 旁路侧问：画到右侧「旁路侧问」栏线程（对齐 Codex 侧边聊天，不进主 transcript） */
 function ensureBtwSideOpen(): boolean {
   return sidePane?.openBtwCategory(false) ?? false;
 }
 
-function btwSideThreadEl(): HTMLElement | null {
-  return document.getElementById("btw-side-thread");
-}
-
-function btwSideHideEmpty(): void {
-  document.getElementById("btw-side-empty")?.classList.add("hidden");
-}
-
-function btwSideShowEmpty(): void {
-  const thread = btwSideThreadEl();
-  const empty = document.getElementById("btw-side-empty");
-  if (!thread || !empty) return;
-  empty.classList.remove("hidden");
-  if (!thread.contains(empty)) thread.appendChild(empty);
-}
-
-/** 将 store 中的一条 exchange 画到 #btw-side-thread（仅前台会话应调用） */
 function paintBtwExchangeDom(ex: BtwExchange): void {
-  const thread = btwSideThreadEl();
-  if (!thread) return;
-  btwSideHideEmpty();
-  let block = document.getElementById(ex.id) as HTMLElement | null;
-  if (!block) {
-    block = document.createElement("div");
-    block.id = ex.id;
-    block.className = "btw-ex";
-    thread.appendChild(block);
-  }
-  const state = ex.state;
-  block.classList.toggle("btw-ex--error", state === "error");
-  block.classList.toggle("btw-ex--done", state === "done");
-  block.classList.toggle("btw-ex--loading", state === "loading");
-  block.classList.toggle("btw-ex--stopped", state === "stopped");
-  const qHtml = `<div class="btw-ex-q"><div class="btw-ex-bubble btw-ex-bubble-user">${esc(ex.question)}</div></div>`;
-  let aHtml: string;
-  if (state === "loading") {
-    aHtml = `<div class="btw-ex-a"><div class="btw-ex-bubble btw-ex-bubble-ai btw-loading">${esc(tr("btw.loading"))}</div></div>`;
-  } else if (state === "error") {
-    aHtml = `<div class="btw-ex-a"><div class="btw-ex-bubble btw-ex-bubble-ai btw-err">${esc(ex.body || tr("btw.fail"))}</div></div>`;
-  } else if (state === "stopped") {
-    aHtml = `<div class="btw-ex-a"><div class="btw-ex-bubble btw-ex-bubble-ai">${esc(ex.body || tr("btw.stopped"))}</div></div>`;
-  } else {
-    aHtml = `<div class="btw-ex-a"><div class="btw-ex-bubble btw-ex-bubble-ai">${renderMarkdownToSafeHtml(ex.body ?? "")}</div></div>`;
-  }
-  block.innerHTML = qHtml + aHtml;
-  thread.scrollTop = thread.scrollHeight;
+  ensureBtwSideUi().paintExchange(ex);
 }
 
 /**
@@ -10882,44 +5274,12 @@ function paintBtwExchangeDom(ex: BtwExchange): void {
  * DOM 是全局单例，投影按会话存在 session-btw-store。
  */
 function rebindBtwSideForSession(sessionId: string | null): void {
-  const thread = btwSideThreadEl();
-  if (!thread) return;
-  thread.querySelectorAll(".btw-ex").forEach((n) => n.remove());
-  const list = sessionId ? listSessionBtw(sessionId) : [];
-  if (!list.length) {
-    btwSideShowEmpty();
-  } else {
-    for (const ex of list) paintBtwExchangeDom(ex);
-  }
-  syncBtwSideComposer(sessionId);
+  ensureBtwSideUi().rebindForSession(sessionId);
 }
 
 /** 侧栏发送钮：空闲=发送，本会话侧问 in-flight=停止（不禁用输入） */
 function syncBtwSideComposer(sessionId?: string | null): void {
-  const sid = sessionId === undefined ? activeSessionId : sessionId;
-  const busy = Boolean(sid && isBtwInFlight(sid));
-  const sendBtn = document.getElementById(
-    "btn-btw-send",
-  ) as HTMLButtonElement | null;
-  if (sendBtn) {
-    sendBtn.disabled = false;
-    if (busy) {
-      sendBtn.classList.add("stop");
-      sendBtn.innerHTML = sendButtonIconHtml(true);
-      sendBtn.title = tr("btw.stop");
-      sendBtn.setAttribute("aria-label", tr("btw.stop"));
-    } else {
-      sendBtn.classList.remove("stop");
-      sendBtn.innerHTML = sendButtonIconHtml(false);
-      sendBtn.title = tr("btw.send");
-      sendBtn.setAttribute("aria-label", tr("btw.send"));
-    }
-  }
-  // 侧问进行中仍可编辑草稿；仅发送钮变 stop
-  const ta = document.getElementById(
-    "btw-side-input",
-  ) as HTMLTextAreaElement | null;
-  if (ta) ta.readOnly = false;
+  ensureBtwSideUi().syncComposer(sessionId);
 }
 
 /** store 更新后：仅当前前台会话刷新对应 DOM 块 */
@@ -10928,38 +5288,16 @@ function applyBtwExchangeUi(
   ex: BtwExchange,
   opts?: { openSide?: boolean },
 ): void {
-  if (sessionId !== activeSessionId) {
-    syncBtwSideComposer(activeSessionId);
-    return;
-  }
-  if (opts?.openSide) ensureBtwSideOpen();
-  paintBtwExchangeDom(ex);
-  syncBtwSideComposer(sessionId);
+  ensureBtwSideUi().applyExchangeUi(sessionId, ex, opts);
 }
 
 function clearBtwSideThread(): void {
-  if (activeSessionId) {
-    // 清空 UI 投影；进行中的 RPC 也丢弃
-    cancelSessionBtwFlight(activeSessionId, tr("btw.stopped"));
-    clearSessionBtw(activeSessionId);
-  }
-  rebindBtwSideForSession(activeSessionId);
+  ensureBtwSideUi().clearThread();
 }
 
 /** 丢弃本会话 in-flight 侧问结果（无 agent cancel API；仅 UI + flightGen） */
 function stopBtwSideQuestion(): void {
-  if (!activeSessionId || !isBtwInFlight(activeSessionId)) return;
-  const r = cancelSessionBtwFlight(activeSessionId, tr("btw.stopped"));
-  if (r?.exchangeId) {
-    const ex = listSessionBtw(activeSessionId).find(
-      (e) => e.id === r.exchangeId,
-    );
-    if (ex) applyBtwExchangeUi(activeSessionId, ex);
-    else rebindBtwSideForSession(activeSessionId);
-  } else {
-    syncBtwSideComposer(activeSessionId);
-  }
-  showToast(tr("btw.stopped"), "info");
+  ensureBtwSideUi().stopQuestion();
 }
 
 /**
@@ -10969,35 +5307,7 @@ async function loadBtwHistoryForSession(
   sessionId: string,
   viewGen: number,
 ): Promise<void> {
-  const sid = sessionId.trim();
-  if (!sid) return;
-  const res = await inv<{
-    sessionId: string;
-    entries: Array<{
-      btwSessionId: string;
-      question: string;
-      answer: string;
-      success: boolean;
-      error?: string;
-      askedAt?: string;
-    }>;
-  }>("history.btwLoad", { sessionId: sid });
-  if (viewGen !== sessionViewGen) return;
-  if (activeSessionId !== sid) return;
-  if (!res.ok || !res.data?.entries?.length) {
-    // 无磁盘记录时仍可能有内存侧问（本会话刚发的）
-    rebindBtwSideForSession(sid);
-    return;
-  }
-  const fromDisk: BtwExchange[] = res.data.entries.map((e) => ({
-    id: `btw_disk_${e.btwSessionId}`,
-    question: e.question,
-    state: (e.success ? "done" : "error") as BtwExchangeState,
-    body: e.success ? e.answer : e.error || e.answer || tr("btw.fail"),
-    updatedAtMs: e.askedAt ? Date.parse(e.askedAt) || Date.now() : Date.now(),
-  }));
-  replaceSessionBtwFromDisk(sid, fromDisk);
-  rebindBtwSideForSession(sid);
+  return ensureBtwActions().loadHistoryForSession(sessionId, viewGen);
 }
 
 /** @deprecated 主时间线卡片已弃用；保留 dismiss 以免旧 DOM 残留 */
@@ -11005,336 +5315,20 @@ function dismissBtwCard(): void {
   document.getElementById("btw-live-card")?.remove();
 }
 
-/** 插话用户块（对齐 user-msg-block；虚线边区分普通气泡）；失败时可 rollback */
-function paintInterjectionMessage(
-  text: string,
-  interjectionId?: string,
-): HTMLElement | null {
-  const t = text.trim();
-  if (!t) return null;
-  const el = $("transcript");
-  const wrap = document.createElement("div");
-  wrap.className = "user-msg-block interjection";
-  wrap.dataset.messageAuthorRole = "user";
-  if (interjectionId) wrap.dataset.interjectionId = interjectionId;
-  wrap.dataset.rawText = t;
-
-  const bubble = document.createElement("div");
-  bubble.className = "line user interjection-bubble";
-
-  const tag = document.createElement("div");
-  tag.className = "interjection-tag";
-  tag.textContent = tr("interject.tag");
-
-  const body = document.createElement("div");
-  body.className = "msg-user-text";
-  body.textContent = t;
-
-  bubble.appendChild(tag);
-  bubble.appendChild(body);
-  wrap.appendChild(bubble);
-  el.appendChild(wrap);
-  // 插话在流式中：用户若在上滑阅读，勿强拉到底
-  scrollTranscriptIfSticky();
-  return wrap;
-}
-
-/** 本端已乐观绘制的 interjection id（回声去重） */
-const selfInterjectionIds = new Set<string>();
-/** interject 进行中：防连点风暴 */
-let interjectInFlight = false;
-
-/**
- * 旁路侧问：打开右侧「旁路侧问」栏（对齐 Codex 侧边聊天布局）。
- * 协议仍是 Grok `_x.ai/btw`；无问题正文时只展开面板。
- * B1：必须有当前会话（sessionId）；可与主 turn 并行。
- */
 async function runBtwCommand(
   questionArg?: string,
 ): Promise<{ ok: boolean; message?: string }> {
-  if (!activeSessionId) {
-    sidePane?.syncBtwAvailability();
-    return { ok: false, message: tr("btw.needSession") };
-  }
-  let question = (questionArg ?? "").trim();
-  if (!question) {
-    const fromComposer = activeComposerInput()?.value.trim() ?? "";
-    const inline = parseInlineBtwOrInterject(fromComposer);
-    if (inline?.kind === "btw" && inline.body) {
-      question = inline.body;
-      const ta = activeComposerInput();
-      if (ta) ta.value = "";
-    } else if (
-      fromComposer &&
-      !fromComposer.startsWith("/") &&
-      // 主 composer 有普通正文时：用户 slash 选 btw 则当作侧问发出
-      questionArg === undefined
-    ) {
-      // 仅 palette 无参时：优先打开侧栏，不吞主输入
-    }
-  }
-  if (!question) {
-    const opened = sidePane?.openBtwCategory(true) ?? false;
-    if (!opened) {
-      return { ok: false, message: tr("btw.needSession") };
-    }
-    return { ok: true, message: tr("btw.sideOpened") };
-  }
-  return sendBtwQuestion(question);
-}
-
-/** 从侧栏输入框发送侧问；进行中时点击 = 停止 */
-async function sendBtwFromSidePanel(): Promise<void> {
-  if (activeSessionId && isBtwInFlight(activeSessionId)) {
-    stopBtwSideQuestion();
-    return;
-  }
-  const ta = document.getElementById(
-    "btw-side-input",
-  ) as HTMLTextAreaElement | null;
-  if (!ta) return;
-  const question = ta.value.trim();
-  if (!question) {
-    showToast(tr("btw.empty"), "error");
-    return;
-  }
-  ta.value = "";
-  ta.style.height = "auto";
-  const res = await sendBtwQuestion(question);
-  if (res.message && !res.ok) showToast(res.message, "error");
-}
-
-async function sendBtwQuestion(
-  question: string,
-): Promise<{ ok: boolean; message?: string }> {
-  const q = question.trim();
-  if (!q) return { ok: false, message: tr("btw.empty") };
-  if (!activeSessionId) {
-    sidePane?.syncBtwAvailability();
-    return { ok: false, message: tr("btw.needSession") };
-  }
-  const sessionId = activeSessionId;
-  if (isBtwInFlight(sessionId)) {
-    return { ok: false, message: tr("btw.inFlight") };
-  }
-
-  showWelcome(false);
-  if (!sidePane?.openBtwCategory(false)) {
-    return { ok: false, message: tr("btw.needSession") };
-  }
-
-  const exId = `btw_ex_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 7)}`;
-  const loading: BtwExchange = {
-    id: exId,
-    question: q,
-    state: "loading",
-    updatedAtMs: Date.now(),
-  };
-  upsertBtwExchange(sessionId, loading);
-  const flightGen = beginBtwFlight(sessionId, exId);
-  applyBtwExchangeUi(sessionId, loading, { openSide: true });
-  recordPromptHistory(`/btw ${q}`);
-
-  try {
-    // 对齐 CLI：/btw 只发扩展 RPC，不在侧问前 setModel（busy 时 setModel 会污染侧问采样）
-    const threadId = await ensureLiveThread({ syncModel: false });
-    // attach 期间用户可能已切会话 / 停止侧问
-    if (!isBtwFlightCurrent(sessionId, flightGen, exId)) {
-      return { ok: false, message: tr("btw.stopped") };
-    }
-    if (!threadId) {
-      const msg = tr("btw.connectFail");
-      const errEx: BtwExchange = {
-        id: exId,
-        question: q,
-        state: "error",
-        body: msg,
-        updatedAtMs: Date.now(),
-      };
-      if (isBtwFlightCurrent(sessionId, flightGen, exId)) {
-        upsertBtwExchange(sessionId, errEx);
-        applyBtwExchangeUi(sessionId, errEx);
-      }
-      return { ok: false, message: msg };
-    }
-
-    // 不 cancel 主 turn；btw 与 busy 可并行。闭包绑定 sessionId，结果写回该会话 store。
-    const res = await inv<{ sessionId: string; answer: string }>("threads.btw", {
-      threadId,
-      question: q,
-    });
-    if (!isBtwFlightCurrent(sessionId, flightGen, exId)) {
-      // 已停止或被新侧问取代：丢弃结果，勿污染 UI
-      return { ok: false, message: tr("btw.stopped") };
-    }
-    if (!res.ok) {
-      const msg = formatTurnErrorMessage(
-        res.error?.message ?? tr("btw.fail"),
-        res.error && "details" in res.error
-          ? (res.error as { details?: unknown }).details
-          : undefined,
-      );
-      const errEx: BtwExchange = {
-        id: exId,
-        question: q,
-        state: "error",
-        body: msg,
-        updatedAtMs: Date.now(),
-      };
-      upsertBtwExchange(sessionId, errEx);
-      applyBtwExchangeUi(sessionId, errEx);
-      return { ok: false, message: msg };
-    }
-    const doneEx: BtwExchange = {
-      id: exId,
-      question: q,
-      state: "done",
-      body: res.data?.answer ?? "",
-      updatedAtMs: Date.now(),
-    };
-    upsertBtwExchange(sessionId, doneEx);
-    applyBtwExchangeUi(sessionId, doneEx);
-    return { ok: true, message: tr("btw.ok") };
-  } finally {
-    // 若仍是本 flight 的 loading（异常路径未 upsert），清 inFlight 标记
-    const p = getOrCreateSessionBtw(sessionId);
-    if (p.inFlightId === exId && p.flightGen === flightGen) {
-      const cur = p.exchanges.find((e) => e.id === exId);
-      if (cur?.state === "loading") {
-        const errEx: BtwExchange = {
-          id: exId,
-          question: q,
-          state: "error",
-          body: tr("btw.fail"),
-          updatedAtMs: Date.now(),
-        };
-        upsertBtwExchange(sessionId, errEx);
-        applyBtwExchangeUi(sessionId, errEx);
-      } else if (p.inFlightId === exId) {
-        p.inFlightId = null;
-      }
-    }
-    if (activeSessionId === sessionId) syncBtwSideComposer(sessionId);
-  }
-}
-
-function bindBtwSidePanel(): void {
-  const ta = document.getElementById(
-    "btw-side-input",
-  ) as HTMLTextAreaElement | null;
-  const sendBtn = document.getElementById("btn-btw-send");
-  const clearBtn = document.getElementById("btn-btw-clear");
-  sendBtn?.addEventListener("click", () => void sendBtwFromSidePanel());
-  clearBtn?.addEventListener("click", () => {
-    clearBtwSideThread();
-    showToast(tr("btw.cleared"));
-  });
-  ta?.addEventListener("keydown", (e) => {
-    if (e.key === "Enter" && !e.shiftKey) {
-      e.preventDefault();
-      // 进行中时 Enter 不触发停止，避免误触；用按钮 stop
-      if (activeSessionId && isBtwInFlight(activeSessionId)) {
-        showToast(tr("btw.inFlight"), "info");
-        return;
-      }
-      void sendBtwFromSidePanel();
-    }
-  });
-  ta?.addEventListener("input", () => {
-    if (!ta) return;
-    ta.style.height = "auto";
-    ta.style.height = `${Math.min(120, ta.scrollHeight)}px`;
-  });
+  return ensureBtwActions().runBtwCommand(questionArg);
 }
 
 async function runInterjectCommand(
   textArg?: string,
 ): Promise<{ ok: boolean; message?: string }> {
-  // cancelling 中禁止插话：避免与 cancel 竞态、误导「已插入」
-  if (turnUiPhase === "cancelling") {
-    return { ok: false, message: tr("interject.cancelling") };
-  }
-  if (!turnActive || turnUiPhase !== "working") {
-    return { ok: false, message: tr("interject.needTurn") };
-  }
-  if (interjectInFlight) {
-    return { ok: false, message: tr("interject.inFlight") };
-  }
-  let text = (textArg ?? "").trim();
-  let historyAlreadyRecorded = false;
-  if (!text) {
-    const taken = takeComposerPrompt();
-    if (taken) {
-      // interject 文本路径：暂不带附件 wire（CLI 有 content blocks；Desktop v1 仅 text）
-      text = taken.content.trim() || taken.display.trim();
-      historyAlreadyRecorded = true; // takeComposerPrompt 已写入 prompt history
-    }
-  }
-  if (!text) {
-    return { ok: false, message: tr("interject.empty") };
-  }
-
-  interjectInFlight = true;
-  const interjectionId = `ij_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 9)}`;
-  // 乐观绘制前先占位；失败则回滚 DOM
-  selfInterjectionIds.add(interjectionId);
-  const painted = paintInterjectionMessage(text, interjectionId);
-  if (!historyAlreadyRecorded) recordPromptHistory(text);
-
-  try {
-    const threadId =
-      activeThreadId && !activeThreadId.startsWith("disk_")
-        ? activeThreadId
-        : await ensureLiveThread({ syncModel: false });
-    if (!threadId) {
-      rollbackInterjection(interjectionId, painted);
-      return { ok: false, message: tr("chat.connectFail") };
-    }
-
-    // 二次确认：attach 期间 turn 可能已结束 / 进入 cancelling
-    // await 后重新读；用 as 打破入口处的 phase 收窄（TS 跨 await 仍可能锁在 working）
-    const phaseAfter = turnUiPhase as TurnUiPhase;
-    if (!turnActive || phaseAfter !== "working") {
-      rollbackInterjection(interjectionId, painted);
-      return {
-        ok: false,
-        message:
-          phaseAfter === "cancelling"
-            ? tr("interject.cancelling")
-            : tr("interject.needTurn"),
-      };
-    }
-
-    const res = await inv<{
-      sessionId: string;
-      status: string;
-      interjectionId: string;
-    }>("threads.interject", { threadId, text, interjectionId });
-
-    if (!res.ok) {
-      rollbackInterjection(interjectionId, painted);
-      const msg = formatTurnErrorMessage(
-        res.error?.message ?? tr("interject.fail"),
-        res.error && "details" in res.error
-          ? (res.error as { details?: unknown }).details
-          : undefined,
-      );
-      appendLine(msg, "error");
-      return { ok: false, message: msg };
-    }
-    showToast(tr("interject.ok"));
-    return { ok: true, message: tr("interject.ok") };
-  } finally {
-    interjectInFlight = false;
-  }
+  return ensureBtwActions().runInterjectCommand(textArg);
 }
 
-function rollbackInterjection(
-  interjectionId: string,
-  el: HTMLElement | null,
-): void {
-  selfInterjectionIds.delete(interjectionId);
-  el?.remove();
+function bindBtwSidePanel(): void {
+  ensureBtwActions().bindSidePanel();
 }
 
 /** turn 进行中：将当前输入入队（S19 follow-up） */
@@ -11416,7 +5410,7 @@ async function sendContinue(): Promise<void> {
 
   // Phase4：Cancelling / busy 发送策略
   const hasDraft = Boolean(
-    (activeComposerInput()?.value.trim() ?? "") || composerAttachments.length,
+    (activeComposerInput()?.value.trim() ?? "") || ensureAttachUi().list().length,
   );
   const busyAction = resolveBusySendWhileCancelling({
     cancelInFlight: Boolean(cancelTurnInFlight),
@@ -11504,7 +5498,7 @@ async function sendContinue(): Promise<void> {
       patchSessionPlan(activeSessionId, { planPhase: "active" });
     }
   }
-  lastPlanArtifactPath = null;
+  ensurePlanPanel().clearLastArtifactPath();
   setTurnStatus(tr("turn.thinking"));
 
   const agentContent = await prepareAgentContentAfterCancel(
@@ -11549,163 +5543,15 @@ async function showTerminalPanel(): Promise<void> {
 // ── Modals ─────────────────────────────────────────────────
 
 function openModal(title: string, html: string): void {
-  $("modal-title").textContent = title;
-  $("modal-body").innerHTML = html;
-  $("modal").classList.remove("hidden");
+  openModalDlg(title, html);
 }
 
 function closeModal(): void {
-  $("modal").classList.add("hidden");
+  closeModalDlg();
 }
 
 async function showSearchModal(): Promise<void> {
-  await refreshProjectsAndThreads();
-  openModal(
-    tr("common.search"),
-    `<div class="session-search-wrap">
-      <p class="prompt-dlg-hint">${esc(tr("search.resumeHint"))}</p>
-      <input id="search-q" class="prompt-dlg-input" type="search"
-        placeholder="${esc(tr("search.placeholder"))}" autocomplete="off" />
-      <div id="search-hits" class="session-search-list"></div>
-      <div class="prompt-dlg-actions">
-        <button type="button" class="btn-ghost" id="prompt-dlg-cancel">${esc(tr("common.close"))}</button>
-      </div>
-    </div>`,
-  );
-  const run = async () => {
-    const rawQ = ($("search-q") as HTMLInputElement).value.trim();
-    const q = rawQ.toLowerCase();
-    const parts: string[] = [];
-    // 完整 session id 精确命中优先（对齐 CLI -r /resume）
-    if (q.length >= 8) {
-      const exact = threads.find(
-        (t) =>
-          t.sessionId.toLowerCase() === q ||
-          t.sessionId.toLowerCase().startsWith(q),
-      );
-      if (exact) {
-        parts.push(
-          `<button type="button" class="session-search-item is-resume" data-kind="thread" data-sid="${esc(exact.sessionId)}">
-            <div class="session-search-title">↩ ${esc(tr("search.resumePrefix"))} ${esc(exact.title || exact.sessionId.slice(0, 8))}</div>
-            <div class="session-search-sub">${esc(exact.sessionId)} · ${esc(formatAge(exact.updatedAt) || "")}</div>
-          </button>`,
-        );
-      }
-    }
-    for (const p of projects) {
-      if (
-        !q ||
-        p.title.toLowerCase().includes(q) ||
-        p.path.toLowerCase().includes(q)
-      ) {
-        parts.push(
-          `<button type="button" class="session-search-item" data-kind="project" data-id="${esc(p.id)}">
-            <div class="session-search-title">📁 ${esc(p.title)}</div>
-            <div class="session-search-sub">${esc(p.path)}</div>
-          </button>`,
-        );
-      }
-    }
-    for (const t of threads.filter((x) => !x.archived)) {
-      if (
-        !q ||
-        t.title.toLowerCase().includes(q) ||
-        t.sessionId.toLowerCase().includes(q) ||
-        t.cwd.toLowerCase().includes(q)
-      ) {
-        // 已作为精确 resume 置顶则跳过重复
-        if (
-          q.length >= 8 &&
-          (t.sessionId.toLowerCase() === q ||
-            t.sessionId.toLowerCase().startsWith(q))
-        ) {
-          continue;
-        }
-        parts.push(
-          `<button type="button" class="session-search-item" data-kind="thread" data-sid="${esc(t.sessionId)}">
-            <div class="session-search-title">💬 ${esc(t.title || t.sessionId.slice(0, 8))}</div>
-            <div class="session-search-sub">${esc(formatAge(t.updatedAt) || "")} · ${esc(t.sessionId.slice(0, 8))}${t.archived ? "" : ""}</div>
-          </button>`,
-        );
-      }
-    }
-    // 归档会话也可按 id / 标题 resume
-    for (const t of threads.filter((x) => x.archived)) {
-      if (
-        q &&
-        (t.title.toLowerCase().includes(q) ||
-          t.sessionId.toLowerCase().includes(q))
-      ) {
-        parts.push(
-          `<button type="button" class="session-search-item" data-kind="thread" data-sid="${esc(t.sessionId)}">
-            <div class="session-search-title">📦 ${esc(t.title || t.sessionId.slice(0, 8))}</div>
-            <div class="session-search-sub">${esc(tr("search.archived"))} · ${esc(t.sessionId.slice(0, 8))}</div>
-          </button>`,
-        );
-      }
-    }
-    const proj = selectedProject();
-    if (proj && q.length >= 2) {
-      const g = await inv<
-        Array<{ name: string; path: string; line: number; snippet: string }>
-      >("graph.search", { projectPath: proj.path, query: q });
-      for (const h of g.data ?? []) {
-        parts.push(
-          `<button type="button" class="session-search-item" data-kind="symbol" data-path="${esc(h.path)}" data-line="${h.line}">
-            <div class="session-search-title">◇ ${esc(h.name)}</div>
-            <div class="session-search-sub">${esc(h.path)}:${h.line}</div>
-          </button>`,
-        );
-      }
-    }
-    $("search-hits").innerHTML =
-      parts.slice(0, 80).join("") ||
-      `<div class="item-sub">${esc(tr("common.noMatch"))}</div>`;
-    for (const btn of Array.from(
-      $("search-hits").querySelectorAll(".session-search-item"),
-    )) {
-      (btn as HTMLElement).onclick = () => {
-        const el = btn as HTMLElement;
-        const kind = el.dataset.kind;
-        if (kind === "project") {
-          selectedProjectId = el.dataset.id ?? null;
-          projectChoiceTouched = true;
-          closeModal();
-          showWelcome(true);
-          void refreshProjectsAndThreads();
-          return;
-        }
-        if (kind === "thread") {
-          const hit = threads.find((t) => t.sessionId === el.dataset.sid);
-          closeModal();
-          if (hit) {
-            showToast(
-              tr("search.opening", {
-                title: hit.title || hit.sessionId.slice(0, 8),
-              }),
-            );
-            void openThread(hit);
-          }
-          return;
-        }
-        if (kind === "symbol") {
-          const pth = el.dataset.path;
-          const line = Number(el.dataset.line);
-          closeModal();
-          if (pth) {
-            void openPathInWorkspace({
-              path: pth,
-              line: Number.isFinite(line) ? line : undefined,
-            });
-          }
-        }
-      };
-    }
-  };
-  $("search-q").oninput = () => void run();
-  $("prompt-dlg-cancel").onclick = () => closeModal();
-  void run();
-  requestAnimationFrame(() => ($("search-q") as HTMLInputElement).focus());
+  await ensureSessionSearch().show();
 }
 
 async function showPluginsPage(): Promise<void> {
@@ -11765,135 +5611,35 @@ async function openNewChatWithCreateSkill(): Promise<void> {
 }
 
 async function showAutomationsModal(): Promise<void> {
-  const list = await inv<
-    Array<{ id: string; name: string; status: string; prompt: string; projectId: string }>
-  >("automations.list");
-  openModal(
-    tr("nav.automations"),
-    `
-    <div style="display:grid;gap:8px;margin-bottom:12px">
-      <input id="auto-name" placeholder=tr("plug.mcpName") style="padding:8px 10px;border:1px solid var(--border);border-radius:8px;background:var(--bg-card);color:var(--text)" />
-      <select id="auto-project" style="padding:8px 10px;border:1px solid var(--border);border-radius:8px;background:var(--bg-card);color:var(--text)">
-        ${projects.map((p) => `<option value="${esc(p.id)}">${esc(p.title)}</option>`).join("")}
-      </select>
-      <textarea id="auto-prompt" rows="3" placeholder="定时任务指令" style="padding:8px 10px;border:1px solid var(--border);border-radius:8px;background:var(--bg-card);color:var(--text)"></textarea>
-      <button type="button" class="btn-dark" id="btn-auto-create">创建</button>
-    </div>
-    ${(list.data ?? []).map((a) => `<div class="item"><div class="item-title">${esc(a.name)} · ${esc(a.status)}</div><div class="item-sub">${esc(a.prompt)}</div>
-      <button type="button" class="btn-ghost" style="margin-top:6px" data-run="${esc(a.id)}">立即运行</button></div>`).join("") || '<div class="item-sub">暂无自动化</div>'}
-    `,
-  );
-  $("modal-body").onclick = async (e) => {
-    const t = e.target as HTMLElement;
-    if (t.id === "btn-auto-create") {
-      const name = ($("auto-name") as HTMLInputElement).value.trim();
-      const projectId = ($("auto-project") as HTMLSelectElement).value;
-      const prompt = ($("auto-prompt") as HTMLTextAreaElement).value.trim();
-      if (!name || !projectId || !prompt) return;
-      await inv("automations.create", {
-        name,
-        projectId,
-        schedule: "manual",
-        prompt,
-        worktreeMode: "project_root",
-        alwaysApprove: false,
-      });
-      await showAutomationsModal();
-    }
-    if (t.dataset.run) {
-      const r = await inv("automations.runNow", { id: t.dataset.run });
-      if (!r.ok) alert(r.error?.message);
-      else alert(tr("auto.started"));
-    }
-  };
+  await ensureAutomationsModal().show();
 }
 
 function resolveTheme(pref: SettingsThemePreference): ThemeVariant {
-  if (pref === "light" || pref === "dark") return pref;
-  try {
-    if (typeof matchMedia === "function") {
-      return matchMedia("(prefers-color-scheme: dark)").matches
-        ? "dark"
-        : "light";
-    }
-  } catch {
-    /* ignore */
-  }
-  return "light";
+  return ensureTheme().resolve(pref);
 }
 
 function appearanceForVariant(v: ThemeVariant): VariantAppearance {
-  return v === "light" ? appearanceLight : appearanceDark;
+  return ensureTheme().appearanceForVariant(v);
 }
 
 function paintResolvedTheme(
   resolved: ThemeVariant,
   opts?: { animate?: boolean },
 ): void {
-  const app = appearanceForVariant(resolved);
-  const isDefault = app.codeThemeId === "default" || app.codeThemeId === "codex";
-  // 始终 derive（含默认预设），与设置页 chrome 编辑同一管道
-  applyChromeTheme(app.chromeTheme, resolved, {
-    animate: opts?.animate === true,
-  });
-  // 冷启动缓存（theme-boot 可读）
-  try {
-    localStorage.setItem("grok-desktop-theme", themePreference);
-    localStorage.setItem(
-      "grok-desktop-theme-boot",
-      JSON.stringify({
-        variant: resolved,
-        codeThemeId: app.codeThemeId,
-        chrome: app.chromeTheme,
-        isDefault,
-      }),
-    );
-  } catch {
-    /* ignore */
-  }
-  // Windows titleBarOverlay 必须与 CSS shell 同色，否则右上角系统按钮区会跳色
-  const tokens = deriveChromeCssTokens(app.chromeTheme, resolved);
-  const bg = tokens["--bg"] ?? tokens["--bg-sidebar"];
-  const symbol = tokens["--text"];
-  void inv("ui.setChromeTheme", { theme: resolved, bg, symbol }).catch(() => {
-    /* older shell */
-  });
+  ensureTheme().paint(resolved, opts);
 }
 
 function bindSystemThemeListener(): void {
-  if (systemThemeMql && systemThemeListener) {
-    try {
-      systemThemeMql.removeEventListener("change", systemThemeListener);
-    } catch {
-      /* ignore */
-    }
-  }
-  systemThemeMql = null;
-  systemThemeListener = null;
-  if (themePreference !== "system") return;
-  try {
-    systemThemeMql = matchMedia("(prefers-color-scheme: dark)");
-    systemThemeListener = () => {
-      if (themePreference === "system") {
-        paintResolvedTheme(resolveTheme("system"));
-      }
-    };
-    systemThemeMql.addEventListener("change", systemThemeListener);
-  } catch {
-    /* ignore */
-  }
+  ensureTheme().bindSystemListener();
 }
 
 /** 应用 mode（system/light/dark）并刷新 chrome */
 function applyThemePreference(pref: SettingsThemePreference): void {
   themePreference = pref;
-  try {
-    localStorage.setItem("grok-desktop-theme", pref);
-  } catch {
-    /* ignore */
-  }
-  paintResolvedTheme(resolveTheme(pref), { animate: true });
-  bindSystemThemeListener();
+  ensureTheme().applyPreference(pref);
+  // 镜像到 main 本地变量（applyDesktopConfig 等仍读 appearanceLight/Dark）
+  appearanceLight = ensureTheme().getAppearanceLight();
+  appearanceDark = ensureTheme().getAppearanceDark();
 }
 
 /** 写入内存中的某 variant 外观并可选立即绘制 */
@@ -11904,20 +5650,12 @@ function setVariantAppearance(
 ): void {
   if (variant === "light") appearanceLight = app;
   else appearanceDark = app;
-  if (repaint && resolveTheme(themePreference) === variant) {
-    paintResolvedTheme(variant);
-  }
+  ensureTheme().setVariantAppearance(variant, app, repaint);
 }
 
 /** 导出当前 resolved 变体的 codex-theme-v1 串 */
 function exportCurrentThemeString(): string {
-  const variant = resolveTheme(themePreference);
-  const app = appearanceForVariant(variant);
-  return formatCodexThemeV1({
-    codeThemeId: app.codeThemeId,
-    theme: app.chromeTheme,
-    variant,
-  });
+  return ensureTheme().exportCurrentString();
 }
 
 function applyDesktopConfig(cfg: {
@@ -11950,10 +5688,12 @@ function applyDesktopConfig(cfg: {
   let appearanceDirty = false;
   if (cfg.appearanceLight) {
     appearanceLight = cfg.appearanceLight;
+    ensureTheme().setAppearanceLight(cfg.appearanceLight);
     appearanceDirty = true;
   }
   if (cfg.appearanceDark) {
     appearanceDark = cfg.appearanceDark;
+    ensureTheme().setAppearanceDark(cfg.appearanceDark);
     appearanceDirty = true;
   }
   if (cfg.theme !== undefined && cfg.theme !== themePreference) {
@@ -12146,43 +5886,11 @@ async function showSettingsPage(section?: string): Promise<void> {
 }
 
 /** 顶栏更新按钮：有可用/已下载更新时显示绿点 */
-type AppUpdateUiSnap = {
-  phase?: string;
-  latestVersion?: string;
-  canUpdate?: boolean;
-  error?: string;
-  currentVersion?: string;
-  releasesUrl?: string;
-};
-
 let lastAppUpdateSnap: AppUpdateUiSnap | null = null;
 
 function syncAppUpdateTopButton(snap?: AppUpdateUiSnap | null): void {
   if (snap) lastAppUpdateSnap = snap;
-  const u = lastAppUpdateSnap;
-  const btn = document.getElementById("btn-app-update") as HTMLButtonElement | null;
-  const dot = document.getElementById("btn-app-update-dot");
-  if (!btn) return;
-  const phase = (u?.phase || "").toLowerCase();
-  const hasUpdate =
-    Boolean(u?.canUpdate) &&
-    (phase === "available" ||
-      phase === "downloaded" ||
-      phase === "downloading" ||
-      (phase === "error" && Boolean(u?.latestVersion)));
-  btn.classList.toggle("has-update", hasUpdate);
-  if (dot) {
-    if (hasUpdate) dot.removeAttribute("hidden");
-    else dot.setAttribute("hidden", "");
-  }
-  const ver = (u?.latestVersion || "").trim();
-  if (hasUpdate && ver) {
-    btn.title = tr("nav.updateAvailableTitle", { version: ver });
-    btn.setAttribute("aria-label", btn.title);
-  } else {
-    btn.title = tr("nav.updateTitle");
-    btn.setAttribute("aria-label", tr("nav.updateTitle"));
-  }
+  lastAppUpdateSnap = syncAppUpdateTopButtonPure(snap, lastAppUpdateSnap);
 }
 
 async function onAppUpdateTopClick(): Promise<void> {
@@ -12204,12 +5912,8 @@ async function onAppUpdateTopClick(): Promise<void> {
 }
 
 /** 权限菜单关闭动画收尾定时器 */
-let permMenuCloseTimer: ReturnType<typeof setTimeout> | null = null;
-let permMenuOpenRaf = 0;
-
 function isPermMenuVisible(): boolean {
-  const menu = document.getElementById("perm-menu");
-  return Boolean(menu && !menu.classList.contains("hidden"));
+  return ensurePermMenu().isVisible();
 }
 
 /**
@@ -12217,55 +5921,7 @@ function isPermMenuVisible(): boolean {
  * @param immediate 窗口 resize 等场景跳过动画，避免残影留在原点
  */
 function hidePermMenu(opts?: { immediate?: boolean }): void {
-  const menu = document.getElementById("perm-menu");
-  if (!menu) return;
-  if (permMenuOpenRaf) {
-    cancelAnimationFrame(permMenuOpenRaf);
-    permMenuOpenRaf = 0;
-  }
-  if (permMenuCloseTimer != null) {
-    clearTimeout(permMenuCloseTimer);
-    permMenuCloseTimer = null;
-  }
-
-  const finish = () => {
-    menu.classList.add("hidden");
-    menu.classList.remove("is-open", "open-up", "open-down");
-    delete menu.dataset.anchor;
-  };
-
-  const reduced =
-    typeof matchMedia === "function" &&
-    matchMedia("(prefers-reduced-motion: reduce)").matches;
-  if (
-    opts?.immediate ||
-    reduced ||
-    menu.classList.contains("hidden") ||
-    !menu.classList.contains("is-open")
-  ) {
-    menu.classList.remove("is-open");
-    finish();
-    return;
-  }
-
-  menu.classList.remove("is-open");
-  const onEnd = (e: TransitionEvent) => {
-    if (e.target !== menu) return;
-    if (e.propertyName !== "opacity" && e.propertyName !== "transform") return;
-    menu.removeEventListener("transitionend", onEnd);
-    if (permMenuCloseTimer != null) {
-      clearTimeout(permMenuCloseTimer);
-      permMenuCloseTimer = null;
-    }
-    finish();
-  };
-  menu.addEventListener("transitionend", onEnd);
-  // transitionend 偶发丢失时兜底
-  permMenuCloseTimer = setTimeout(() => {
-    menu.removeEventListener("transitionend", onEnd);
-    permMenuCloseTimer = null;
-    finish();
-  }, 240);
+  ensurePermMenu().hide(opts);
 }
 
 /** 窗口几何变化时关掉 fixed 浮层，避免锚点失效留在原点 */
@@ -12276,217 +5932,29 @@ function hideEphemeralMenus(): void {
 }
 
 function syncPermMenuActiveItem(): void {
-  const menu = document.getElementById("perm-menu");
-  if (!menu) return;
-  for (const btn of Array.from(menu.querySelectorAll<HTMLElement>("[data-mode]"))) {
-    const mode = btn.dataset.mode;
-    // 菜单只反映访问权限，与 plan 无关
-    const active =
-      mode === "always_approve"
-        ? accessMode === "always_approve"
-        : mode === "normal"
-          ? accessMode === "normal"
-          : false;
-    btn.classList.toggle("is-active", active);
-  }
+  ensurePermMenu().syncActiveItem();
 }
 
 function showPermMenu(anchor: HTMLElement): void {
-  hideModelMenu();
-  hidePlusMenu();
-  const menu = $("perm-menu");
-
-  // 再次点击同一锚点：丝滑收起
-  if (
-    isPermMenuVisible() &&
-    menu.classList.contains("is-open") &&
-    menu.dataset.anchor === anchor.id
-  ) {
-    hidePermMenu();
-    return;
-  }
-
-  if (permMenuCloseTimer != null) {
-    clearTimeout(permMenuCloseTimer);
-    permMenuCloseTimer = null;
-  }
-  if (permMenuOpenRaf) {
-    cancelAnimationFrame(permMenuOpenRaf);
-    permMenuOpenRaf = 0;
-  }
-
-  // 先无 is-open 显示以便测量真实尺寸，再 rAF 触发展开动画
-  menu.classList.remove("hidden", "is-open");
-  syncPermMenuActiveItem();
-  const r = anchor.getBoundingClientRect();
-  const mw = menu.offsetWidth || 160;
-  const mh = menu.offsetHeight || 88;
-  let left = r.left;
-  if (left + mw > window.innerWidth - 8) left = window.innerWidth - mw - 8;
-  if (left < 8) left = 8;
-  // 输入栏贴底：优先向上弹出，避免「完全访问」等项被窗口底边裁切
-  const spaceBelow = window.innerHeight - r.bottom;
-  let top: number;
-  let openUp = false;
-  if (spaceBelow < mh + 12 && r.top > mh + 12) {
-    top = Math.max(8, r.top - mh - 6);
-    openUp = true;
-  } else {
-    top = r.bottom + 4;
-    if (top + mh > window.innerHeight - 8) {
-      top = Math.max(8, window.innerHeight - mh - 8);
-    }
-    // 最终仍在 chip 上方则用向上动效
-    openUp = top + mh / 2 < r.top;
-  }
-  menu.classList.toggle("open-up", openUp);
-  menu.classList.toggle("open-down", !openUp);
-  menu.style.left = `${left}px`;
-  menu.style.top = `${top}px`;
-  menu.dataset.anchor = anchor.id;
-
-  // 强制 reflow，保证从收起态过渡到 is-open
-  void menu.offsetWidth;
-  permMenuOpenRaf = requestAnimationFrame(() => {
-    permMenuOpenRaf = 0;
-    menu.classList.add("is-open");
-  });
+  ensurePermMenu().show(anchor);
 }
 
 /**
  * Shift+Tab：循环主展示模式（对齐 Grok Build CLI）
  * Normal → Plan → Always-approve → Normal
- * 注：从 Plan 到 Always-approve 会关 plan 并打开 yolo；
- * 从 Normal 进 Plan 不改变 accessMode（yolo 可 armed underneath）。
  */
 async function cycleSessionMode(): Promise<void> {
-  if (!isPlanOn() && accessMode === "normal") {
-    const r = await enterPlanMode();
-    if (r.message) showToast(r.message, r.ok ? "info" : "error");
-    return;
-  }
-  if (isPlanOn()) {
-    planPhase = "off";
-    if (activeSessionId) {
-      patchSessionPlan(activeSessionId, {
-        planPhase: "off",
-        pendingApproval: pendingPlanApproval,
-      });
-    }
-    accessMode = "always_approve";
-    if (sessionModeChipFocus === "plan") {
-      sessionModeChipFocus =
-        Boolean(currentGoalTitle()) || goalComposeActive ? "goal" : null;
-    }
-    syncPermLabels();
-    const r = await syncSessionPolicyLive({ plan: false, alwaysApprove: true });
-    if (!r.ok) {
-      showToast(r.message ?? "切换完全访问失败", "error");
-      return;
-    }
-    showToast("已开启完全访问");
-    return;
-  }
-  // always_approve（非 plan）→ normal
-  accessMode = "normal";
-  planPhase = "off";
-  if (activeSessionId) {
-    patchSessionPlan(activeSessionId, { planPhase: "off" });
-  }
-  if (sessionModeChipFocus === "plan") {
-    sessionModeChipFocus =
-      Boolean(currentGoalTitle()) || goalComposeActive ? "goal" : null;
-  }
-  syncPermLabels();
-  void syncSessionPolicyLive({ plan: false, alwaysApprove: false });
-  showToast("已恢复默认确认");
+  return ensureSessionPolicy().cycleSessionMode();
 }
 
 // ── Events ─────────────────────────────────────────────────
 
 function showPermission(requestId: string, summary: string): void {
-  // enter_plan_mode：与计划模式一致时自动允许（对齐 CLI 减少打断）
-  const low = summary.toLowerCase();
-  if (
-    /enter_plan|enter-plan|进入计划|plan mode/i.test(low) &&
-    isPlanOn()
-  ) {
-    void inv("permissions.respond", {
-      requestId,
-      decision: "allow_once",
-    });
-    planPhase = "active";
-    syncPermLabels();
-    return;
-  }
-  // Host 在 always_approve 时会自动放行；此处仍可能收到事件，直接隐藏条
-  if (accessMode === "always_approve") {
-    void inv("permissions.respond", {
-      requestId,
-      decision: "allow_once",
-    }).catch(() => undefined);
-    return;
-  }
-  const bar = $("permission-bar");
-  bar.classList.remove("hidden");
-  bar.innerHTML = `<div>${esc(tr("perm.needApprove", { summary }) || `需要批准：${summary}`)}</div>`;
-  for (const [label, decision] of [
-    [tr("perm.allow") || "允许", "allow_once"],
-    [tr("perm.deny") || "拒绝", "deny"],
-  ] as const) {
-    const b = document.createElement("button");
-    b.className = decision === "allow_once" ? "btn-dark" : "btn-ghost";
-    b.textContent = label;
-    b.onclick = async () => {
-      await inv("permissions.respond", { requestId, decision });
-      bar.classList.add("hidden");
-      if (decision === "allow_once" && /enter_plan|enter-plan|进入计划/i.test(low)) {
-        planPhase = "active";
-        syncPermLabels();
-      }
-    };
-    bar.appendChild(b);
-  }
-  showWelcome(false);
-}
-
-/** 从 tool raw 抽失败摘要（过程块 / 系统行） */
-function extractToolFailHint(raw: unknown, name?: string): string | null {
-  if (!raw || typeof raw !== "object") {
-    return name ? `${name}: failed` : null;
-  }
-  const r = raw as Record<string, unknown>;
-  const content = r.content;
-  if (Array.isArray(content)) {
-    for (const c of content) {
-      if (!c || typeof c !== "object") continue;
-      const inner = (c as { content?: { text?: string }; text?: string }).content;
-      const t =
-        (typeof inner === "object" && inner && "text" in inner
-          ? String((inner as { text?: string }).text ?? "")
-          : "") || String((c as { text?: string }).text ?? "");
-      if (t.trim()) {
-        const short = t.trim().slice(0, 200);
-        return name ? `${name}: ${short}` : short;
-      }
-    }
-  }
-  const out = r.rawOutput ?? r.raw_output;
-  if (out && typeof out === "object") {
-    const m =
-      (out as { message?: string }).message ??
-      (out as { error?: string }).error;
-    if (typeof m === "string" && m.trim()) {
-      const short = m.trim().slice(0, 200);
-      return name ? `${name}: ${short}` : short;
-    }
-  }
-  return name ? `${name}: failed` : null;
+  ensurePermPromptUi().showPermission(requestId, summary);
 }
 
 /**
  * ask_user_question UI：单选/多选题目；提交 → askUser.respond accepted。
- * plan 模式额外提供「取消」。
  */
 async function showAskUserDialog(ev: {
   requestId: string;
@@ -12497,826 +5965,113 @@ async function showAskUserDialog(ev: {
     options: Array<{ label: string; description?: string }>;
   }>;
 }): Promise<void> {
-  const questions = ev.questions ?? [];
-  if (!questions.length) {
-    void inv("askUser.respond", {
-      requestId: ev.requestId,
-      outcome: "cancelled",
-    });
-    return;
-  }
-
-  const parts: string[] = [
-    `<p class="prompt-dlg-hint">${esc(tr("askUser.hint") || "请选择后继续")}</p>`,
-  ];
-  questions.forEach((q, qi) => {
-    const multi = Boolean(q.multiSelect);
-    parts.push(
-      `<div class="ask-user-q" data-qi="${qi}" data-multi="${multi ? "1" : "0"}">
-        <div class="ask-user-q-title">${esc(q.question)}</div>
-        <div class="ask-user-opts">`,
-    );
-    (q.options ?? []).forEach((opt, oi) => {
-      const inputType = multi ? "checkbox" : "radio";
-      const name = `ask_q_${qi}`;
-      const id = `ask_q_${qi}_${oi}`;
-      parts.push(
-        `<label class="ask-user-opt" for="${id}">
-          <input type="${inputType}" name="${name}" id="${id}" value="${esc(opt.label)}" />
-          <span class="ask-user-opt-label">${esc(opt.label)}</span>
-          ${opt.description ? `<span class="ask-user-opt-desc">${esc(opt.description)}</span>` : ""}
-        </label>`,
-      );
-    });
-    parts.push(`</div></div>`);
-  });
-  parts.push(`
-    <div class="prompt-dlg-actions">
-      <button type="button" class="btn-ghost" id="ask-user-cancel">${esc(tr("common.cancel"))}</button>
-      <button type="button" class="btn-dark" id="ask-user-ok">${esc(tr("askUser.submit") || "提交")}</button>
-    </div>`);
-
-  openModal(tr("askUser.title") || "需要你的选择", parts.join(""));
-
-  const finish = async (
-    outcome: "accepted" | "cancelled",
-    answers?: Record<string, string[]>,
-  ) => {
-    closeModal();
-    try {
-      await inv("askUser.respond", {
-        requestId: ev.requestId,
-        outcome,
-        answers,
-      });
-    } catch (err) {
-      showToast(
-        err instanceof Error ? err.message : tr("askUser.fail") || "提交失败",
-        "error",
-      );
-    }
-  };
-
-  $("ask-user-cancel").onclick = () => void finish("cancelled");
-  $("ask-user-ok").onclick = () => {
-    const answers: Record<string, string[]> = {};
-    let missing = false;
-    questions.forEach((q, qi) => {
-      const wrap = document.querySelector(
-        `.ask-user-q[data-qi="${qi}"]`,
-      ) as HTMLElement | null;
-      if (!wrap) return;
-      const multi = wrap.dataset.multi === "1";
-      const inputs = Array.from(
-        wrap.querySelectorAll("input:checked"),
-      ) as HTMLInputElement[];
-      const labels = inputs.map((i) => i.value).filter(Boolean);
-      if (!labels.length) missing = true;
-      else answers[q.question] = multi ? labels : [labels[0]!];
-    });
-    if (missing) {
-      showToast(tr("askUser.needPick") || "请完成所有选择", "error");
-      return;
-    }
-    void finish("accepted", answers);
-  };
+  return ensurePermPromptUi().showAskUser(ev);
 }
 
 async function handleDeepLinkPayload(payload: string): Promise<void> {
-  const parsed = await inv<{ kind: string; id?: string }>(
-    "shell.parseDeepLink",
-    { raw: payload },
-  );
-  if (!parsed.ok || !parsed.data) return;
-  if (parsed.data.kind === "project" && parsed.data.id) {
-    selectedProjectId = parsed.data.id;
-    await refreshProjectsAndThreads();
-    showWelcome(true);
-  }
-  if (parsed.data.kind === "inbox") {
-    /* could open modal */
-  }
+  return ensureShellNav().handleDeepLinkPayload(payload);
 }
 
 function handleShellNavigate(view: "command" | "inbox" | string): void {
-  if (view === "inbox") {
-    void (async () => {
-      try {
-        const res = await inv<
-          Array<{
-            id: string;
-            title?: string;
-            body?: string;
-            read?: boolean;
-            type?: string;
-            createdAt?: string;
-            sessionId?: string;
-            threadId?: string;
-            projectId?: string;
-          }>
-        >("inbox.list", {});
-        const items = res.ok ? (res.data ?? []) : [];
-        const rows = items.length
-          ? items
-              .map((it) => {
-                const unread = it.read ? "" : " is-unread";
-                const when = it.createdAt
-                  ? esc(it.createdAt.replace("T", " ").slice(0, 16))
-                  : "";
-                return (
-                  '<div class="item inbox-item' +
-                  unread +
-                  '" data-inbox-id="' +
-                  esc(it.id) +
-                  '">' +
-                  '<div class="item-title">' +
-                  esc(it.title || it.type || "notice") +
-                  "</div>" +
-                  '<div class="item-sub">' +
-                  esc((it.body || "").slice(0, 200)) +
-                  "</div>" +
-                  '<div class="item-sub mono">' +
-                  esc(it.type || "") +
-                  " · " +
-                  when +
-                  "</div>" +
-                  '<div style="display:flex;gap:6px;margin-top:8px;flex-wrap:wrap">' +
-                  '<button type="button" class="btn-dark" data-inbox-act="open" data-id="' +
-                  esc(it.id) +
-                  '">' +
-                  esc(tr("common.open")) +
-                  "</button>" +
-                  '<button type="button" class="btn-ghost" data-inbox-act="dismiss" data-id="' +
-                  esc(it.id) +
-                  '">' +
-                  esc(tr("common.delete")) +
-                  "</button>" +
-                  "</div></div>"
-                );
-              })
-              .join("")
-          : '<div class="item-sub">' + esc(tr("common.none")) + "</div>";
-        openModal(
-          tr("nav.inbox"),
-          '<div style="display:flex;justify-content:flex-end;margin-bottom:8px">' +
-            '<button type="button" class="btn-ghost" id="btn-inbox-mark-all">' +
-            esc(tr("common.ok")) +
-            "</button></div><div class=\"inbox-list\">" +
-            rows +
-            "</div>",
-        );
-        const body = $("modal-body");
-        body.onclick = async (e) => {
-          const target = e.target;
-          if (!(target instanceof HTMLElement)) return;
-          if (target.id === "btn-inbox-mark-all") {
-            await inv("inbox.markAllRead");
-            handleShellNavigate("inbox");
-            return;
-          }
-          const act = target.dataset.inboxAct;
-          const id = target.dataset.id;
-          if (!act || !id) return;
-          const item = items.find((x) => x.id === id);
-          if (act === "open") {
-            if (item?.id) await inv("inbox.markRead", { id: item.id });
-            if (item?.sessionId) {
-              const row = threads.find((x) => x.sessionId === item.sessionId);
-              if (row) {
-                closeModal();
-                await openThread(row);
-              }
-            } else if (item?.projectId) {
-              selectedProjectId = item.projectId;
-              await refreshProjectsAndThreads();
-            }
-            return;
-          }
-          if (act === "dismiss") {
-            await inv("inbox.dismiss", { id });
-            handleShellNavigate("inbox");
-          }
-        };
-      } catch (err) {
-        showToast(
-          err instanceof Error ? err.message : tr("common.error"),
-          "error",
-        );
-      }
-    })();
-    return;
-  }
-  if (view === "command") {
-    try {
-      closeModal();
-    } catch {
-      /* ignore */
-    }
-    showWelcome(true);
-  }
+  ensureShellNav().handleShellNavigate(view);
 }
 
 function handleShellNotice(code: string, message?: string): void {
-  if (code === "agent_missing") {
-    showToast(message || tr("agent.missing"), "error");
-  } else if (message) {
-    showToast(message, "info");
-  }
+  ensureShellNav().handleShellNotice(code, message);
 }
 
-/** 会写入当前 transcript / 改 turn UI 的事件（必须按会话隔离） */
-function isTranscriptScopedEvent(ev: { type?: string }): boolean {
-  switch (ev.type) {
-    case "message.delta":
-    case "thought.delta":
-    case "tool.started":
-    case "tool.completed":
-    case "turn.started":
-    case "turn.completed":
-    case "permission.requested":
-    case "ask_user.requested":
-    case "context.compacted":
-    case "agent.error":
-      return true;
-    default:
-      return false;
-  }
-}
+const isTranscriptScopedEvent = (ev: { type?: string }) =>
+  isTranscriptScopedEventPure(ev);
 
-/**
- * 事件是否属于当前打开的会话。
- * - 优先 sessionId（disk_* / live 均可靠）
- * - 无 sessionId 时回退 threadId（仅 live id 可比；disk_ 前缀不相等）
- */
-function eventBelongsToActiveSession(ev: {
+const eventBelongsToActiveSession = (ev: {
   sessionId?: string;
   threadId?: string;
-}): boolean {
-  if (!activeSessionId && !activeThreadId) return false;
-  if (ev.sessionId) {
-    return Boolean(activeSessionId && ev.sessionId === activeSessionId);
-  }
-  if (ev.threadId && activeThreadId) {
-    if (ev.threadId === activeThreadId) return true;
-    // live thread 事件 vs 当前 disk_ 展示：若 session 未知则拒绝（防串台）
-    if (activeThreadId.startsWith("disk_")) return false;
-  }
-  // 无 session/thread 标识的全局事件不走此函数
-  return !ev.sessionId && !ev.threadId;
-}
+}) =>
+  eventBelongsToActiveSessionPure(ev, {
+    activeSessionId,
+    activeThreadId,
+  });
 
 function onEvent(raw: unknown): void {
-  const ev = raw as NormalizedEvent & { activity?: string };
-  // Dedicated shell control bus (preferred over session.status activity)
-  if (ev.type === "shell.handoff") {
-    void handleDeepLinkPayload((ev as { payload?: string }).payload || "");
-    return;
-  }
-  if (ev.type === "shell.navigate") {
-    handleShellNavigate((ev as { view?: string }).view || "command");
-    return;
-  }
-  if (ev.type === "app.update") {
-    const upd = {
-      phase: String(ev.phase ?? ""),
-      currentVersion: String(ev.currentVersion ?? ""),
-      latestVersion: ev.latestVersion as string | undefined,
-      percent: ev.percent as number | undefined,
-      error: ev.error as string | undefined,
-      canUpdate: Boolean(ev.canUpdate),
-      releasesUrl: String(
-        (ev as { releasesUrl?: string }).releasesUrl ??
-          "https://github.com/fanghui-li/Grok-Desktop/releases",
-      ),
-    };
-    settingsPage?.onAppUpdateEvent(upd);
-    syncAppUpdateTopButton(upd);
-    return;
-  }
-  if (ev.type === "shell.notice") {
-    handleShellNotice(
-      (ev as { code?: string }).code || "",
-      (ev as { message?: string }).message,
-    );
-    return;
-  }
-  /**
-   * 欢迎页（无活动会话）：丢弃带 thread/session 的直播事件。
-   * 旧 agent 在 detach 前后仍可能吐 delta/error，否则会污染新对话入口。
-   */
-  if (!activeThreadId && !activeSessionId) {
-    const tid = "threadId" in ev ? (ev as { threadId?: string }).threadId : undefined;
-    const sid =
-      "sessionId" in ev ? (ev as { sessionId?: string }).sessionId : undefined;
-    if (tid || sid) {
-      return;
-    }
-  }
-  // goal 与 agent 同源：不因 transcript 挂起而丢状态
-  if (ev.type === "goal.updated") {
-    applyAgentGoalEvent(ev);
-    return;
-  }
-  if (ev.type === "subagent.updated") {
-    handleSubagentUpdated(ev);
-    return;
-  }
-  if (ev.type === "task.updated") {
-    handleTaskUpdated(ev);
-    return;
-  }
-  if (ev.type === "session.attach_state") {
-    if (ev.sessionId && activeSessionId && ev.sessionId !== activeSessionId) {
-      return;
-    }
-    setAttachUiState(ev.state, ev.lastError);
-    // logout detach / 主动 detach：live id 失效，降为 disk_，避免 setModel/ping 打僵尸 thread
-    const st = String(ev.state || "").toLowerCase();
-    if (
-      (st === "history_only" || st === "failed") &&
-      activeSessionId &&
-      activeThreadId &&
-      !activeThreadId.startsWith("disk_")
-    ) {
-      activeThreadId = `disk_${activeSessionId}`;
-      if (turnActive) {
-        endTurn({ skipQueueDrain: true, outcome: "stopped" });
-      } else {
-        setComposerBusy(false);
-        markSessionWorking(activeSessionId, false);
-      }
-    }
-    return;
-  }
-  if (ev.type === "queue.changed") {
-    if (ev.sessionId && activeSessionId && ev.sessionId === activeSessionId) {
-      void reloadPromptQueueFromHost();
-      if (ev.syncError) {
-        showToast(tr("queue.localOnly", { err: String(ev.syncError) }), "error");
-      }
-    }
-    return;
-  }
-  if (ev.type === "session.available_commands") {
-    applyAvailableCommandsEvent(ev);
-    return;
-  }
-  // 目录变更：与会话挂起无关，始终刷新文件树
-  if (ev.type === "files.changed") {
-    sidePane?.scheduleRefreshFileTree();
-    return;
-  }
-  // 计划审批 / 模式变更：按 session 路由（阶段一：禁止串台到错误前台）
-  if (ev.type === "plan.approval.requested") {
-    void handlePlanApprovalRequested(ev);
-    return;
-  }
-  if (ev.type === "plan.mode.changed") {
-    handlePlanModeChanged(ev);
-    return;
-  }
-  // handoff / 全局状态始终处理
-  if (ev.type === "session.status") {
-    // Legacy control bus (pre shell.* events) - keep for older host builds
-    if (ev.activity === "nav:inbox" || ev.activity === "nav:command") {
-      handleShellNavigate(ev.activity === "nav:inbox" ? "inbox" : "command");
-      return;
-    }
-    if (ev.activity === "system:agent_missing") {
-      handleShellNotice("agent_missing");
-      return;
-    }
-    if (ev.activity?.startsWith("handoff:")) {
-      void handleDeepLinkPayload(ev.activity.slice("handoff:".length));
-    }
-    if (ev.sessionId) {
-      // Phase4：stop/cancelling 后忽略迟到 working，避免侧栏转圈「没停」
-      const busyStatus =
-        ev.status === "working" ||
-        ev.status === "needs_input" ||
-        ev.status === "blocked";
-      if (
-        busyStatus &&
-        shouldIgnoreLateSessionWorking({
-          userStopSuppressed: isUserStopSuppressed(),
-          phase: turnUiPhase,
-          eventBelongsToActiveSession: eventBelongsToActiveSession(ev),
-        })
-      ) {
-        markSessionWorking(ev.sessionId, false);
-        return;
-      }
-      markSessionWorking(ev.sessionId, busyStatus);
-      // 非 busy 时 markSessionWorking 已 markSessionTurnIdle
-      // 当前打开会话且 idle：确保主区也 idle（后台完成后再切回已由 rehydrate 处理）
-      if (
-        !busyStatus &&
-        activeSessionId === ev.sessionId &&
-        turnActive
-      ) {
-        endTurn({ skipQueueDrain: true, outcome: "worked" });
-      }
-    }
-    return;
-  }
+  const ev = raw as NormalizedEvent & {
+    activity?: string;
+    payload?: string;
+    view?: string;
+    code?: string;
+    message?: string;
+    state?: string;
+    lastError?: string;
+    syncError?: string;
+    phase?: string;
+    currentVersion?: string;
+    latestVersion?: string;
+    percent?: number;
+    error?: string;
+    canUpdate?: boolean;
+    releasesUrl?: string;
+  };
+  // shell / app / attach / queue / plan / status 等总线
+  if (ensureBusEventHandlers().tryHandle(ev)) return;
+
   // Transcript / turn 事件：按 sessionId 严格隔离（含 disk_* 浏览态）
   // 方案 B：非当前会话仍更新 per-session 投影（不写当前 transcript）
-  if (isTranscriptScopedEvent(ev) && !eventBelongsToActiveSession(ev)) {
-    const bgSid =
-      "sessionId" in ev
-        ? String((ev as { sessionId?: string }).sessionId || "")
-        : "";
-    if (bgSid) {
-      const bgProj = getSessionTurn(bgSid);
-      if (ev.type === "turn.started") {
-        patchSessionTurn(bgSid, {
-          turnActive: true,
-          turnUiPhase: "working",
-          alreadyPaintedStopped: false,
-          turnStartedAt: Date.now(),
-          streamArmedThisTurn: true,
-          assistantStartedThisTurn: false,
-          pendingAssistantText: "",
-        });
-        markSessionWorking(bgSid, true);
-      } else if (ev.type === "turn.completed") {
-        markSessionTurnIdle(bgSid);
-        markSessionWorking(bgSid, false);
-      } else if (
-        // 仅在仍认为 running 时收增量；完成后的迟到 tool/delta 不得复活 busy
-        bgProj?.turnActive &&
-        ev.type === "message.delta" &&
-        (ev as { role?: string }).role !== "user" &&
-        (ev as { text?: string }).text
-      ) {
-        appendBackgroundAssistantDelta(
-          bgSid,
-          String((ev as { text?: string }).text),
-        );
-        markSessionWorking(bgSid, true);
-      } else if (
-        bgProj?.turnActive &&
-        (ev.type === "tool.started" || ev.type === "tool.completed")
-      ) {
-        // tool.completed 不单独把已 idle 的会话拉回 working
-        if (ev.type === "tool.started") {
-          patchSessionTurn(bgSid, {
-            turnActive: true,
-            turnUiPhase: "working",
-            streamArmedThisTurn: true,
-          });
-          markSessionWorking(bgSid, true);
-        }
-      }
-    }
+  const scopeEv = ev as {
+    type?: string;
+    sessionId?: string;
+    threadId?: string;
+    role?: string;
+    text?: string;
+    requestId?: string;
+    summary?: string;
+  };
+  if (isTranscriptScopedEvent(scopeEv) && !eventBelongsToActiveSession(scopeEv)) {
+    applyBackgroundTranscriptEvent(scopeEv, { markSessionWorking });
     return;
   }
   // create / openThread 期间：当前会话事件仍更新投影，不写 transcript
   if (suspendLiveTranscript) {
-    if (
-      ev.type === "permission.requested" &&
-      eventBelongsToActiveSession(ev)
-    ) {
-      showPermission(ev.requestId, ev.summary);
-    }
-    if (activeSessionId && eventBelongsToActiveSession(ev)) {
-      if (ev.type === "turn.started") {
-        patchSessionTurn(activeSessionId, {
-          turnActive: true,
-          turnUiPhase: "working",
-          streamArmedThisTurn: true,
-        });
-      } else if (
-        getSessionTurn(activeSessionId)?.turnActive &&
-        ev.type === "message.delta" &&
-        (ev as { text?: string }).text
-      ) {
-        appendBackgroundAssistantDelta(
-          activeSessionId,
-          String((ev as { text?: string }).text),
-        );
-      } else if (ev.type === "turn.completed") {
-        markSessionTurnIdle(activeSessionId);
-        markSessionWorking(activeSessionId, false);
-      }
-    }
-    return;
-  }
-  switch (ev.type) {
-    case "message.delta":
-      showWelcome(false);
-      if (ev.role === "user") return;
-      appendLine(ev.text, "assistant", { fromStream: true });
-      break;
-    case "thought.delta":
-      showWelcome(false);
-      // 用户停止后禁止用迟到 thought 复活 turn
-      if (!turnActive) {
-        if (isUserStopSuppressed()) break;
-        beginTurn();
-      }
-      if (ev.text.trim()) appendThoughtDelta(ev.text);
-      break;
-    case "tool.started":
-      showWelcome(false);
-      if (!turnActive) {
-        if (isUserStopSuppressed()) break;
-        beginTurn();
-      }
-      markToolStarted(ev.name || "tool", ev.toolCallId, ev.raw);
-      break;
-    case "tool.completed": {
-      const failed = (ev as { status?: string }).status === "failed";
-      if (failed) {
-        markToolIncomplete(ev.toolCallId, ev.name, true);
-        // 过程块可见失败摘要（权限 option 错误等）
-        const failHint = extractToolFailHint(ev.raw, ev.name);
-        if (failHint) {
-          appendProcessText(failHint);
-        }
-      } else {
-        markToolCompleted(ev.toolCallId, ev.name, ev.raw);
-      }
-      // 双保险：从 tool raw 再抽一次 update_goal（normalize 已推 goal.updated 时为幂等）
-      maybeGoalFromToolRaw(ev.name, ev.raw);
-      // 写文件 / shell 后刷新侧栏文件树（fs.watch 也会兜底）
-      const kind = extractToolMeta(ev.raw, ev.name).kind;
-      if (kind === "write" || kind === "shell") {
-        sidePane?.scheduleRefreshFileTree();
-      }
-      notePlanArtifactFromTool(ev.name, ev.raw);
-      break;
-    }
-    case "turn.started":
-      showWelcome(false);
-      if (!turnActive) {
-        // Phase4：cancel / suppress 后迟到 turn.started — 勿复活
-        if (
-          shouldIgnoreLateTurnStarted({
-            turnActive: false,
-            userStopSuppressed: isUserStopSuppressed(),
-            phase: turnUiPhase,
-          })
-        ) {
-          break;
-        }
-        beginTurn();
-      } else {
-        // Host 已写入 session/prompt：开闸收流
-        armTurnForLiveStream();
-        setTurnStatus(tr("turn.thinking"));
-      }
-      break;
-    case "turn.completed": {
-      const stop = String((ev as { stopReason?: string }).stopReason || "");
-      const errMsg = (ev as { error?: string }).error
-        ? String((ev as { error?: string }).error)
-        : "";
-      const hadText = Boolean((ev as { hadAssistantText?: boolean }).hadAssistantText);
-      const hadTools = Boolean((ev as { hadToolActivity?: boolean }).hadToolActivity);
-      const hadToolFailures = Boolean(
-        (ev as { hadToolFailures?: boolean }).hadToolFailures,
-      );
-      const isCancelled =
-        stop === "cancelled" ||
-        stop === "canceled" ||
-        stop === "user_cancelled" ||
-        /cancel/i.test(stop);
-      // Phase4：UI 已 stopped / suppress → 只清 working，不二次 paint
-      if (
-        shouldIgnoreCancelledTurnCompleted({
-          turnActive,
-          alreadyPaintedStopped,
-          userStopSuppressed: isUserStopSuppressed(),
-          isCancelled,
-        })
-      ) {
-        if (activeSessionId) markSessionWorking(activeSessionId, false);
-        setComposerBusy(false);
-        void syncGoalFromAgent();
-        void refreshContextUsage();
-        break;
-      }
-      // 用户停止语义：统一 stopped 文案（非 worked）
-      endTurn({ outcome: isCancelled ? "stopped" : "worked" });
-      // 超时/错误：只走友好标题；与 turns.prompt 失败共用 showTurnErrorOnce 去重
-      // 取消不画错误/空回复提示
-      if (isCancelled) {
-        /* already painted stopped */
-      } else if (stop === "timeout" || /timed out/i.test(errMsg)) {
-        showTurnErrorOnce(errMsg || "timeout");
-      } else if (errMsg && stop === "error") {
-        showTurnErrorOnce(errMsg);
-      } else if (hadToolFailures) {
-        // 末尾仅短提示；失败 detail 已在折叠过程块/工具卡，勿再铺长错误
-        appendLine(tr("chat.turnToolFailed"), "system");
-        if (!hadText) {
-          appendLine(tr("chat.turnToolsOnly"), "system");
-        }
-      } else if (!hadText && !hadTools) {
-        // 停止后隔离丢弃了串流时 hadText=false — 勿吓人「没有助手回复」
-        if (!blockHistoryResyncAfterStop && !isUserStopSuppressed()) {
-          appendLine(
-            tr("chat.turnEmpty") ||
-              "Turn finished with no assistant reply. Check agent logs or retry.",
-            "system",
-          );
-        }
-      } else if (!hadText && hadTools) {
-        if (!blockHistoryResyncAfterStop && !isUserStopSuppressed()) {
-          appendLine(
-            tr("chat.turnToolsOnly") ||
-              "Turn finished after tools ran, but no final reply text was streamed.",
-            "system",
-          );
-        }
-      }
-      void syncGoalFromAgent();
-      void refreshContextUsage();
-      sidePane?.scheduleRefreshFileTree(400);
-      // Phase3：stop block / suppress / 已流式 → 跳过 resync
-      if (
-        shouldSkipHistoryResync({
-          assistantStartedThisTurn,
-          userStopSuppressed: isUserStopSuppressed(),
-          blockAfterStop: blockHistoryResyncAfterStop,
-        })
-      ) {
-        void maybeSurfacePlanAfterTurn();
-      } else {
-        void afterTurnSettled();
-      }
-      break;
-    }
-    case "ask_user.requested": {
-      showWelcome(false);
-      if (!turnActive) {
-        if (isUserStopSuppressed()) break;
-        beginTurn();
-      }
-      setTurnStatus(tr("askUser.waiting") || "等待你的选择…");
-      void showAskUserDialog(ev);
-      break;
-    }
-    case "context.compacted":
-      // auto-compact：系统提示 + 乐观刷新 chip（signals 写回有延迟）
-      if (ev.status === "completed" && ev.kind === "auto") {
-        const detail =
-          ev.tokensBefore != null && ev.tokensAfter != null
-            ? `（${formatTokenK(ev.tokensBefore)} → ${formatTokenK(ev.tokensAfter)}）`
-            : "";
-        appendLine(tr("chat.autoCompacted", { detail }), "system");
-        refreshContextAfterCompact(ev);
-      } else if (ev.status === "completed") {
-        refreshContextAfterCompact(ev);
-      } else if (ev.status === "failed") {
-        appendLine(
-          tr("chat.autoCompactFail", {
-            detail: ev.message ? `：${ev.message}` : "",
-          }),
-          "error",
-        );
-      } else if (ev.status === "started" && ev.kind === "auto") {
-        setTurnStatus(
-          ev.percentage != null
-            ? tr("chat.autoCompactStartPct", { pct: ev.percentage })
-            : tr("chat.autoCompactStart"),
-        );
-      }
-      break;
-    case "permission.requested":
-      endStreamBubble();
-      setTurnStatus("等待批准…");
-      showPermission(ev.requestId, ev.summary);
-      break;
-    case "agent.error":
-      endTurn();
-      showTurnErrorOnce(ev.message);
-      // R4：标记 live 失效，展示重新附着
-      if (activeThreadId && !activeThreadId.startsWith("disk_") && activeSessionId) {
-        activeThreadId = `disk_${activeSessionId}`;
-      }
-      showAgentCrashBanner(ev.message);
-      break;
-    default:
-      break;
-  }
-}
-
-/**
- * agent 发起 x.ai/exit_plan_mode。
- * 阶段一：仅当前前台会话打开侧栏；后台只写入 session-plan-store。
- */
-async function handlePlanApprovalRequested(ev: {
-  requestId: string;
-  sessionId: string;
-  threadId?: string;
-  toolCallId?: string;
-  planContent?: string | null;
-}): Promise<void> {
-  const ownerSid = (ev.sessionId || "").trim();
-  if (!ownerSid || !ev.requestId?.trim()) return;
-
-  let content = (ev.planContent ?? "").trim();
-  if (!content) {
-    const res = await inv<{
-      content?: string;
-    } | null>("plans.get", { sessionId: ownerSid });
-    if (res.ok && res.data?.content) {
-      content = res.data.content.trim();
-    }
-  }
-  // 若 agent 带了正文且 session 尚空，先写入真源（可后台）
-  if (content) {
-    const cur = await inv<{ content?: string } | null>("plans.get", {
-      sessionId: ownerSid,
-    });
-    if (cur.ok && !(cur.data?.content ?? "").trim()) {
-      await inv("plans.write", { sessionId: ownerSid, content });
-    }
-  }
-
-  const pending: SessionPlanPendingApproval = {
-    requestId: ev.requestId.trim(),
-    sessionId: ownerSid,
-    planContent: content,
-  };
-  patchSessionPlan(ownerSid, {
-    planPhase: "active",
-    pendingApproval: pending,
-  });
-
-  // 后台会话：不抢前台侧栏 / 不改全局 planPhase
-  if (!eventBelongsToActiveSession(ev)) {
-    markSessionWorking(ownerSid, true);
-    const row = threads.find((t) => t.sessionId === ownerSid);
-    const title =
-      row?.title?.trim() ||
-      ownerSid.slice(0, 8);
-    showToast(tr("plan.bgAwaiting", { title }), "info");
-    return;
-  }
-
-  endStreamBubble();
-  setTurnStatus(tr("plan.awaiting") || "等待计划审批…");
-  planPhase = "active";
-  pendingPlanApproval = pending;
-  syncPermLabels();
-  await openPlanPanel({
-    requestId: pending.requestId,
-    seedContent: content || null,
-    forceReload: true,
-    ownerSessionId: ownerSid,
-  });
-  if (activeSessionId !== ownerSid) return;
-  showToast(tr("plan.pleaseReview") || "请在右侧「计划」面板审阅并批准", "info");
-}
-
-/** plan.mode.changed：按 session 写入投影；仅前台改 chip */
-function handlePlanModeChanged(ev: {
-  sessionId?: string;
-  threadId?: string;
-  active: boolean;
-  modeId?: string;
-}): void {
-  const sid = (ev.sessionId || "").trim();
-  if (sid) {
-    if (ev.active) {
-      const cur = getSessionPlan(sid);
-      // 前台可能已是 pending（用户 /plan）；勿用 active 盖掉
-      const keepPending =
-        eventBelongsToActiveSession(ev) && planPhase === "pending";
-      const nextPhase: PlanPhase = keepPending
-        ? "pending"
-        : cur?.planPhase === "pending"
-          ? "pending"
-          : "active";
-      patchSessionPlan(sid, { planPhase: nextPhase });
-    } else {
-      // agent 退出 plan：清 phase；若仍有 pending 审批则保留 pending 槽
-      const cur = getSessionPlan(sid);
-      patchSessionPlan(sid, {
-        planPhase: cur?.pendingApproval ? "active" : "off",
+    if (activeSessionId) {
+      applySuspendedLiveTranscriptEvent(scopeEv, {
+        activeSessionId,
+        eventBelongs: eventBelongsToActiveSession(scopeEv),
+        showPermission,
+        permissionEv: scopeEv,
+        markSessionWorking,
       });
     }
-  }
-
-  if (!eventBelongsToActiveSession(ev) && sid) {
-    // 后台：只更新 store
     return;
   }
-
-  if (ev.active) {
-    // 用户 /plan 已为 pending：保持 Pending 至下一条消息；
-    // agent 主动进入时直接 Active。不改 accessMode。
-    if (planPhase === "off") planPhase = "active";
-  } else if (isPlanOn()) {
-    // agent 退出 plan；若本会话仍有 exit_plan 待批则保持 active 供审批
-    if (!isPlanApprovalArmed()) planPhase = "off";
-  }
-  if (activeSessionId) snapshotActiveSessionPlan(activeSessionId);
-  syncPermLabels();
+  // 前台 transcript / turn：统一经 TranscriptEventHandlers
+  ensureTranscriptHandlers().handle(ev as {
+    type?: string;
+    role?: string;
+    text?: string;
+    name?: string;
+    toolCallId?: string;
+    raw?: unknown;
+    status?: string;
+    kind?: string;
+    message?: string;
+    requestId?: string;
+    summary?: string;
+    stopReason?: string;
+    error?: string;
+    hadAssistantText?: boolean;
+    hadToolActivity?: boolean;
+    hadToolFailures?: boolean;
+    tokensBefore?: number;
+    tokensAfter?: number;
+    percentage?: number;
+  });
 }
+
+const handlePlanApprovalRequested = (
+  ev: Parameters<PlanEventHandlers["handleApprovalRequested"]>[0],
+) => ensurePlanEventHandlers().handleApprovalRequested(ev);
+
+const handlePlanModeChanged = (
+  ev: Parameters<PlanEventHandlers["handleModeChanged"]>[0],
+) => ensurePlanEventHandlers().handleModeChanged(ev);
 
 // ── Boot ───────────────────────────────────────────────────
 
@@ -13681,7 +6436,7 @@ npm start</pre>
     e.stopPropagation();
     selectedProjectId = null;
     projectChoiceTouched = true;
-    expandedProjectIds.add(CHATS_GROUP_ID);
+    ensureSidebarList().expandedProjectIds.add(CHATS_GROUP_ID);
     closeProjectPicker();
     setWelcomeTitle();
     showWelcome(true);

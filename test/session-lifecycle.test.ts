@@ -8,7 +8,7 @@ import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { DesktopHost } from "../src/host/host.js";
 import { loadChatHistory } from "../src/host/history.js";
-import { loadQueue, queueFilePath } from "../src/host/prompt-queue.js";
+import { loadQueue, queueFilePath } from "../src/host/prompt-queue/queue.js";
 import { findSessionDir } from "../src/host/paths.js";
 import {
   invalidateDiskRosterCache,

@@ -14,7 +14,7 @@ import {
   applyGoalUpdated,
   clearSessionGoal,
   getSessionGoal,
-} from "../src/host/session-goal-store.js";
+} from "../src/host/session/goal-store.js";
 import type { NormalizedEvent } from "../src/shared/events.js";
 
 const here = path.dirname(fileURLToPath(import.meta.url));

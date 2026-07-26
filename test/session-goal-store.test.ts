@@ -6,7 +6,7 @@ import {
   markGoalClearedLocal,
   parseGoalWireStatus,
   shouldDropGoalStatusDowngrade,
-} from "../src/host/session-goal-store.js";
+} from "../src/host/session/goal-store.js";
 
 const SID = "sess-goal-test";
 

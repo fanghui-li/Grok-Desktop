@@ -6,7 +6,7 @@ import type { HostIpcMethod } from "../shared/host-api.js";
 import { t as tr } from "../shared/i18n/index.js";
 import { renderMarkdownToSafeHtml } from "./markdown.js";
 import { linkifyFilePaths } from "./file-links.js";
-import { focusModeIconHtml } from "./sidebar-icons.js";
+import { focusModeIconHtml } from "./sidebar/icons.js";
 
 type HostRes<T> = {
   ok: boolean;

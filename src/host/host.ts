@@ -27,7 +27,7 @@ import type {
 } from "../shared/types.js";
 import { spawn } from "node:child_process";
 import { AcpClient } from "./acp-client.js";
-import { AutomationStore } from "./automations.js";
+import { AutomationStore } from "./automations/index.js";
 import {
   changesDiff,
   changesSummary,
@@ -59,45 +59,19 @@ import {
   writeDesktopConfig,
 } from "./extensibility.js";
 import {
-  marketplaceAdd as cliMarketplaceAdd,
-  marketplaceListCli,
-  marketplaceRemove as cliMarketplaceRemove,
-  marketplaceUpdate as cliMarketplaceUpdate,
-  mcpAddCli,
-  mcpDoctorCli,
-  mcpListCli,
-  mcpRemoveCli,
-  pluginsDetails as cliPluginsDetails,
-  pluginsDisable as cliPluginsDisable,
-  pluginsEnable as cliPluginsEnable,
-  pluginsInstall as cliPluginsInstall,
-  pluginsListCli,
-  pluginsUninstall as cliPluginsUninstall,
-  pluginsUpdate as cliPluginsUpdate,
   skillsListCli,
   type GrokCliRunner,
-} from "./cli-plugins.js";
+  PluginsFacade,
+} from "./plugins/index.js";
 import { COMPAT_DISABLED_ENV } from "./compat.js";
-import { loadBtwHistory } from "./btw-history.js";
+import { loadBtwHistory } from "./history/btw-history.js";
 import {
-  clearGoal,
-  loadPlan,
-  loadSubagentTree,
+  GoalsService,
   mapSubagentStatus,
-  projectionToLegacyState,
-  setGoalStatus,
-  setPlanStatus,
-  syncGoalFromAgentLog,
   upsertSubagentNode,
-  writeGoal,
-  writePlan,
   writeProjectionCache,
-} from "./goals.js";
-import {
-  applyGoalUpdated,
-  getSessionGoal,
-  markGoalClearedLocal,
-} from "./session-goal-store.js";
+} from "./goals/index.js";
+import { applyGoalUpdated } from "./session/goal-store.js";
 import { InboxStore } from "./inbox.js";
 import { HostLogger } from "./logger.js";
 import {
@@ -109,10 +83,10 @@ import {
   grokHomeDir,
   sessionsRoot,
 } from "./paths.js";
+import { buildHistoryExportMarkdown } from "./history/export.js";
 import {
   listCustomProviders,
   listRemoteModels,
-  modelDisplayNamesFromConfig,
   pingProvider,
   removeCustomProvider,
   setDefaultModelId,
@@ -130,16 +104,15 @@ import {
   sanitizeThreadTitle,
 } from "./roster.js";
 import { ThreadMetaStore } from "./thread-meta.js";
-import { loadSessionContextUsage } from "./session-context.js";
+import { loadSessionContextUsage } from "./session/context.js";
 import type { SessionContextUsage } from "../shared/types.js";
-
-function isGoalInfraSessionTitle(title: string): boolean {
-  return isGoalInfraSession(title);
-}
-
-function sanitizeListTitle(title: string): string {
-  return sanitizeThreadTitle(title) || title;
-}
+import {
+  deriveSessionMode,
+  legacyModeToPatch,
+} from "./session/mode.js";
+import { parseGrokModelsCliOutput } from "./models/catalog.js";
+import { ModelsListService } from "./models/list-service.js";
+import { sideQuestionIsolated } from "./session/btw-isolated.js";
 import {
   acquireSingleInstance,
   type SingleInstanceHandle,
@@ -182,12 +155,12 @@ import {
   applyRuntimeCapabilitySignal,
   BASELINE_CAPABILITIES,
 } from "./capabilities.js";
-import type { AttachState } from "./attach-policy.js";
+import type { AttachState } from "./attach/policy.js";
 import {
   DEFAULT_IDLE_DETACH,
   pickLruDetachTargets,
   type LiveAttachSnapshot,
-} from "./attach-policy.js";
+} from "./attach/policy.js";
 import { listDesktopHooks } from "./hooks-discover.js";
 import {
   grantFolderTrust,
@@ -195,31 +168,29 @@ import {
 } from "./folder-trust.js";
 import { hooksDir } from "./paths.js";
 import {
-  clearQueue,
-  completeSending,
   deleteQueueFile,
-  enqueueItem,
   loadQueue,
-  removeItem,
-  reorderItems,
-  saveQueue,
-  setQueueFlags,
-  takeNextPending,
-  updateItem,
   type PromptQueueAttachment,
   type PromptQueueFile,
   type PromptQueueItem,
-} from "./prompt-queue.js";
+} from "./prompt-queue/queue.js";
+import { PromptQueueService } from "./prompt-queue/service.js";
 import {
   copySessionHistoryForFork,
   countHistoryLines,
   writeForkSummary,
 } from "./fork-session.js";
-import { aggregateTasksLoose } from "./tasks-aggregate.js";
+import { buildTasksList } from "./tasks-list.js";
 import {
+  respondAskUserAcrossClients,
+  respondPermissionAcrossClients,
+} from "./permission/respond.js";
+import {
+  appendCreateSkillDesktopPathOverride,
   SkillRegistry,
+  SkillsOps,
   type SkillsResolveResult,
-} from "./skill-registry.js";
+} from "./skills/index.js";
 
 export interface DesktopHostOptions {
   home?: string;
@@ -274,8 +245,6 @@ export class DesktopHost {
   private sessionIndex = new Map<string, string>();
   /** sessionId → in-flight attach Promise（去重并发 attach，避免双进程） */
   private attachInflight = new Map<string, Promise<{ threadId: string }>>();
-  /** 队列 drain 互斥：take→complete 之间禁止二次 take */
-  private queueDrainLocked = new Set<string>();
   private listeners = new Set<EventListener>();
   private single: SingleInstanceHandle | null = null;
   private disposed = false;
@@ -298,6 +267,11 @@ export class DesktopHost {
   readonly threadMeta: ThreadMetaStore;
   /** list/resolve 同集合（path-first；inspect → FS） */
   private readonly skillRegistry: SkillRegistry;
+  private readonly skillsOps: SkillsOps;
+  private readonly modelsListService: ModelsListService;
+  private readonly promptQueue: PromptQueueService;
+  private readonly goalsService: GoalsService;
+  private readonly pluginsFacade: PluginsFacade;
 
   constructor(opts: DesktopHostOptions = {}) {
     this.home = opts.home;
@@ -328,6 +302,39 @@ export class DesktopHost {
     this.threadMeta = new ThreadMetaStore(opts.home);
     this.skillRegistry = new SkillRegistry({
       list: (projectPath) => skillsListCli(this.grokCliRunner(), projectPath),
+    });
+    this.skillsOps = new SkillsOps({
+      home: opts.home,
+      logger: this.logger,
+      skillRegistry: this.skillRegistry,
+    });
+    this.modelsListService = new ModelsListService({
+      home: opts.home,
+      isAuthenticated: () => Boolean(authStatus(this.home).authenticated),
+      fetchCliModels: () => this.modelsListUncachedAsync(),
+    });
+    this.promptQueue = new PromptQueueService({
+      home: opts.home,
+      logger: this.logger,
+      threadIdForSession: (sid) => this.sessionIndex.get(sid),
+      resolveWritableClient: (sid) => {
+        const tid = this.sessionIndex.get(sid);
+        if (!tid) return null;
+        const live = this.threads.get(tid);
+        if (!live?.client || !live.writable) return null;
+        return live.client;
+      },
+      emit: (event) => this.emit(event),
+    });
+    this.goalsService = new GoalsService({
+      home: opts.home,
+      logger: this.logger,
+      listPlanClients: () =>
+        [...this.threads.values()].map((l) => l.client),
+    });
+    this.pluginsFacade = new PluginsFacade({
+      grokCliRunner: () => this.grokCliRunner(),
+      requireGrokCli: () => this.requireGrokCli(),
     });
     this.startIdleDetachLoop();
   }
@@ -691,7 +698,7 @@ export class DesktopHost {
       if (seen.has(r.sessionId)) continue;
       seen.add(r.sessionId);
       // 再滤一层：live 标题若像 goal 基建会话也隐藏
-      if (isGoalInfraSessionTitle(r.title)) continue;
+      if (isGoalInfraSession(r.title)) continue;
       const archived = this.threadMeta.isArchived(r.sessionId);
       const customTitle = this.threadMeta.getTitle(r.sessionId);
       const smeta = this.threadMeta.get(r.sessionId);
@@ -731,7 +738,7 @@ export class DesktopHost {
         id: r.threadId ?? `disk_${r.sessionId}`,
         sessionId: r.sessionId,
         projectId: resolvedProjectId,
-        title: sanitizeListTitle(customTitle || r.title),
+        title: sanitizeThreadTitle(customTitle || r.title) || customTitle || r.title,
         cwd: r.cwd,
         status: r.status,
         // 展示/回填用「仍可用」的模型；幽灵 id 回退默认（不改写历史消息）
@@ -1418,35 +1425,18 @@ export class DesktopHost {
     }
     const snap = this.snapshotThread(ref);
     const hist = this.historyLoad(ref.sessionId);
-    const lines: string[] = [
-      `# ${snap.title || ref.sessionId.slice(0, 8)}`,
-      "",
-      `- session: \`${ref.sessionId}\``,
-      `- cwd: \`${snap.cwd || "—"}\``,
-      `- exported: ${new Date().toISOString()}`,
-      "",
-      "---",
-      "",
-    ];
-    for (const e of hist.entries) {
-      if (e.role === "user") {
-        lines.push("## User", "", e.text || "_(empty)_", "");
-      } else if (e.role === "assistant") {
-        lines.push("## Assistant", "", e.text || "_(empty)_", "");
-      } else if (e.role === "tool") {
-        const name = e.toolName || "tool";
-        lines.push(
-          `### Tool · ${name}`,
-          "",
-          e.text ? "```\n" + e.text.slice(0, 4000) + "\n```" : "_(no output)_",
-          "",
-        );
-      }
-    }
+    const title = snap.title || ref.sessionId.slice(0, 8);
     return {
-      title: snap.title || ref.sessionId.slice(0, 8),
+      title,
       sessionId: ref.sessionId,
-      markdown: lines.join("\n"),
+      markdown: buildHistoryExportMarkdown(
+        {
+          title,
+          sessionId: ref.sessionId,
+          cwd: snap.cwd,
+        },
+        hist.entries,
+      ),
     };
   }
 
@@ -2068,62 +2058,17 @@ export class DesktopHost {
     if (!info.path) {
       throw new HostError("BINARY_NOT_FOUND", "grok binary not found");
     }
-    const cwd = live.thread.cwd || process.cwd();
-    const modelId = (live.thread.model ?? "").trim();
-    const effort = live.thread.effort;
-    const ephemeralThreadId = `btw_iso_${randomUUID()}`;
-    const client = new AcpClient({
+    return sideQuestionIsolated({
       command: info.path,
-      args: this.agentArgs,
-      cwd,
+      agentArgs: this.agentArgs,
+      cwd: live.thread.cwd || process.cwd(),
       env: this.env,
       logger: this.logger,
-      threadId: ephemeralThreadId,
-      allowFs: false,
-      onEvent: () => {
-        /* 隔离侧问：不把 ephemeral 事件投到主 UI */
-      },
+      modelId: live.thread.model,
+      effort: live.thread.effort,
+      parentSessionId: live.thread.sessionId,
+      question,
     });
-    try {
-      await client.start();
-      await client.createSession({
-        cwd,
-        meta: {
-          // 轻量旁路：不要把主会话计划/权限模式带进隔离会话
-          title: "desktop-btw-isolated",
-        },
-      });
-      if (modelId) {
-        try {
-          await client.setModel(modelId, {
-            effort:
-              effort && ["low", "medium", "high", "xhigh"].includes(effort)
-                ? effort
-                : undefined,
-          });
-        } catch (err) {
-          this.logger.warn("threads.btw_isolated_set_model_failed", {
-            modelId,
-            err: err instanceof Error ? err.message : String(err),
-          });
-        }
-      }
-      // 无父上下文时模型更易跟问；再加一句约束，避免沿用 system 默认「继续任务」口吻
-      const framed =
-        `【旁路侧问 · 与主对话任务无关】请只根据下面问题直接作答，` +
-        `不要复述或续写任何其它话题。\n\n${question}`;
-      const answer = await client.sideQuestion(framed);
-      this.logger.info("threads.btw_isolated", {
-        parentSessionId: live.thread.sessionId,
-        ephemeralSessionId: client.attachedSessionId,
-        modelId: modelId || undefined,
-        qLen: question.length,
-        aLen: answer.length,
-      });
-      return answer;
-    } finally {
-      await client.close().catch(() => undefined);
-    }
   }
 
   /**
@@ -2261,32 +2206,11 @@ export class DesktopHost {
   }
 
   permissionsRespond(requestId: string, decision: PermissionDecision): void {
-    const rid = requestId?.trim();
-    if (!rid) {
-      throw new HostError("INVALID_ARGUMENT", "requestId required");
-    }
-    // 1) 精确匹配：仅响应持有该 requestId 的 client
-    for (const live of this.threads.values()) {
-      if (!live.client?.hasPermission(rid)) continue;
-      live.client.respondPermission(rid, decision);
-      this.inbox.markReadByRequestId(rid);
-      return;
-    }
-    // 2) 兼容旧路径：requestId 格式异常时再扫一遍（仍只 mark 该 requestId）
-    for (const live of this.threads.values()) {
-      if (!live.client) continue;
-      try {
-        live.client.respondPermission(rid, decision);
-        this.inbox.markReadByRequestId(rid);
-        return;
-      } catch (err) {
-        if (isHostError(err) && err.code === "INVALID_ARGUMENT") continue;
-        throw err;
-      }
-    }
-    throw new HostError(
-      "INVALID_ARGUMENT",
-      `No pending permission request: ${rid}`,
+    respondPermissionAcrossClients(
+      [...this.threads.values()].map((l) => l.client),
+      requestId,
+      decision,
+      { markReadByRequestId: (rid) => this.inbox.markReadByRequestId(rid) },
     );
   }
 
@@ -2301,28 +2225,10 @@ export class DesktopHost {
       partialAnswers?: Record<string, string>;
     },
   ): void {
-    const rid = requestId?.trim();
-    if (!rid) {
-      throw new HostError("INVALID_ARGUMENT", "requestId required");
-    }
-    for (const live of this.threads.values()) {
-      if (!live.client?.hasAskUser(rid)) continue;
-      live.client.respondAskUser(rid, resp);
-      return;
-    }
-    for (const live of this.threads.values()) {
-      if (!live.client) continue;
-      try {
-        live.client.respondAskUser(rid, resp);
-        return;
-      } catch (err) {
-        if (isHostError(err) && err.code === "INVALID_ARGUMENT") continue;
-        throw err;
-      }
-    }
-    throw new HostError(
-      "INVALID_ARGUMENT",
-      `No pending ask_user request: ${rid}`,
+    respondAskUserAcrossClients(
+      [...this.threads.values()].map((l) => l.client),
+      requestId,
+      resp,
     );
   }
 
@@ -2648,10 +2554,7 @@ export class DesktopHost {
    * 兼容旧 GoalState 形状；完整字段在 projection。
    */
   goalsGet(sessionId: string): GoalState | null {
-    const proj = getSessionGoal(sessionId);
-    if (proj) return projectionToLegacyState(proj);
-    // 不读脏 goal.json 作权威；冷启动请 goals.sync
-    return null;
+    return this.goalsService.get(sessionId);
   }
 
   /**
@@ -2659,19 +2562,18 @@ export class DesktopHost {
    * 保留 IPC 兼容：仅写草稿缓存，不抬 harness 投影。
    */
   goalsSet(sessionId: string, title: string, status?: GoalState["status"]): GoalState {
-    return writeGoal(sessionId, title, this.home, status ?? "active");
+    return this.goalsService.set(sessionId, title, status);
   }
 
   /**
    * @deprecated 本地 setStatus 非权威；pause/resume 应 `/goal pause|resume`。
    */
   goalsSetStatus(sessionId: string, status: GoalState["status"]): GoalState | null {
-    return setGoalStatus(sessionId, status, this.home);
+    return this.goalsService.setStatus(sessionId, status);
   }
 
   goalsClear(sessionId: string): { cleared: boolean } {
-    markGoalClearedLocal(sessionId);
-    return { cleared: clearGoal(sessionId, this.home) };
+    return this.goalsService.clear(sessionId);
   }
 
   /**
@@ -2679,23 +2581,23 @@ export class DesktopHost {
    * 仅当 jsonl 有 goal_updated 时建立投影。
    */
   goalsSync(sessionId: string) {
-    return syncGoalFromAgentLog(sessionId, this.home);
+    return this.goalsService.sync(sessionId);
   }
 
   plansGet(sessionId: string): PlanState | null {
-    return loadPlan(sessionId, this.home);
+    return this.goalsService.plansGet(sessionId);
   }
 
   plansWrite(sessionId: string, content: string): PlanState {
-    return writePlan(sessionId, content, this.home);
+    return this.goalsService.plansWrite(sessionId, content);
   }
 
   plansApprove(sessionId: string): PlanState {
-    return setPlanStatus(sessionId, "approved", this.home);
+    return this.goalsService.plansApprove(sessionId);
   }
 
   plansReject(sessionId: string): PlanState {
-    return setPlanStatus(sessionId, "rejected", this.home);
+    return this.goalsService.plansReject(sessionId);
   }
 
   /**
@@ -2708,67 +2610,16 @@ export class DesktopHost {
     feedback?: string,
     sessionId?: string,
   ): { ok: true } {
-    // 优先：精确 requestId；再试仅有一个 waiter 的 client；最后扫全部
-    let found = false;
-    let lastErr: unknown;
-    const clients = [...this.threads.values()].filter((l) => l.client);
-
-    const tryRespond = (live: (typeof clients)[0]): boolean => {
-      try {
-        live.client!.respondPlanApproval(requestId, outcome, feedback);
-        return true;
-      } catch (err) {
-        lastErr = err;
-        return false;
-      }
-    };
-
-    // 1) 精确命中
-    for (const live of clients) {
-      if (live.client!.hasPlanApproval(requestId) && tryRespond(live)) {
-        found = true;
-        break;
-      }
-    }
-    // 2) 仅一个 client 有任意 plan 审批
-    if (!found) {
-      const withWaiter = clients.filter((l) => l.client!.hasPlanApproval());
-      if (withWaiter.length === 1 && tryRespond(withWaiter[0])) {
-        found = true;
-      }
-    }
-    // 3) 扫全部
-    if (!found) {
-      for (const live of clients) {
-        if (tryRespond(live)) {
-          found = true;
-          break;
-        }
-      }
-    }
-    if (!found) {
-      throw new HostError(
-        "INVALID_ARGUMENT",
-        `No pending plan approval: ${requestId}${
-          lastErr instanceof Error ? ` (${lastErr.message})` : ""
-        }`,
-      );
-    }
-    if (sessionId) {
-      if (outcome === "approved") {
-        setPlanStatus(sessionId, "approved", this.home);
-      } else if (outcome === "cancelled") {
-        setPlanStatus(sessionId, "drafting", this.home);
-      } else {
-        setPlanStatus(sessionId, "rejected", this.home);
-      }
-    }
-    this.logger.info("plans.respond", { requestId, outcome, feedback: Boolean(feedback) });
-    return { ok: true };
+    return this.goalsService.plansRespond(
+      requestId,
+      outcome,
+      feedback,
+      sessionId,
+    );
   }
 
   subagentsTree(sessionId: string): SubagentNode[] {
-    return loadSubagentTree(sessionId, this.home);
+    return this.goalsService.subagentsTree(sessionId);
   }
 
   // ── Automations ──────────────────────────────────────────
@@ -2919,45 +2770,7 @@ export class DesktopHost {
   }
 
   skillsOpenPath(skillPath: string): { opened: boolean; path: string } {
-    const pth = (skillPath || "").trim();
-    if (!pth || !fs.existsSync(pth)) {
-      throw new HostError("IO_ERROR", `Skill path not found: ${skillPath}`);
-    }
-    // 优先打开 SKILL.md（目录则拼接）
-    const target = fs.statSync(pth).isDirectory()
-      ? path.join(pth, "SKILL.md")
-      : pth;
-    const openTarget = fs.existsSync(target) ? target : pth;
-    try {
-      openInEditor(openTarget);
-    } catch {
-      // 编辑器不可用时退回系统文件管理器
-      try {
-        if (process.platform === "win32") {
-          spawn("explorer", ["/select,", openTarget], {
-            detached: true,
-            stdio: "ignore",
-            windowsHide: true,
-          }).unref();
-        } else if (process.platform === "darwin") {
-          spawn("open", ["-R", openTarget], {
-            detached: true,
-            stdio: "ignore",
-          }).unref();
-        } else {
-          spawn("xdg-open", [path.dirname(openTarget)], {
-            detached: true,
-            stdio: "ignore",
-          }).unref();
-        }
-      } catch (err) {
-        this.logger.warn("skills.openPath_fallback_failed", {
-          path: openTarget,
-          err: String(err),
-        });
-      }
-    }
-    return { opened: true, path: openTarget };
+    return this.skillsOps.openPath(skillPath);
   }
 
   /**
@@ -2969,92 +2782,7 @@ export class DesktopHost {
     name?: string;
     projectPath?: string;
   }): { deleted: boolean; path: string; name: string } {
-    const raw = (params.path || "").trim();
-    if (!raw) {
-      throw new HostError("INVALID_ARGUMENT", "skill path required");
-    }
-    const resolved = path.resolve(raw);
-    if (!fs.existsSync(resolved)) {
-      throw new HostError("IO_ERROR", `Skill path not found: ${resolved}`);
-    }
-
-    // 解析 skill 根目录：path 可能是 SKILL.md 或目录
-    let skillDir = resolved;
-    const st = fs.statSync(resolved);
-    if (st.isFile()) {
-      if (path.basename(resolved).toLowerCase() !== "skill.md") {
-        throw new HostError("INVALID_ARGUMENT", "not a skill path");
-      }
-      skillDir = path.dirname(resolved);
-    } else if (!st.isDirectory()) {
-      throw new HostError("INVALID_ARGUMENT", "not a skill path");
-    }
-
-    const skillMd = path.join(skillDir, "SKILL.md");
-    if (!fs.existsSync(skillMd)) {
-      throw new HostError("IO_ERROR", `SKILL.md not found under ${skillDir}`);
-    }
-
-    const norm = (p: string) => path.resolve(p).replace(/\\/g, "/").toLowerCase();
-    const dirN = norm(skillDir);
-    const under = (root: string) => {
-      const r = norm(root).replace(/\/+$/, "");
-      return dirN === r || dirN.startsWith(`${r}/`);
-    };
-
-    // 系统内置：bundled / 安装包 skills
-    if (
-      under(path.join(grokHomeDir(this.home), "bundled")) ||
-      dirN.includes("/bundled/skills/") ||
-      dirN.includes("/resources/skills/")
-    ) {
-      throw new HostError(
-        "PERMISSION_DENIED",
-        "系统内置技能不可删除",
-      );
-    }
-
-    const desktopSkills = path.join(grokHomeDir(this.home), "skills");
-    const projectSkills = params.projectPath
-      ? path.join(params.projectPath, ".grok", "skills")
-      : null;
-
-    // 个人真源仅 Desktop GROK_HOME/skills；~/.grok 不在此删
-    const inUser = under(desktopSkills);
-    const inProject =
-      (projectSkills && under(projectSkills)) ||
-      /[/\\]\.grok[/\\]skills([/\\]|$)/i.test(skillDir);
-
-    if (!inUser && !inProject) {
-      throw new HostError(
-        "PERMISSION_DENIED",
-        "仅可删除 Desktop 个人技能（~/.grok-desktop/skills）或项目技能，系统内置与插件技能不可删除",
-      );
-    }
-
-    // 只删 skills 下一层目录，防止误删整个 skills 根
-    const parent = path.dirname(skillDir);
-    const parentN = norm(parent);
-    const allowedParents = [
-      desktopSkills,
-      ...(projectSkills ? [projectSkills] : []),
-    ].map((p) => norm(p));
-    const parentIsSkillsRoot =
-      allowedParents.includes(parentN) ||
-      /[/\\]\.grok[/\\]skills$/i.test(parent.replace(/\\/g, "/"));
-    if (!parentIsSkillsRoot) {
-      throw new HostError(
-        "PERMISSION_DENIED",
-        "skill path is not a direct skills/<name> directory",
-      );
-    }
-
-    const name = (params.name || path.basename(skillDir)).trim();
-    fs.rmSync(skillDir, { recursive: true, force: true });
-    this.skillRegistry.invalidate(params.projectPath);
-    this.skillRegistry.invalidate();
-    this.logger.info("skills.delete", { name, path: skillDir });
-    return { deleted: true, path: skillDir, name };
+    return this.skillsOps.delete(params);
   }
 
   /**
@@ -3065,125 +2793,55 @@ export class DesktopHost {
     sourcePath: string;
     force?: boolean;
   }): { name: string; path: string; overwritten: boolean } {
-    const raw = (params.sourcePath || "").trim();
-    if (!raw) {
-      throw new HostError("INVALID_ARGUMENT", "sourcePath required");
-    }
-    const resolved = path.resolve(raw);
-    if (!fs.existsSync(resolved)) {
-      throw new HostError("IO_ERROR", `Path not found: ${resolved}`);
-    }
-
-    let skillDir = resolved;
-    const st = fs.statSync(resolved);
-    if (st.isFile()) {
-      if (path.basename(resolved).toLowerCase() !== "skill.md") {
-        throw new HostError(
-          "INVALID_ARGUMENT",
-          "请选择含 SKILL.md 的技能目录",
-        );
-      }
-      skillDir = path.dirname(resolved);
-    } else if (!st.isDirectory()) {
-      throw new HostError("INVALID_ARGUMENT", "请选择技能目录");
-    }
-
-    const skillMd = path.join(skillDir, "SKILL.md");
-    if (!fs.existsSync(skillMd)) {
-      throw new HostError(
-        "INVALID_ARGUMENT",
-        `目录内未找到 SKILL.md：${skillDir}`,
-      );
-    }
-
-    const name = path.basename(skillDir).trim();
-    if (!name || name === "." || name === "..") {
-      throw new HostError("INVALID_ARGUMENT", "invalid skill name");
-    }
-
-    const destRoot = path.join(grokHomeDir(this.home), "skills");
-    fs.mkdirSync(destRoot, { recursive: true });
-    const dest = path.join(destRoot, name);
-
-    const norm = (p: string) => path.resolve(p).replace(/\\/g, "/").toLowerCase();
-    if (norm(skillDir) === norm(dest)) {
-      throw new HostError(
-        "INVALID_ARGUMENT",
-        "源目录已是 Desktop 个人技能目录",
-      );
-    }
-
-    const overwritten = fs.existsSync(dest);
-    if (overwritten && !params.force) {
-      throw new HostError(
-        "INVALID_ARGUMENT",
-        `技能「${name}」已存在，确认覆盖后再导入`,
-        { code: "EXISTS", name, path: dest },
-      );
-    }
-    if (overwritten) {
-      fs.rmSync(dest, { recursive: true, force: true });
-    }
-    fs.cpSync(skillDir, dest, { recursive: true });
-    this.skillRegistry.invalidate();
-    this.logger.info("skills.import", {
-      name,
-      from: skillDir,
-      to: dest,
-      overwritten,
-    });
-    return { name, path: dest, overwritten };
+    return this.skillsOps.importFromDir(params);
   }
 
   pluginsList(projectPath?: string, opts?: { available?: boolean }) {
-    return pluginsListCli(this.grokCliRunner(), {
-      projectPath,
-      available: opts?.available,
-    });
+    return this.pluginsFacade.list(projectPath, opts);
   }
 
   pluginsInstall(source: string, opts?: { trust?: boolean }) {
-    return cliPluginsInstall(this.requireGrokCli(), source, opts);
+    return this.pluginsFacade.install(source, opts);
   }
 
   pluginsUninstall(name: string, opts?: { confirm?: boolean; keepData?: boolean }) {
-    return cliPluginsUninstall(this.requireGrokCli(), name, opts);
+    return this.pluginsFacade.uninstall(name, opts);
   }
 
   pluginsEnable(name: string) {
-    return cliPluginsEnable(this.requireGrokCli(), name);
+    return this.pluginsFacade.enable(name);
   }
 
   pluginsDisable(name: string) {
-    return cliPluginsDisable(this.requireGrokCli(), name);
+    return this.pluginsFacade.disable(name);
   }
 
   pluginsUpdate(name?: string) {
-    return cliPluginsUpdate(this.requireGrokCli(), name);
+    return this.pluginsFacade.update(name);
   }
 
   pluginsDetails(name: string) {
-    return cliPluginsDetails(this.requireGrokCli(), name);
+    return this.pluginsFacade.details(name);
   }
 
   pluginsMarketplaceList() {
-    return marketplaceListCli(this.requireGrokCli());
+    return this.pluginsFacade.marketplaceList();
   }
 
   pluginsMarketplaceAdd(url: string) {
-    return cliMarketplaceAdd(this.requireGrokCli(), url);
+    return this.pluginsFacade.marketplaceAdd(url);
   }
 
   pluginsMarketplaceRemove(url: string) {
-    return cliMarketplaceRemove(this.requireGrokCli(), url);
+    return this.pluginsFacade.marketplaceRemove(url);
   }
 
   pluginsMarketplaceUpdate(name?: string) {
-    return cliMarketplaceUpdate(this.requireGrokCli(), name);
+    return this.pluginsFacade.marketplaceUpdate(name);
   }
 
   mcpList() {
-    return mcpListCli(this.grokCliRunner());
+    return this.pluginsFacade.mcpList();
   }
 
   mcpAdd(input: {
@@ -3196,47 +2854,20 @@ export class DesktopHost {
     headers?: string[];
     cwd?: string;
   }) {
-    return mcpAddCli(this.requireGrokCli(), input);
+    return this.pluginsFacade.mcpAdd(input);
   }
 
   mcpRemove(name: string, opts?: { scope?: "user" | "project"; cwd?: string }) {
-    return mcpRemoveCli(this.requireGrokCli(), name, opts);
+    return this.pluginsFacade.mcpRemove(name, opts);
   }
 
   mcpDoctor(name?: string) {
-    return mcpDoctorCli(this.requireGrokCli(), name);
+    return this.pluginsFacade.mcpDoctor(name);
   }
-
-  /**
-   * `grok models` 结果缓存。
-   * `authenticated` 参与键：登出/登录后不得继续吐出旧的官方目录。
-   */
-  private modelsListCache: {
-    at: number;
-    list: ModelInfo[];
-    authenticated: boolean;
-  } | null = null;
-
-  /**
-   * 进行中的异步拉目录（单飞）。
-   * `gen` 与 `modelsListGeneration` 对齐；invalidate 后旧 flight 不可再被 join。
-   */
-  private modelsListInFlight: {
-    gen: number;
-    promise: Promise<ModelInfo[]>;
-  } | null = null;
-
-  /**
-   * 目录世代：invalidate 时自增；in-flight 完成时若世代变了则丢弃写回，
-   * 避免 logout 与 models.list 竞态把官方幽灵表写回 cache。
-   */
-  private modelsListGeneration = 0;
 
   /** 作废模型目录缓存（登录/登出/提供商变更） */
   private invalidateModelsListCache(): void {
-    this.modelsListCache = null;
-    this.modelsListGeneration += 1;
-    // 不取消子进程；仅丢弃其写回 / 禁止 join（见 modelsList）
+    this.modelsListService.invalidate();
   }
 
   /**
@@ -3351,23 +2982,8 @@ export class DesktopHost {
    * 供 roster / attach 等热路径；官方表以最近一次异步 modelsList 为准。
    */
   modelsListSync(): ModelInfo[] {
-    const authenticated = Boolean(authStatus(this.home).authenticated);
-    const ttlMs = 5 * 60_000;
-    if (
-      this.modelsListCache &&
-      this.modelsListCache.authenticated === authenticated &&
-      Date.now() - this.modelsListCache.at < ttlMs
-    ) {
-      return this.modelsListCache.list;
-    }
-    // 缓存失效/登录态变了：立刻只返回自定义（不堵主进程）；后台补拉官方
-    const list = this.mergeModelsCatalog([], authenticated);
-    // 不写入长期 cache（避免把「仅自定义」当成完整目录缓存 5 分钟）
-    // 但若从未有过 cache，短暂可用；并触发异步刷新
-    if (
-      !this.modelsListInFlight ||
-      this.modelsListInFlight.gen !== this.modelsListGeneration
-    ) {
+    const { list, shouldBackgroundRefresh } = this.modelsListService.listSync();
+    if (shouldBackgroundRefresh) {
       void this.modelsList({ force: true }).catch(() => undefined);
     }
     return list;
@@ -3377,160 +2993,10 @@ export class DesktopHost {
    * 列出可用模型（`grok models` + config 自定义；默认缓存 5 分钟）。
    * - 真源：CLI 输出 + `[model.*]` base_url 提供商；**无硬编码幽灵官方表**
    * - 未官方登录：隐藏 `source=official`，只保留自定义中转；**不 spawn CLI**
-   *   （登出后 force 拉表若仍 join 旧 `grok models` 会卡数秒 → 关设置后无法输入）
    * - 已登录：CLI 异步 spawn；同世代并发单飞；invalidate 后不 join 旧 flight
    */
   async modelsList(opts?: { force?: boolean }): Promise<ModelInfo[]> {
-    const authenticated = Boolean(authStatus(this.home).authenticated);
-    const ttlMs = 5 * 60_000;
-
-    // 未登录：目录 = 仅自定义提供商。立刻返回，绝不 await 旧 flight / spawn grok models。
-    if (!authenticated) {
-      if (
-        !opts?.force &&
-        this.modelsListCache &&
-        this.modelsListCache.authenticated === false &&
-        Date.now() - this.modelsListCache.at < ttlMs
-      ) {
-        return this.modelsListCache.list;
-      }
-      const list = this.mergeModelsCatalog([], false);
-      this.modelsListCache = {
-        at: Date.now(),
-        list,
-        authenticated: false,
-      };
-      return list;
-    }
-
-    if (
-      !opts?.force &&
-      this.modelsListCache &&
-      this.modelsListCache.authenticated === true &&
-      Date.now() - this.modelsListCache.at < ttlMs
-    ) {
-      return this.modelsListCache.list;
-    }
-
-    const flight = this.modelsListInFlight;
-    if (flight && flight.gen === this.modelsListGeneration) {
-      // 同世代：join 单飞（含 force 连打）
-      return flight.promise;
-    }
-    if (flight && flight.gen !== this.modelsListGeneration) {
-      // 世代已变：不 await 旧 flight（登出/登录后旧 grok models 可能仍跑数秒）。
-      // 直接开新一轮；旧进程写回会被 gen 校验丢弃。
-      if (
-        this.modelsListInFlight &&
-        this.modelsListInFlight.gen === this.modelsListGeneration
-      ) {
-        return this.modelsListInFlight.promise;
-      }
-    }
-
-    const gen = this.modelsListGeneration;
-    const promise = (async () => {
-      const cliModels = await this.modelsListUncachedAsync();
-      // 完成时再读登录态：logout 可能与拉目录并发，避免写回官方幽灵表
-      const authNow = Boolean(authStatus(this.home).authenticated);
-      // 登出已发生：只回 custom，勿把 CLI 官方表写入 cache
-      const list = this.mergeModelsCatalog(
-        authNow ? cliModels : [],
-        authNow,
-      );
-      if (gen === this.modelsListGeneration) {
-        this.modelsListCache = {
-          at: Date.now(),
-          list,
-          authenticated: authNow,
-        };
-      }
-      return list;
-    })().finally(() => {
-      if (this.modelsListInFlight?.promise === promise) {
-        this.modelsListInFlight = null;
-      }
-    });
-    this.modelsListInFlight = { gen, promise };
-    return promise;
-  }
-
-  /**
-   * 合并 CLI 官方表 + config 自定义提供商；按登录态过滤 official。
-   */
-  private mergeModelsCatalog(
-    cliModels: ModelInfo[],
-    authenticated: boolean,
-  ): ModelInfo[] {
-    const list: ModelInfo[] = cliModels.map((m) => ({ ...m }));
-    try {
-      const { providers, defaultModel } = listCustomProviders(this.home);
-      const customIds = new Set(providers.map((p) => p.id));
-      const names = modelDisplayNamesFromConfig(this.home);
-      for (const p of providers) {
-        const display = (p.name || p.model || p.id).trim() || p.id;
-        const hit = list.find((m) => m.id === p.id);
-        if (hit) {
-          hit.name = display;
-          hit.source = "custom";
-        } else {
-          list.push({
-            id: p.id,
-            name: display,
-            source: "custom",
-          });
-        }
-      }
-      // 非 base_url 的 [model.*] 段也写 name（若有）
-      for (const [id, display] of names) {
-        const hit = list.find((m) => m.id === id);
-        if (hit) {
-          if (!hit.name || hit.name === hit.id) hit.name = display;
-        }
-      }
-      for (const m of list) {
-        m.source = customIds.has(m.id) ? "custom" : "official";
-      }
-
-      // 未官方登录：不展示官方模型（避免 slug 幽灵 + 误以为 OAuth 仍可用）
-      if (!authenticated) {
-        for (let i = list.length - 1; i >= 0; i--) {
-          if (list[i].source !== "custom") list.splice(i, 1);
-        }
-      }
-
-      // config `[models].default` 统一 isDefault；若 default 已被滤掉则改标首项
-      if (defaultModel && list.some((m) => m.id === defaultModel)) {
-        for (const m of list) m.isDefault = m.id === defaultModel;
-      } else if (list.length) {
-        for (const m of list) m.isDefault = false;
-        list[0].isDefault = true;
-      }
-
-      // 仅当 default 仍「可见」时补行：自定义始终可补；官方仅登录后可补
-      if (defaultModel && !list.some((m) => m.id === defaultModel)) {
-        const isCustom = customIds.has(defaultModel);
-        if (isCustom || authenticated) {
-          list.unshift({
-            id: defaultModel,
-            name: names.get(defaultModel) || defaultModel,
-            isDefault: true,
-            source: isCustom ? "custom" : "official",
-          });
-          for (let i = 1; i < list.length; i++) list[i].isDefault = false;
-        }
-      }
-    } catch {
-      for (const m of list) {
-        if (!m.source) m.source = "official";
-      }
-      if (!authenticated) {
-        for (let i = list.length - 1; i >= 0; i--) {
-          if (list[i].source !== "custom") list.splice(i, 1);
-        }
-      }
-    }
-    return list;
+    return this.modelsListService.list(opts);
   }
 
   /**
@@ -3546,29 +3012,7 @@ export class DesktopHost {
         this.logger.warn("models.list_cli_failed", { error: r.error });
         return [];
       }
-      const out = `${r.stdout}\n${r.stderr}`;
-      const models: ModelInfo[] = [];
-      let defaultId: string | undefined;
-      for (const line of out.split(/\r?\n/)) {
-        const def = /^\s*Default model:\s*(\S+)/i.exec(line);
-        if (def) defaultId = def[1];
-        // "  * grok-4.5 (default)" or "  - grok-composer-2.5-fast"
-        const m = /^\s*[*•-]\s+(\S+)/.exec(line);
-        if (m) {
-          const id = m[1].replace(/\(.*\)\s*$/, "").trim();
-          if (!id || models.some((x) => x.id === id)) continue;
-          models.push({
-            id,
-            name: id,
-            // 初标 official；mergeModelsCatalog 会按 base_url 提供商改写为 custom
-            source: "official",
-            isDefault:
-              Boolean(defaultId && id === defaultId) ||
-              /\(default\)/i.test(line),
-          });
-        }
-      }
-      return models;
+      return parseGrokModelsCliOutput(`${r.stdout}\n${r.stderr}`);
     } catch (err) {
       this.logger.warn("models.list_cli_exception", { err: String(err) });
       return [];
@@ -3997,16 +3441,14 @@ export class DesktopHost {
     return targets;
   }
 
-  // ── Prompt queue (L1 durable) ─────────────────────────────
+  // ── Prompt queue (L1 durable) → PromptQueueService ───────
 
   queueGet(sessionId: string): PromptQueueFile {
-    return loadQueue(sessionId, this.home);
+    return this.promptQueue.get(sessionId);
   }
 
   queueSet(sessionId: string, file: PromptQueueFile): PromptQueueFile {
-    const next = saveQueue({ ...file, sessionId }, this.home);
-    this.emitQueueChanged(sessionId, "local", next);
-    return next;
+    return this.promptQueue.set(sessionId, file);
   }
 
   queueEnqueue(
@@ -4018,32 +3460,15 @@ export class DesktopHost {
       id?: string;
     },
   ): PromptQueueFile {
-    const next = enqueueItem(
-      sessionId,
-      {
-        id: item.id,
-        display: item.display || item.content.slice(0, 80),
-        content: item.content,
-        attachments: item.attachments ?? [],
-      },
-      this.home,
-    );
-    this.emitQueueChanged(sessionId, "local", next);
-    return next;
+    return this.promptQueue.enqueue(sessionId, item);
   }
 
   queueRemove(sessionId: string, itemId: string): PromptQueueFile {
-    const next = removeItem(sessionId, itemId, this.home);
-    void this.tryQueueWire(sessionId, "remove", { itemId });
-    this.emitQueueChanged(sessionId, "local", next);
-    return next;
+    return this.promptQueue.remove(sessionId, itemId);
   }
 
   queueReorder(sessionId: string, orderedIds: string[]): PromptQueueFile {
-    const next = reorderItems(sessionId, orderedIds, this.home);
-    void this.tryQueueWire(sessionId, "reorder", { orderedIds });
-    this.emitQueueChanged(sessionId, "local", next);
-    return next;
+    return this.promptQueue.reorder(sessionId, orderedIds);
   }
 
   queueUpdate(
@@ -4053,17 +3478,11 @@ export class DesktopHost {
       Pick<PromptQueueItem, "display" | "content" | "attachments" | "status" | "lastError">
     >,
   ): PromptQueueFile {
-    const next = updateItem(sessionId, itemId, patch, this.home);
-    void this.tryQueueWire(sessionId, "edit", { itemId, ...patch });
-    this.emitQueueChanged(sessionId, "local", next);
-    return next;
+    return this.promptQueue.update(sessionId, itemId, patch);
   }
 
   queueClear(sessionId: string): PromptQueueFile {
-    const next = clearQueue(sessionId, this.home);
-    void this.tryQueueWire(sessionId, "clear", {});
-    this.emitQueueChanged(sessionId, "local", next);
-    return next;
+    return this.promptQueue.clear(sessionId);
   }
 
   queueSetFlags(
@@ -4074,36 +3493,19 @@ export class DesktopHost {
       syncError?: string | null;
     },
   ): PromptQueueFile {
-    const next = setQueueFlags(sessionId, flags, this.home);
-    this.emitQueueChanged(sessionId, "local", next);
-    return next;
+    return this.promptQueue.setFlags(sessionId, flags);
   }
 
   /** 释放队列 drain 互斥（detach/delete/complete 共用） */
   private releaseQueueDrainLock(sessionId: string): void {
-    const sid = sessionId.trim();
-    if (sid) this.queueDrainLocked.delete(sid);
+    this.promptQueue.releaseDrainLock(sessionId);
   }
 
   queueTakeNext(sessionId: string): {
     queue: PromptQueueFile;
     item: PromptQueueItem | null;
   } {
-    const sid = sessionId.trim();
-    if (!sid) {
-      return { queue: loadQueue("", this.home), item: null };
-    }
-    // 同一 session 已有 in-flight drain：不二次 take（防重复发送）
-    if (this.queueDrainLocked.has(sid)) {
-      return {
-        queue: loadQueue(sid, this.home, { recoverOrphanSending: false }),
-        item: null,
-      };
-    }
-    const result = takeNextPending(sid, this.home);
-    if (result.item) this.queueDrainLocked.add(sid);
-    this.emitQueueChanged(sid, "local", result.queue);
-    return result;
+    return this.promptQueue.takeNext(sessionId);
   }
 
   queueCompleteSending(
@@ -4112,87 +3514,21 @@ export class DesktopHost {
     ok: boolean,
     error?: string,
   ): PromptQueueFile {
-    const sid = sessionId.trim();
-    try {
-      const next = completeSending(sid, itemId, ok, error, this.home);
-      this.emitQueueChanged(sid, "local", next);
-      return next;
-    } finally {
-      this.releaseQueueDrainLock(sid);
-    }
-  }
-
-  private emitQueueChanged(
-    sessionId: string,
-    source: "local" | "agent",
-    q: PromptQueueFile,
-  ): void {
-    const tid = this.sessionIndex.get(sessionId);
-    this.emit({
-      type: "queue.changed",
-      threadId: tid,
-      sessionId,
-      source,
-      itemCount: q.items.length,
-      pausedByInterrupt: q.pausedByInterrupt,
-      syncError: q.syncError,
-    });
-  }
-
-  /** Best-effort agent queue writeback (P2-A); never throws to UI. */
-  private async tryQueueWire(
-    sessionId: string,
-    op: string,
-    params: Record<string, unknown>,
-  ): Promise<void> {
-    const tid = this.sessionIndex.get(sessionId);
-    if (!tid) return;
-    const live = this.threads.get(tid);
-    if (!live?.client || !live.writable) return;
-    try {
-      await live.client.extMethod(
-        `_x.ai/queue/${op}`,
-        { sessionId, ...params },
-        15_000,
-      );
-      setQueueFlags(sessionId, { syncError: null }, this.home);
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
-      if (/method not found/i.test(msg)) return;
-      setQueueFlags(sessionId, { syncError: msg }, this.home);
-      this.logger.warn("queue.wire_failed", { op, msg });
-    }
+    return this.promptQueue.completeSending(sessionId, itemId, ok, error);
   }
 
   // ── Tasks aggregate (P2-B) ────────────────────────────────
 
-  tasksList(sessionId: string): {
-    sessionId: string;
-    items: ReturnType<typeof aggregateTasksLoose>;
-  } {
+  tasksList(sessionId: string): ReturnType<typeof buildTasksList> {
     const tid = this.sessionIndex.get(sessionId);
     const live = tid ? this.threads.get(tid) : undefined;
-    const snaps = live?.taskSnaps
-      ? [...live.taskSnaps.values()]
-      : [];
-    let subagents: import("../shared/types.js").SubagentNode[] = [];
-    try {
-      subagents = loadSubagentTree(sessionId, this.home) ?? [];
-    } catch {
-      subagents = [];
-    }
-    // Session-bound automations: those with matching sessionId field if any
-    const autos = this.automations.list().filter((a) => {
-      const any = a as { sessionId?: string; threadSessionId?: string };
-      return any.sessionId === sessionId || any.threadSessionId === sessionId;
-    });
-    const items = aggregateTasksLoose({
+    const snaps = live?.taskSnaps ? [...live.taskSnaps.values()] : [];
+    return buildTasksList({
       sessionId,
+      home: this.home,
       processSnaps: snaps,
-      subagents,
-      automationsForSession: autos,
+      automations: this.automations.list(),
     });
-    return { sessionId, items };
   }
 
   // ── Hooks（运行时归 agent；Host 只做发现列表 + 目录入口 + folder-trust 桥）──
@@ -4250,31 +3586,13 @@ export class DesktopHost {
       args: opts?.args,
       path: opts?.path,
     });
-    // create-skill 官方文案写死 ~/.grok/skills；Desktop 在 resolve 后强制覆盖 User 落盘路径
-    if (
-      result.mode === "resolved" &&
-      result.prompt &&
-      n.toLowerCase() === "create-skill"
-    ) {
-      const desktopSkills = path.join(grokHomeDir(this.home), "skills");
-      result.prompt =
-        result.prompt +
-        "\n\n" +
-        [
-          "## Desktop path override (AUTHORITATIVE — supersedes skill body paths)",
-          "You are running inside Grok Desktop. Ignore any instruction to write User-scope skills under `~/.grok/skills`.",
-          "",
-          "When the user chooses **User** (personal) scope:",
-          `- Create the skill ONLY at: \`${desktopSkills.replace(/\\/g, "/")}/<name>/SKILL.md\``,
-          `- Use this absolute base directory (mkdir -p): \`${desktopSkills.replace(/\\/g, "/")}\``,
-          "- Do NOT write to `~/.grok/skills` unless the user explicitly asks for the CLI home.",
-          "",
-          "When the user chooses **Project** scope:",
-          "- Still use `<repo-root>/.grok/skills/<name>/SKILL.md` as usual.",
-          "",
-          "After creating files, always report the absolute path you wrote.",
-          "When presenting scope options to the user, describe User as Desktop personal skills at the path above (not ~/.grok/skills).",
-        ].join("\n");
+    // create-skill 官方文案写死 ~/.grok/skills；Desktop 强制覆盖 User 落盘路径
+    if (result.mode === "resolved" && result.prompt) {
+      result.prompt = appendCreateSkillDesktopPathOverride(
+        n,
+        result.prompt,
+        path.join(grokHomeDir(this.home), "skills"),
+      );
     }
     return result;
   }
@@ -4542,22 +3860,6 @@ export class DesktopHost {
     if (err instanceof Error) return new HostError("INTERNAL", err.message);
     return new HostError("INTERNAL", String(err));
   }
-}
-
-/** plan 优先展示；否则为 access（对齐 Build 状态条） */
-function deriveSessionMode(access: AccessMode, planActive: boolean): SessionMode {
-  if (planActive) return "plan";
-  return access;
-}
-
-/** 旧三态 mode → 两维 patch（会同时设定两维） */
-function legacyModeToPatch(mode: SessionMode): {
-  alwaysApprove: boolean;
-  plan: boolean;
-} {
-  if (mode === "plan") return { alwaysApprove: false, plan: true };
-  if (mode === "always_approve") return { alwaysApprove: true, plan: false };
-  return { alwaysApprove: false, plan: false };
 }
 
 

@@ -15,7 +15,7 @@ import {
   pickLruDetachTargets,
   shouldIdleDetach,
   type LiveAttachSnapshot,
-} from "../src/host/attach-policy.js";
+} from "../src/host/attach/policy.js";
 import {
   applyRuntimeCapabilitySignal,
   BASELINE_CAPABILITIES,
@@ -42,7 +42,7 @@ import {
   saveQueue,
   setQueueFlags,
   takeNextPending,
-} from "../src/host/prompt-queue.js";
+} from "../src/host/prompt-queue/queue.js";
 import { findSessionDir } from "../src/host/paths.js";
 import { aggregateTasksLoose } from "../src/host/tasks-aggregate.js";
 import { spawnSync } from "node:child_process";

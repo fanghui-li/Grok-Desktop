@@ -7,7 +7,7 @@ import {
   patchSessionTurn,
   setSessionTurn,
   shouldRehydrateBusy,
-} from "../src/renderer/session-turn-store.js";
+} from "../src/renderer/session/turn-store.js";
 
 describe("session-turn-store (方案 B)", () => {
   beforeEach(() => {
