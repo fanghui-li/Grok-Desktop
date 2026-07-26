@@ -1,5 +1,5 @@
 /**
- * Goal Host-layer E2E — maps docs/goal-handtest-checklist.md automatable items.
+ * Goal Host-layer E2E — Host-layer E2E for goal automatable cases (store + fake ACP).
  *
  * Scope: DesktopHost + fake ACP agent (stdio). Not Electron UI clicks.
  * Covers: N1–N3, P2–P4, L1–L3/L5–L7, B2, M1–M2, D1-ish (goalsGet projection).

@@ -15,7 +15,7 @@
 ## 0.1 功能测试（公开约定）
 
 - **默认门禁**：相关 **L0 单测 + L1 Host/fake** 绿（`npx vitest run test/<相关>.test.ts`）；不默认真 grok / Playwright。
-- **真窗口**：合入/发版前由维护者按风险短剧本点验；goal 厚清单见 `docs/goal-handtest-checklist.md`（若有）。
+- **真窗口**：合入/发版前由维护者按风险短剧本点验；手测清单本地维护（不入库）。
 - **维护者本地**（**不入库**）：`.grok/skills/desktop-test/` + `docs/test-archive/` 已 gitignore；仅本机 `/desktop-test` 工作流，勿把路径写进对外文档当必选。
 
 ---
