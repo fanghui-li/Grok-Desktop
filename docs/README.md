@@ -14,6 +14,7 @@ Grok Desktop 是 **Grok Build 的桌面客户端**（Electron 指挥面 + Host�
 | [packaging.md](./packaging.md) | agent-bin 与安装包 |
 | [agent-bin/README](../agent-bin/README.md) | 捆绑 agent 说明 |
 | [SECURITY](../SECURITY.md) | 安全与数据边界 |
+| [gbr.md](./gbr.md) | Build Remote Agent：桌面 Grok 会话的手机 spectator（`gbr/1`，独立产品，非 xAI） |
 
 **原则**
 
